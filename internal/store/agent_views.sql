@@ -2,20 +2,136 @@
 -- existing view in agent has been dropped. They read core, sync and raw with the owner's rights.
 -- Days are Europe/London days: an instant is converted with AT TIME ZONE 'Europe/London'.
 
+-- accounts: detail is the latest raw Monzo object for the account (from /accounts) or the pot
+-- (from /pots), and null for a file-fed account. For each endpoint and parameter set only the
+-- newest readable successful (200) response is read, newest by fetched_at then seq (a capture
+-- loaded later but fetched earlier does not win), so the parse stays a handful of bodies however
+-- many responses raw holds. A body that is not UTF-8 JSON holding the list is skipped (load-capture
+-- stores bodies unchecked), so it can neither shadow a readable response nor fail the read. Monzo
+-- lists closed accounts and deleted pots, so that response names every account it ever did. An id
+-- listed under more than one parameter set takes the newest response by the same order.
+-- New columns are appended so a reader selecting by position is unaffected.
 CREATE VIEW agent.accounts AS
+WITH request AS (
+  SELECT DISTINCT endpoint, params,
+         CASE endpoint WHEN '/accounts' THEN 'accounts' ELSE 'pots' END AS list_key
+  FROM raw.api_response
+  WHERE source = 'monzo' AND endpoint IN ('/accounts', '/pots') AND status = 200
+),
+-- The newest readable response of each request: newest first, the first whose body is JSON with
+-- the list in it. OFFSET 0 keeps the sort below the filter, so LIMIT 1 stops at the first readable
+-- body instead of parsing every one.
+latest_doc AS (
+  SELECT q.endpoint, d.seq, d.fetched_at, raw.json_body(d.body) -> q.list_key AS list
+  FROM request q
+  CROSS JOIN LATERAL (
+    SELECT s.seq, s.fetched_at, s.body
+    FROM (SELECT r.seq, r.fetched_at, r.body
+          FROM raw.api_response r
+          WHERE r.source = 'monzo' AND r.endpoint = q.endpoint AND r.params = q.params AND r.status = 200
+          ORDER BY r.fetched_at DESC, r.seq DESC
+          OFFSET 0) s
+    WHERE jsonb_typeof(raw.json_body(s.body) -> q.list_key) = 'array'
+    LIMIT 1
+  ) d
+),
+monzo_object AS (
+  SELECT DISTINCT ON (d.endpoint, o.value ->> 'id') d.endpoint, o.value ->> 'id' AS id, o.value AS obj
+  FROM latest_doc d
+  CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(d.list) = 'array' THEN d.list ELSE '[]'::jsonb END) o
+  ORDER BY d.endpoint, o.value ->> 'id', d.fetched_at DESC, d.seq DESC
+)
 SELECT a.slug, a.source, a.type, a.feed, a.currency, a.name,
-       p.slug AS parent_slug, a.opened_on, a.closed
+       p.slug AS parent_slug, a.opened_on, a.closed,
+       m.obj AS detail
 FROM core.account a
-LEFT JOIN core.account p ON p.id = a.parent_id;
+LEFT JOIN core.account p ON p.id = a.parent_id
+LEFT JOIN monzo_object m
+  ON a.source = 'monzo' AND a.feed = 'api' AND m.id = a.source_key
+ AND m.endpoint = CASE WHEN a.type = 'pot' THEN '/pots' ELSE '/accounts' END;
 
+-- transactions: detail is the latest version's full source record (the Monzo transaction object,
+-- or a statement import's parsed row). pot_slug names the pot a Monzo pot transfer moved money to
+-- or from (the transaction's metadata.pot_id is a pot finstore holds), whatever its status, and is
+-- null for every other transaction.
 CREATE VIEW agent.transactions AS
 SELECT t.id, a.slug AS account_slug, t.txn_date, t.created_at, t.settled_at,
        t.amount_minor, t.currency, t.local_amount_minor, t.local_currency, t.status,
        t.description, t.counterparty, t.merchant_name, t.category, t.scheme, t.notes,
-       t.version_count, t.first_seen_at, t.last_seen_at
+       t.version_count, t.first_seen_at, t.last_seen_at,
+       v.content AS detail, pot.slug AS pot_slug
 FROM core.transaction t
 JOIN core.account a ON a.id = t.account_id
+LEFT JOIN core.transaction_version v ON v.transaction_id = t.id AND v.version_no = t.version_count
+LEFT JOIN core.account pot
+  ON t.source = 'monzo' AND pot.source = 'monzo' AND pot.type = 'pot'
+ AND pot.source_key = v.content -> 'metadata' ->> 'pot_id'
 WHERE t.disappeared_at IS NULL;
+
+-- pot_transactions: one row per Monzo transaction that moved money into or out of a pot finstore
+-- holds, matched on the pot id in its metadata (not on the pot's parent: a joint account can pay
+-- into a pot). Declined and disappeared transactions are left out; pending ones are kept, since
+-- they already move the pot's balance. amount_minor is from the pot's side: positive into the
+-- pot, so the negation of the amount on the account the transfer was made on.
+CREATE VIEW agent.pot_transactions AS
+SELECT t.id AS transaction_id, pot.slug AS pot_slug, a.slug AS account_slug, t.txn_date, t.created_at,
+       -t.amount_minor AS amount_minor, t.currency, t.description,
+       v.content -> 'metadata' ->> 'trigger' AS trigger, t.status, v.content AS detail
+FROM core.transaction t
+JOIN core.account a ON a.id = t.account_id
+JOIN core.transaction_version v ON v.transaction_id = t.id AND v.version_no = t.version_count
+JOIN core.account pot
+  ON pot.source = 'monzo' AND pot.type = 'pot' AND pot.source_key = v.content -> 'metadata' ->> 'pot_id'
+WHERE t.source = 'monzo' AND t.disappeared_at IS NULL AND t.status <> 'declined';
+
+-- pot_reconciliation: one row per pot. balance is its latest balance snapshot; transfers_net and
+-- transfer_count cover its agent.pot_transactions rows created at or before that reading (all of
+-- them when it has none); difference is balance minus transfers_net; pot_type is the type in the
+-- latest raw /pots object (agent.accounts detail). reason is one of:
+--   matches              the transfers sum to the balance
+--   interest_not_listed  a savings pot whose balance exceeds its transfers: Monzo pays interest
+--                        inside the pot and never lists it. The savings types are exactly
+--                        instant_access and flexible_savings; any other type falls to unexplained
+--   unexplained          anything else, including a pot with no balance snapshot (balance null)
+CREATE VIEW agent.pot_reconciliation AS
+WITH latest_balance AS (
+  SELECT DISTINCT ON (b.account_id) b.account_id, b.balance_minor, b.at
+  FROM core.balance_snapshot b
+  JOIN core.account p ON p.id = b.account_id AND p.type = 'pot'
+  ORDER BY b.account_id, b.at DESC NULLS LAST, b.raw_seq DESC, b.ordinal DESC
+),
+-- Transfers as at the balance reading: one made after it is not yet in the balance. A pot with no
+-- balance reading counts all of its transfers.
+transfers AS (
+  SELECT pt.pot_slug, sum(pt.amount_minor)::bigint AS net, count(*) AS n
+  FROM agent.pot_transactions pt
+  JOIN core.account p ON p.slug = pt.pot_slug
+  LEFT JOIN latest_balance b ON b.account_id = p.id
+  WHERE b.at IS NULL OR pt.created_at IS NULL OR pt.created_at <= b.at
+  GROUP BY pt.pot_slug
+),
+pots AS (
+  SELECT p.slug AS pot_slug, par.slug AS parent_slug, ac.detail ->> 'type' AS pot_type, p.closed,
+         b.balance_minor, b.at AS balance_at,
+         coalesce(tr.net, 0) AS transfers_net_minor, coalesce(tr.n, 0) AS transfer_count
+  FROM core.account p
+  LEFT JOIN core.account par ON par.id = p.parent_id
+  LEFT JOIN agent.accounts ac ON ac.slug = p.slug
+  LEFT JOIN latest_balance b ON b.account_id = p.id
+  LEFT JOIN transfers tr ON tr.pot_slug = p.slug
+  WHERE p.type = 'pot'
+)
+SELECT pot_slug, parent_slug, pot_type, closed, balance_minor, balance_at,
+       transfers_net_minor, transfer_count,
+       balance_minor - transfers_net_minor AS difference_minor,
+       CASE
+         WHEN balance_minor IS NULL THEN 'unexplained'
+         WHEN balance_minor = transfers_net_minor THEN 'matches'
+         WHEN balance_minor > transfers_net_minor AND pot_type IN ('instant_access', 'flexible_savings')
+           THEN 'interest_not_listed'
+         ELSE 'unexplained'
+       END AS reason
+FROM pots;
 
 CREATE VIEW agent.transaction_history AS
 SELECT v.transaction_id, v.version_no, v.seen_at, v.content
