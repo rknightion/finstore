@@ -280,11 +280,8 @@ func TestConnectRedirectsOnlyASameOriginPost(t *testing.T) {
 	conn := &fakeConn{}
 	h := newServer(t, conn, &fakeReader{}, nil)
 	rec := do(h, http.MethodPost, "/connect/monzo", signedIn(map[string]string{"Sec-Fetch-Site": "same-origin"}))
-	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("same-origin post: %d, want 303", rec.Code)
-	}
-	if got := rec.Header().Get("Location"); !strings.HasPrefix(got, "https://auth.bank.test/") {
-		t.Fatalf("Location = %q", got)
+	if got := continueTarget(t, rec); !strings.HasPrefix(got, "https://auth.bank.test/") {
+		t.Fatalf("continue page leads to %q", got)
 	}
 	if conn.authoriseCalls != 1 {
 		t.Fatalf("authorise calls = %d, want 1", conn.authoriseCalls)
@@ -446,7 +443,7 @@ func TestContentSecurityPolicyMatchesThePage(t *testing.T) {
 	if !strings.Contains(csp, want) {
 		t.Fatalf("policy %q does not allow the page's style %s", csp, want)
 	}
-	for _, part := range []string{"default-src 'none'", "form-action 'self' https://auth.bank.test", "frame-ancestors 'none'"} {
+	for _, part := range []string{"default-src 'none'", "form-action 'self';", "frame-ancestors 'none'"} {
 		if !strings.Contains(csp, part) {
 			t.Errorf("policy %q lacks %q", csp, part)
 		}

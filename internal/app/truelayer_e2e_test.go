@@ -76,7 +76,12 @@ func (w *tlWorld) send(method, path, email, site string) *http.Response {
 	if err != nil {
 		w.t.Fatal(err)
 	}
+	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
 	return resp
 }
 
@@ -85,10 +90,7 @@ func (w *tlWorld) send(method, path, email, site string) *http.Response {
 func (w *tlWorld) connectLink(path string) *url.URL {
 	w.t.Helper()
 	resp := w.send(http.MethodPost, path, ownerEmail, "same-origin")
-	if resp.StatusCode != http.StatusSeeOther {
-		w.t.Fatalf("POST %s: %d, want 303", path, resp.StatusCode)
-	}
-	u, err := url.Parse(resp.Header.Get("Location"))
+	u, err := url.Parse(continueLink(w.t, resp))
 	if err != nil {
 		w.t.Fatal(err)
 	}

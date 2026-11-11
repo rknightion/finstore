@@ -3,8 +3,11 @@ package web
 import (
 	"bytes"
 	"errors"
+	"html"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -43,8 +46,8 @@ func TestTrueLayerConnectRoutesRedirectToTheirBank(t *testing.T) {
 	} {
 		ts := newThree(t, nil)
 		rec := do(ts.h, http.MethodPost, path, signedIn(map[string]string{"Sec-Fetch-Site": "same-origin"}))
-		if rec.Code != http.StatusSeeOther || !strings.Contains(rec.Header().Get("Location"), want) {
-			t.Errorf("%s: %d to %q, want 303 to the %s link", path, rec.Code, rec.Header().Get("Location"), want)
+		if got := continueTarget(t, rec); !strings.Contains(got, want) {
+			t.Errorf("%s: continue page leads to %q, want the %s link", path, got, want)
 		}
 		if n := ts.lloyds.authoriseCalls + ts.tlMonzo.authoriseCalls + ts.monzo.authoriseCalls; n != 1 {
 			t.Errorf("%s: %d attempts started, want 1", path, n)
@@ -73,11 +76,14 @@ func TestTrueLayerConnectRoutesApplyTheSameChecksAsMonzo(t *testing.T) {
 	}
 }
 
-func TestPolicyAllowsEveryBankOriginOnce(t *testing.T) {
+// A bank's login page may redirect onward to another domain (TrueLayer sends the browser to the
+// bank's own site), and form-action applies to every redirect after a form post. So a connect post
+// answers with a same-origin page that moves on by itself, and forms may post only to this site.
+func TestPolicyLetsFormsPostOnlyToThisSite(t *testing.T) {
 	ts := newThree(t, nil)
 	csp := do(ts.h, http.MethodGet, "/", signedIn(nil)).Header().Get("Content-Security-Policy")
-	if !strings.Contains(csp, "form-action 'self' https://auth.bank.test https://auth.truelayer.test;") {
-		t.Fatalf("policy %q does not allow both bank origins once each", csp)
+	if !strings.Contains(csp, "form-action 'self';") {
+		t.Fatalf("policy %q does not limit form posts to this site", csp)
 	}
 }
 
@@ -221,4 +227,23 @@ func TestMonzoOnlyHasNoTrueLayerRoutesOrSection(t *testing.T) {
 			t.Errorf("%s %s: %d, want 404", r.method, r.target, rec.Code)
 		}
 	}
+}
+
+// continueTarget checks rec is the page a connect post answers with and returns where it leads:
+// a 200 page whose refresh and fallback link name the same bank login URL.
+func continueTarget(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("connect post: %d, want 200 and a continue page", rec.Code)
+	}
+	body := rec.Body.String()
+	refresh := regexp.MustCompile(`<meta http-equiv="refresh" content="0; url=([^"]+)">`).FindStringSubmatch(body)
+	link := regexp.MustCompile(`<a id="continue" href="([^"]+)">`).FindStringSubmatch(body)
+	if refresh == nil || link == nil {
+		t.Fatalf("continue page lacks a refresh or a link: %s", body)
+	}
+	if html.UnescapeString(refresh[1]) != html.UnescapeString(link[1]) {
+		t.Fatalf("refresh %q and link %q differ", refresh[1], link[1])
+	}
+	return html.UnescapeString(link[1])
 }

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"html"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -261,13 +263,10 @@ func TestServiceEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("connect: %d, want 303", resp.StatusCode)
-	}
-	bank, err := url.Parse(resp.Header.Get("Location"))
+	link := continueLink(t, resp)
+	bank, err := url.Parse(link)
 	if err != nil || bank.Host != "auth.example.test" {
-		t.Fatalf("connect redirected to %q", resp.Header.Get("Location"))
+		t.Fatalf("connect leads to %q", link)
 	}
 	state := bank.Query().Get("state")
 	if state == "" || bank.Query().Get("redirect_uri") != "https://finstore.example.test/callback/monzo" {
@@ -560,4 +559,24 @@ func TestServiceEndToEnd(t *testing.T) {
 	if !strings.Contains(logs, `"msg":"http request"`) {
 		t.Errorf("no request log line was written; the log check above proves nothing:\n%s", logs)
 	}
+}
+
+// continueLink reads the page a connect post answers with and returns the bank login URL its
+// refresh and fallback link lead to.
+func continueLink(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("connect post: %d, want 200 and a continue page", resp.StatusCode)
+	}
+	refresh := regexp.MustCompile(`<meta http-equiv="refresh" content="0; url=([^"]+)">`).FindSubmatch(body)
+	link := regexp.MustCompile(`<a id="continue" href="([^"]+)">`).FindSubmatch(body)
+	if refresh == nil || link == nil || html.UnescapeString(string(refresh[1])) != html.UnescapeString(string(link[1])) {
+		t.Fatalf("continue page lacks a matching refresh and link: %s", body)
+	}
+	return html.UnescapeString(string(link[1]))
 }

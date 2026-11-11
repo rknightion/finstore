@@ -99,6 +99,26 @@ var statusCSS string
 
 var statusTmpl = template.Must(template.New("status").Parse(statusHTML))
 
+// continueTmpl is the page a connect post answers with. It moves the browser on to the bank's
+// login page by itself instead of a redirect: a bank's login page may redirect onward to another
+// domain (TrueLayer sends the browser to the bank's own site), and the form-action policy applies
+// to every redirect after a form post, so a redirect would be blocked partway. A page that
+// navigates on its own is not a form submission.
+var continueTmpl = template.Must(template.New("continue").Parse(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex">
+<meta http-equiv="refresh" content="0; url={{.URL}}">
+<title>finstore</title>
+<style>{{.CSS}}</style>
+</head>
+<body>
+<p>Taking you to your bank to approve the connection. If nothing happens, <a id="continue" href="{{.URL}}">continue to your bank</a>.</p>
+</body>
+</html>
+`))
+
 // New builds a Server. It refuses an empty allow-list: a service with nobody allowed is a
 // misconfiguration, not a locked-down service.
 func New(opts Options, read Reader) (*Server, error) {
@@ -121,7 +141,6 @@ func New(opts Options, read Reader) (*Server, error) {
 		opts.Log = slog.New(slog.DiscardHandler)
 	}
 	opts.Sources = slices.Clone(opts.Sources) // defaults are filled in below
-	origins := []string{"'self'"}
 	names, routes := map[string]bool{}, map[string]bool{}
 	callbacks := map[string]map[string]Source{}
 	for i, src := range opts.Sources {
@@ -138,9 +157,6 @@ func New(opts Options, read Reader) (*Server, error) {
 		if err != nil || u.Scheme == "" || u.Host == "" {
 			return nil, fmt.Errorf("web: source %d's bank login URL is not an absolute URL", i)
 		}
-		if origin := u.Scheme + "://" + u.Host; !slices.Contains(origins, origin) {
-			origins = append(origins, origin)
-		}
 		if src.IsRefusal == nil {
 			src.IsRefusal = func(error) bool { return false }
 			opts.Sources[i] = src
@@ -151,8 +167,10 @@ func New(opts Options, read Reader) (*Server, error) {
 		callbacks[src.CallbackPath][src.Name] = src
 	}
 	sum := sha256.Sum256([]byte(statusCSS))
-	csp := fmt.Sprintf("default-src 'none'; style-src 'sha256-%s'; form-action %s; frame-ancestors 'none'; base-uri 'none'",
-		base64.StdEncoding.EncodeToString(sum[:]), strings.Join(origins, " "))
+	// Forms post only to this site; a connect post answers with a page that moves on to the bank
+	// by itself (see continueTmpl).
+	csp := fmt.Sprintf("default-src 'none'; style-src 'sha256-%s'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+		base64.StdEncoding.EncodeToString(sum[:]))
 	return &Server{opts: opts, read: read, csp: csp, callbacks: callbacks}, nil
 }
 
@@ -263,7 +281,18 @@ func (s *Server) connect(src Source) http.Handler {
 			http.Error(w, "The connection could not be started. Try again.", http.StatusInternalServerError)
 			return
 		}
-		http.Redirect(w, r, target, http.StatusSeeOther)
+		u, err := url.Parse(target)
+		if err != nil || u.Scheme != "https" && u.Scheme != "http" {
+			s.opts.Log.ErrorContext(r.Context(), "connect attempt gave no usable bank link",
+				semconv.LogSource, src.Name, semconv.LogOutcome, "error")
+			http.Error(w, "The connection could not be started. Try again.", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_ = continueTmpl.Execute(w, struct {
+			URL *url.URL
+			CSS template.CSS
+		}{u, template.CSS(statusCSS)}) // #nosec G203 -- an embedded file, not input
 	})
 }
 
