@@ -8,7 +8,10 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/rknightion/finstore/internal/scheduler"
 	"github.com/rknightion/finstore/internal/semconv"
 )
 
@@ -28,6 +31,9 @@ type Metrics struct {
 	optionalReads   metric.Int64Counter
 	cardsUnlisted   metric.Int64Gauge
 	processStart    metric.Int64Gauge
+	jobRuns         metric.Int64Counter
+	jobDuration     metric.Float64Histogram
+	jobLastOK       metric.Int64Gauge
 }
 
 // NewMetrics creates every instrument on meter.
@@ -65,10 +71,68 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 	counter(&m.optionalReads, semconv.MetricTrueLayerOptionalReads, "TrueLayer reads whose answer never reaches the ledger, by endpoint and result")
 	gauge(&m.cardsUnlisted, semconv.MetricTrueLayerCardsUnlisted, "1", "Card accounts the newest card list left out")
 	gauge(&m.processStart, semconv.MetricProcessStartTime, "s", "Unix time serve started")
+	counter(&m.jobRuns, semconv.MetricSchedulerJobRuns, "Scheduler job runs, by job and outcome (ok, error or panic)")
+	gauge(&m.jobLastOK, semconv.MetricSchedulerJobLastOK, "1", "1 when the job's last run ended ok, 0 otherwise; held in the serve process, so absent after a restart until the job has run")
+	if err == nil {
+		m.jobDuration, err = meter.Float64Histogram(semconv.MetricSchedulerJobDuration,
+			metric.WithUnit("s"), metric.WithDescription("Scheduler job run duration, by job"))
+		if err != nil {
+			err = fmt.Errorf("create %s: %w", semconv.MetricSchedulerJobDuration, err)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
 	return &m, nil
+}
+
+// SchedulerObserver returns the scheduler's observer. Each job run is a new root span named
+// scheduler.job with the job's registered name and outcome, and is counted, timed, and recorded
+// as the job's last outcome. A nil tr makes no spans. The job name is a registered name, never
+// data; the outcome is ok, error or panic, and neither a returned error nor a panic value is
+// recorded.
+func (m *Metrics) SchedulerObserver(tr trace.Tracer) scheduler.Observer {
+	if tr == nil {
+		tr = tracenoop.NewTracerProvider().Tracer(semconv.ServiceName)
+	}
+	return &schedulerObserver{m: m, tr: tr}
+}
+
+type schedulerObserver struct {
+	m  *Metrics
+	tr trace.Tracer
+}
+
+// Start begins a new root span for one run of job. The returned finish records the run's outcome
+// on the span and in the metrics, in that order, then ends the span: metrics recorded inside the
+// span's context carry it as their exemplar.
+func (o *schedulerObserver) Start(ctx context.Context, job string) (context.Context, func(string)) {
+	ctx, span := o.tr.Start(ctx, semconv.SpanSchedulerJob,
+		trace.WithNewRoot(),
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(attribute.String(semconv.SpanJob, job)))
+	began := time.Now()
+	return ctx, func(outcome string) {
+		span.SetAttributes(attribute.String(semconv.SpanJobOutcome, outcome))
+		// A run cancelled by shutdown is not a failure: no error status and no last_ok write, so a
+		// deploy cannot trip the Scheduled Job Failed alert.
+		failed := outcome != semconv.JobOK && outcome != semconv.JobCancelled
+		if failed {
+			Fail(span, "error")
+		}
+		attr := metric.WithAttributes(attribute.String(semconv.AttrJob, job))
+		o.m.jobRuns.Add(ctx, 1, metric.WithAttributes(
+			attribute.String(semconv.AttrJob, job), attribute.String(semconv.AttrOutcome, outcome)))
+		o.m.jobDuration.Record(ctx, time.Since(began).Seconds(), attr)
+		if outcome != semconv.JobCancelled {
+			var ok int64
+			if outcome == semconv.JobOK {
+				ok = 1
+			}
+			o.m.jobLastOK.Record(ctx, ok, attr)
+		}
+		span.End()
+	}
 }
 
 // SyncSucceeded records the time of the last successful scheduled sync.

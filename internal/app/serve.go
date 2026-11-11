@@ -218,6 +218,7 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 		Location:      cfg.Timezone,
 		Now:           e.now,
 		Log:           log,
+		Tracer:        providers.Tracer(semconv.ServiceName),
 	}, reader{st})
 	if err != nil {
 		return err
@@ -254,7 +255,7 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 	}
 
 	status := &statusPublisher{st: st, m: metrics, log: log, dumpFile: cfg.DumpStatusFile, now: e.now}
-	sched := scheduler.New(e.now, log)
+	sched := scheduler.New(e.now, log, metrics.SchedulerObserver(providers.Tracer(semconv.ServiceName)))
 	if !hooks.NoSchedule {
 		sched.Every("status", statusInterval, 0, status.run)
 		// The jitter keeps a restart loop from hitting the bank at every start. Each run has a

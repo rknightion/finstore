@@ -23,9 +23,14 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
+
 	"github.com/rknightion/finstore/internal/consent"
 	"github.com/rknightion/finstore/internal/semconv"
 	"github.com/rknightion/finstore/internal/store"
+	"github.com/rknightion/finstore/internal/telemetry"
 )
 
 // Connector starts and completes a bank connection.
@@ -80,6 +85,8 @@ type Options struct {
 	Location *time.Location
 	Now      func() time.Time
 	Log      *slog.Logger
+	// Tracer makes the connect and callback spans. Nil means no spans.
+	Tracer trace.Tracer
 }
 
 // Server holds the HTTP handlers.
@@ -89,6 +96,7 @@ type Server struct {
 	csp  string
 	// callbacks maps each callback path to the sources that share it, by name.
 	callbacks map[string]map[string]Source
+	tracer    trace.Tracer
 }
 
 //go:embed status.html
@@ -140,6 +148,10 @@ func New(opts Options, read Reader) (*Server, error) {
 	if opts.Log == nil {
 		opts.Log = slog.New(slog.DiscardHandler)
 	}
+	tracer := opts.Tracer
+	if tracer == nil {
+		tracer = tracenoop.NewTracerProvider().Tracer(semconv.ServiceName)
+	}
 	opts.Sources = slices.Clone(opts.Sources) // defaults are filled in below
 	names, routes := map[string]bool{}, map[string]bool{}
 	callbacks := map[string]map[string]Source{}
@@ -171,7 +183,7 @@ func New(opts Options, read Reader) (*Server, error) {
 	// by itself (see continueTmpl).
 	csp := fmt.Sprintf("default-src 'none'; style-src 'sha256-%s'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
 		base64.StdEncoding.EncodeToString(sum[:]))
-	return &Server{opts: opts, read: read, csp: csp, callbacks: callbacks}, nil
+	return &Server{opts: opts, read: read, csp: csp, callbacks: callbacks, tracer: tracer}, nil
 }
 
 // Handler returns the routes.
@@ -269,13 +281,17 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 // site cannot start one from the signed-in user's browser.
 func (s *Server) connect(src Source) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r, f := s.startFlow(r, semconv.SpanConnect, src.Name)
+		defer f.end()
 		if r.Header.Get("Sec-Fetch-Site") != "same-origin" {
+			f.outcome(semconv.ConnectCrossSite)
 			// Not 403: the proxy in front may rewrite a 403 into a login redirect.
 			http.Error(w, "This request must come from the status page.", http.StatusBadRequest)
 			return
 		}
 		target, err := src.Connector.AuthoriseURL(r.Context())
 		if err != nil {
+			f.startFailed()
 			s.opts.Log.ErrorContext(r.Context(), "connect attempt not started",
 				semconv.LogSource, src.Name, semconv.LogOutcome, "error")
 			http.Error(w, "The connection could not be started. Try again.", http.StatusInternalServerError)
@@ -283,11 +299,13 @@ func (s *Server) connect(src Source) http.Handler {
 		}
 		u, err := url.Parse(target)
 		if err != nil || u.Scheme != "https" && u.Scheme != "http" {
+			f.startFailed()
 			s.opts.Log.ErrorContext(r.Context(), "connect attempt gave no usable bank link",
 				semconv.LogSource, src.Name, semconv.LogOutcome, "error")
 			http.Error(w, "The connection could not be started. Try again.", http.StatusInternalServerError)
 			return
 		}
+		f.outcome(semconv.ConnectStarted)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_ = continueTmpl.Execute(w, struct {
 			URL *url.URL
@@ -306,15 +324,18 @@ const (
 // why a value was refused.
 func (s *Server) callback(src Source) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r, f := s.startFlow(r, semconv.SpanCallback, src.Name)
+		defer f.end()
 		q := r.URL.Query()
 		state, code := q.Get("state"), q.Get("code")
 		if state == "" || code == "" {
+			f.outcome(semconv.ConnectInvalidLink)
 			http.Error(w, msgInvalidLink, http.StatusBadRequest)
 			return
 		}
 		ctx, cancel := callbackContext(r)
 		defer cancel()
-		s.complete(ctx, w, r, src, state, code)
+		s.complete(ctx, w, r, f, src, state, code)
 	})
 }
 
@@ -326,8 +347,12 @@ func (s *Server) callback(src Source) http.Handler {
 // the attempt expires unused.
 func (s *Server) sharedCallback(group map[string]Source) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The source is not known until the attempt has been read.
+		r, f := s.startFlow(r, semconv.SpanCallback, semconv.SourceUnknown)
+		defer f.end()
 		q := r.URL.Query()
 		if q.Has("error") {
+			f.outcome(semconv.ConnectBankDeclined)
 			// The error code is the bank's text, so neither the page nor the log repeats it.
 			http.Error(w, "The bank did not give access, so nothing changed. Start again from the status page.",
 				http.StatusBadRequest)
@@ -335,6 +360,7 @@ func (s *Server) sharedCallback(group map[string]Source) http.Handler {
 		}
 		state, code := q.Get("state"), q.Get("code")
 		if state == "" || code == "" {
+			f.outcome(semconv.ConnectInvalidLink)
 			http.Error(w, msgInvalidLink, http.StatusBadRequest)
 			return
 		}
@@ -343,20 +369,62 @@ func (s *Server) sharedCallback(group map[string]Source) http.Handler {
 		name, err := s.read.ConnectAttemptSource(ctx, consent.HashState(state), s.opts.Now())
 		switch {
 		case errors.Is(err, store.ErrAttemptUnusable):
+			f.outcome(semconv.ConnectRefused)
 			http.Error(w, msgRefused, http.StatusBadRequest)
 			return
 		case err != nil:
+			f.failed(semconv.ErrorAttemptRead)
 			s.opts.Log.ErrorContext(r.Context(), "connect attempt not read", semconv.LogOutcome, "error")
 			http.Error(w, "The connection could not be completed. Try the link again.", http.StatusServiceUnavailable)
 			return
 		}
+		f.source(name)
 		src, ok := group[name]
 		if !ok {
+			f.outcome(semconv.ConnectRefused)
 			http.Error(w, msgRefused, http.StatusBadRequest)
 			return
 		}
-		s.complete(ctx, w, r, src, state, code)
+		s.complete(ctx, w, r, f, src, state, code)
 	})
+}
+
+// flow is the span of one connect or callback request. It records fixed words only: the source
+// name, an outcome and an error category. Never a code, a state, a query or an error.
+type flow struct{ span trace.Span }
+
+// startFlow starts the span name for source as a child of the request's server span, and returns
+// the request carrying it, so the connector's work and the log lines are inside it.
+func (s *Server) startFlow(r *http.Request, name, source string) (*http.Request, flow) {
+	ctx, span := s.tracer.Start(r.Context(), name,
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(attribute.String(semconv.SpanSource, source)))
+	return r.WithContext(ctx), flow{span}
+}
+
+func (f flow) end() { f.span.End() }
+
+// source sets the span's source once it is known.
+func (f flow) source(name string) {
+	f.span.SetAttributes(attribute.String(semconv.SpanSource, name))
+}
+
+// outcome records how the request ended.
+func (f flow) outcome(outcome string) {
+	f.span.SetAttributes(attribute.String(semconv.SpanConnectOutcome, outcome))
+}
+
+// failed records outcome failed with the error category (error.type) and marks the span failed.
+func (f flow) failed(category string) {
+	f.outcome(semconv.ConnectFailed)
+	f.span.SetAttributes(attribute.String(semconv.SpanErrorType, category))
+	telemetry.Fail(f.span, category)
+}
+
+// startFailed records a connect attempt that could not be started.
+func (f flow) startFailed() {
+	f.outcome(semconv.ConnectStartFailed)
+	telemetry.Fail(f.span, "error")
 }
 
 // callbackContext bounds a callback's exchange. The exchange spends the code and replaces the
@@ -367,14 +435,17 @@ func callbackContext(r *http.Request) (context.Context, context.CancelFunc) {
 }
 
 // complete hands state and code to src's connector and answers with the outcome.
-func (s *Server) complete(ctx context.Context, w http.ResponseWriter, r *http.Request, src Source, state, code string) {
+func (s *Server) complete(ctx context.Context, w http.ResponseWriter, r *http.Request, f flow, src Source, state, code string) {
 	err := src.Connector.HandleCallback(ctx, state, code)
 	switch {
 	case err == nil:
+		f.outcome(semconv.ConnectExchanged)
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	case src.IsRefusal(err):
+		f.outcome(semconv.ConnectRefused)
 		http.Error(w, msgRefused, http.StatusBadRequest)
 	default:
+		f.failed(semconv.ErrorExchange)
 		s.opts.Log.ErrorContext(r.Context(), "connect attempt not completed",
 			semconv.LogSource, src.Name, semconv.LogOutcome, "error")
 		http.Error(w, "The connection could not be completed. Start again from the status page.",
