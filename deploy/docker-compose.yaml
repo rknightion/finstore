@@ -1,5 +1,6 @@
-# An example deployment: the database, the service, and a one-off container for the owner commands.
-# Copy it, set your own host name and paths, and keep both env files at mode 600.
+# An example deployment: the database, the service, a Tailscale sidecar that is the only way in, and
+# a one-off container for the owner commands. Copy it, set your own paths, and keep the env files at
+# mode 600. docs/operations.md explains the sidecar and the alternative of a sign-in proxy.
 name: finstore
 
 services:
@@ -36,16 +37,46 @@ services:
     volumes:
       # Written by the dump script; the service only reports its time as a metric.
       - ./data/status:/var/lib/finstore/status:ro
+    # No ports and no shared network: only the sidecar below reaches port 8080. Anything that can
+    # reach it directly can claim to be anyone through FINSTORE_AUTH_HEADER.
     networks: [default]
-    # Put a reverse proxy that signs users in front of port 8080 and have it pass the signed-in
-    # address in the header named by FINSTORE_AUTH_HEADER. The path prefix /callback/ must reach
-    # the service without the sign-in, and nothing should be reachable from the public internet.
-    # docs/operations.md shows the two routes.
-    ports:
-      - "127.0.0.1:8080:8080"
     depends_on:
       finstore-db:
         condition: service_healthy
+
+  # The service's own tailnet node. `tailscale serve` terminates HTTPS with a certificate for the
+  # node's MagicDNS name (TS_HOSTNAME plus your tailnet's DNS suffix), proxies to finstore:8080, and
+  # adds Tailscale-User-Login for a signed-in user's device (stripping any copy the client sent).
+  # Tagged devices get no header and so get 404 from the pages. Restrict who reaches the tag in your
+  # tailnet policy.
+  finstore-ts:
+    image: tailscale/tailscale:v1.104.1@sha256:87c55d6be56ad85b3d8bceca5f87f73de288c609131460dd1be1874c250cc41d
+    container_name: finstore-ts
+    restart: unless-stopped
+    env_file: ./ts.env # TS_AUTHKEY: a pre-authorised key for the tag; used once, then the state holds the identity
+    environment:
+      TS_HOSTNAME: finstore
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "true"
+      TS_AUTH_ONCE: "true"
+      TS_EXTRA_ARGS: "--advertise-tags=tag:finstore"
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: "127.0.0.1:9002"
+      TS_SERVE_CONFIG: /config/tailscale-serve.json
+    volumes:
+      - ./data/ts-state:/var/lib/tailscale
+      # Mount the directory, not the file: a bind-mounted file breaks config-change detection.
+      - ./ts:/config:ro
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [default]
+    depends_on: [finstore]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9002/healthz"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   # docker compose run --rm finstore-admin bootstrap|migrate|renormalise
   finstore-admin:
