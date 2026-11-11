@@ -155,6 +155,13 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 		return err
 	}
 
+	// Before any worker starts: a connection string for the wrong role stops serve here.
+	mcpHandler, closeMCP, err := openMCP(ctx, cfg, providers, metrics, log, e.Version)
+	if err != nil {
+		return err
+	}
+	defer closeMCP()
+
 	l := NewLedger(cfg.Timezone, log, providers.Tracer(semconv.ServiceName))
 	opts := monzo.Options{
 		ClientID: cfg.MonzoClientID, ClientSecret: cfg.MonzoClientSecret,
@@ -224,6 +231,7 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 		Now:           e.now,
 		Log:           log,
 		Tracer:        providers.Tracer(semconv.ServiceName),
+		MCP:           mcpHandler,
 	}, reader{st})
 	if err != nil {
 		return err

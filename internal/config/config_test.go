@@ -181,6 +181,7 @@ func TestSecretsAreRedacted(t *testing.T) {
 		EnvTrueLayerClientID:     "client-id-test",
 		EnvTrueLayerClientSecret: "SECRET-MARKER-truelayer",
 		EnvOTLPToken:             "SECRET-MARKER-token",
+		EnvMCPDatabaseURL:        "SECRET-MARKER-mcp-url",
 		EnvAllowedEmails:         "SECRET-MARKER-email@example.com",
 	}
 	c, err := Load(env(secrets))
@@ -264,5 +265,54 @@ func TestOTelSDKDisabled(t *testing.T) {
 	}
 	if EnvOTelSDKDisabled != "OTEL_SDK_DISABLED" {
 		t.Errorf("variable name = %q", EnvOTelSDKDisabled)
+	}
+}
+
+// The two MCP settings have no default, load in any combination, are required by no command, and
+// the database URL is redacted (it holds a password) while the capability name, which is not a
+// secret, is printed.
+func TestMCPSettings(t *testing.T) {
+	c, err := Load(env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MCPDatabaseURL != "" || c.MCPAppCap != "" {
+		t.Errorf("MCP defaults = %q, %q, want both empty", c.MCPDatabaseURL, c.MCPAppCap)
+	}
+	if !strings.Contains(c.String(), "mcp_database_url=unset") || !strings.Contains(c.String(), "mcp_app_cap=unset") {
+		t.Errorf("String does not say the MCP settings are unset: %s", c.String())
+	}
+	for name, vars := range map[string]map[string]string{
+		"url only": {EnvMCPDatabaseURL: " host=db user=finstore_mcp "},
+		"cap only": {EnvMCPAppCap: " example.com/cap/finstore "},
+		"both":     {EnvMCPDatabaseURL: "host=db user=finstore_mcp", EnvMCPAppCap: "example.com/cap/finstore"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, err := Load(env(vars))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := c.MCPDatabaseURL; got != strings.TrimSpace(vars[EnvMCPDatabaseURL]) {
+				t.Errorf("MCPDatabaseURL = %q", got)
+			}
+			if got := c.MCPAppCap; got != strings.TrimSpace(vars[EnvMCPAppCap]) {
+				t.Errorf("MCPAppCap = %q", got)
+			}
+		})
+	}
+	for cmd, names := range requirements {
+		for _, name := range names {
+			if name == EnvMCPDatabaseURL || name == EnvMCPAppCap {
+				t.Errorf("%s requires %s", cmd, name)
+			}
+		}
+	}
+	c, err = Load(env(map[string]string{EnvMCPDatabaseURL: "SECRET-MARKER-mcp", EnvMCPAppCap: "example.com/cap/finstore"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := c.String(); !strings.Contains(s, "mcp_database_url=[redacted]") || !strings.Contains(s, "mcp_app_cap=example.com/cap/finstore") ||
+		strings.Contains(s, "SECRET-MARKER") {
+		t.Errorf("String = %s", s)
 	}
 }

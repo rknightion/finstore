@@ -47,7 +47,10 @@ services:
   # The service's own tailnet node. `tailscale serve` terminates HTTPS with a certificate for the
   # node's MagicDNS name (TS_HOSTNAME plus your tailnet's DNS suffix), proxies to finstore:8080, and
   # adds Tailscale-User-Login for a signed-in user's device (stripping any copy the client sent).
-  # Tagged devices get no header and so get 404 from the pages. Restrict who reaches the tag in your
+  # Tagged devices get no such header and so get 404 from the pages. They can still use /mcp: the
+  # handler in tailscale-serve.json lists an app capability in AcceptAppCaps, and the proxy passes
+  # the caller's grant of it in Tailscale-App-Capabilities (also stripping any copy the client
+  # sent), which /mcp requires (FINSTORE_MCP_APP_CAP). Restrict who reaches the tag in your
   # tailnet policy.
   finstore-ts:
     image: tailscale/tailscale:v1.104.1@sha256:87c55d6be56ad85b3d8bceca5f87f73de288c609131460dd1be1874c250cc41d

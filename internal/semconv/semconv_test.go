@@ -54,6 +54,7 @@ func TestIsStatusCategory(t *testing.T) {
 		"cards_refused", "window_closed", "timestamp_group_over_page", "check_failed",
 		"account_mismatch", "unknown_format", "rejected_before", "database_error", "attempt_read",
 		"exchange", "cancelled", "internal", "unexpected_body", "error",
+		"invalid", "busy", "refused",
 	} {
 		if !IsStatusCategory(w) {
 			t.Errorf("%q should be a category", w)
@@ -66,5 +67,79 @@ func TestIsStatusCategory(t *testing.T) {
 		if IsStatusCategory(w) {
 			t.Errorf("%q must not be a category", w)
 		}
+	}
+}
+
+// The MCP attributes survive the exporter allow-list, with the names the OpenTelemetry conventions
+// give them (semantic-conventions v1.45.0 registry, MCP and GenAI sections), and finstore's own
+// keep the finstore. prefix. None of them can carry SQL or a row.
+func TestMCPSpanAttributesAreAllowed(t *testing.T) {
+	for want, key := range map[string]string{
+		"mcp.method.name": SpanMCPMethodName, "mcp.protocol.version": SpanMCPProtocolVersion,
+		"gen_ai.tool.name": SpanGenAIToolName, "gen_ai.operation.name": SpanGenAIOperationName,
+		"finstore.mcp.client": SpanMCPClient, "finstore.mcp.rows": SpanMCPRows, "finstore.mcp.truncated": SpanMCPTruncated,
+	} {
+		if key != want {
+			t.Errorf("constant = %q, want %q", key, want)
+		}
+		if !IsSpanAttribute(want) {
+			t.Errorf("%q is not allowed", want)
+		}
+	}
+	for _, k := range []string{
+		"gen_ai.tool.call.arguments", "gen_ai.tool.call.result", "gen_ai.prompt.variable.x",
+		"mcp.resource.uri", "mcp.session.id", "jsonrpc.request.id", "finstore.mcp.sql", "finstore.mcp.args",
+	} {
+		if IsSpanAttribute(k) {
+			t.Errorf("%q must not be allowed: it can carry what the caller sent or read", k)
+		}
+	}
+}
+
+func TestMCPLogFieldsAreAllowed(t *testing.T) {
+	for _, f := range []string{"tool", "client", "peer", "outcome", "rows", "truncated", "duration_ms", "args", "sql", "stack"} {
+		if !IsLogField(f) {
+			t.Errorf("log field %q is not allowed", f)
+		}
+	}
+	for _, f := range []string{"result", "query", "row", "rows_data"} {
+		if IsLogField(f) {
+			t.Errorf("log field %q must not be allowed", f)
+		}
+	}
+}
+
+// Every outcome but ok is a status description the exporter keeps, so a failed tool call span does
+// not read "error" whatever its cause.
+func TestEveryMCPFailureOutcomeMayBeAStatusDescription(t *testing.T) {
+	for _, o := range []string{MCPOutcomeInvalid, MCPOutcomeBusy, MCPOutcomeTimeout, MCPOutcomeRefused, MCPOutcomeError} {
+		if !IsStatusCategory(o) {
+			t.Errorf("outcome %q is not a status category", o)
+		}
+	}
+}
+
+func TestMCPToolsAreTheFiveAndACopy(t *testing.T) {
+	got := MCPTools()
+	want := []string{"overview", "search_transactions", "spending_summary", "describe_schema", "query_sql"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("MCPTools = %v, want %v", got, want)
+	}
+	got[0] = "tampered"
+	if MCPTools()[0] != "overview" {
+		t.Error("MCPTools returns the live slice")
+	}
+	for _, n := range want {
+		if !IsMCPTool(n) {
+			t.Errorf("%q is not a tool", n)
+		}
+	}
+	for _, n := range []string{"", MCPToolUnknown, "OVERVIEW", "overview ", "x'; DROP TABLE y"} {
+		if IsMCPTool(n) {
+			t.Errorf("%q must not be a tool", n)
+		}
+	}
+	if MetricMCPToolCalls != "finstore.mcp.tool.calls" || AttrTool != "tool" || AttrClient != "client" || AttrOutcome != "outcome" {
+		t.Error("the MCP metric name or attribute keys changed")
 	}
 }
