@@ -421,6 +421,23 @@ const (
 	callbackTimeout = 75 * time.Second
 )
 
+// feedLabel names where an account's data comes from: Monzo's own API, TrueLayer, or statement
+// files. An API source it does not know is shown as stored.
+func feedLabel(feed, source string) string {
+	switch {
+	case feed == "file":
+		return "statement file"
+	case source == "monzo":
+		return "Monzo API"
+	case strings.HasPrefix(source, "truelayer:"):
+		return "TrueLayer"
+	case source != "":
+		return source
+	default:
+		return feed
+	}
+}
+
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
@@ -478,7 +495,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, c := range coverage {
 		a := pageAccount{
-			Slug: c.AccountSlug, Feed: c.Feed,
+			Slug: c.AccountSlug, Feed: feedLabel(c.Feed, c.Source),
 			Earliest: day(c.EarliestDate), Latest: day(c.LatestDate),
 			Transactions:      c.TransactionCount,
 			State:             strings.ReplaceAll(c.ReconciliationState, "_", " "),

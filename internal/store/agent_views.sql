@@ -298,7 +298,8 @@ SELECT a.slug AS account_slug,
        r.last_diff_minor,
        coalesce(g.gaps, '[]'::jsonb) AS gaps,
        fl.d AS latest_statement_date,
-       r.failed_on
+       r.failed_on,
+       a.source
 FROM core.account a
 LEFT JOIN txn ON txn.account_id = a.id
 LEFT JOIN core.reconciliation r ON r.account_id = a.id

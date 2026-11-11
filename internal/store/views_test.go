@@ -196,7 +196,7 @@ func TestCoverageGaps(t *testing.T) {
 		t.Errorf("mortgage state %q, want not_checked", s)
 	}
 	j := bySlug["joint"]
-	if j.TransactionCount != 1 || j.LatestDate == nil || !j.LatestDate.Equal(day(today, -36)) || j.Feed != "file" {
+	if j.TransactionCount != 1 || j.LatestDate == nil || !j.LatestDate.Equal(day(today, -36)) || j.Feed != "file" || j.Source != "test" {
 		t.Errorf("joint row %+v", j)
 	}
 

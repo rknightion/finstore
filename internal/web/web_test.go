@@ -405,6 +405,25 @@ func TestStatusPageShowsStatesDatesAndCountsButNoAmount(t *testing.T) {
 	}
 }
 
+func TestStatusPageNamesWhereEachAccountsDataComesFrom(t *testing.T) {
+	read := &fakeReader{coverage: []store.CoverageRow{
+		{AccountSlug: "monzo-current", Feed: "api", Source: "monzo"},
+		{AccountSlug: "lloyds-joint", Feed: "api", Source: "truelayer:ob-lloyds"},
+		{AccountSlug: "bank-joint", Feed: "file", Source: "manual"},
+	}}
+	h := newServer(t, &fakeConn{}, read, nil)
+	body := do(h, http.MethodGet, "/", signedIn(nil)).Body.String()
+	for _, want := range []string{
+		"<td>monzo-current</td><td>Monzo API</td>",
+		"<td>lloyds-joint</td><td>TrueLayer</td>",
+		"<td>bank-joint</td><td>statement file</td>",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("page lacks %q", want)
+		}
+	}
+}
+
 func TestStatusPageOffersConnectBeforeAnyConsentExists(t *testing.T) {
 	h := newServer(t, &fakeConn{}, &fakeReader{}, nil)
 	body := do(h, http.MethodGet, "/", signedIn(nil)).Body.String()
