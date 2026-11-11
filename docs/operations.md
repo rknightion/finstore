@@ -92,9 +92,19 @@ docker exec -i finstore finstore import --account bank-joint --format halifax-pd
 
 | Exit code | Meaning |
 |---|---|
-| 0 | Imported, or "already imported" for a file whose bytes were imported before |
-| 2 | Rejected by a check. The file is kept in `raw.import_file`; no rows were stored |
+| 0 | Imported, or "already imported" when this exact file was imported into this account before |
+| 2 | Rejected, with the reason. The file is kept in `raw.import_file`; no rows were stored. Giving a rejected file again is rejected again |
 | 3 | The account is unknown, or is fed by an API |
+
+Every command exits 1 for any other failure, such as a database it cannot reach, and 64 for a
+command line it cannot understand.
+
+The first PDF statement imported into an account ties the account to that statement's sort code
+and account number. A later statement with different numbers is rejected, so a statement cannot
+land in the wrong account by a slip of `--account`.
+
+A file rejected because the reader misread it is not lost: the bytes are stored. Once the reader
+is corrected, `finstore renormalise` reads every stored file again.
 
 Formats:
 
@@ -108,9 +118,13 @@ Formats:
   previous one plus `amount`. Rows are oldest first.
 
 Importing a statement that overlaps one already imported is safe: rows are matched and stored once.
-That is how a part-month statement followed by the full month works. If a statement does not follow
-from the balance already stored (a month was skipped), it is still imported, and the gap is recorded
-and shown in the coverage view until the missing statement arrives.
+That is how a part-month statement followed by the full month works. Statements can be imported in
+any order, oldest last if that is how you find them.
+
+If two statements do not join up, both are still imported, and the gap between them is recorded and
+shown in the coverage view until the missing statement arrives. For PDF statements a gap is a break
+in the printed periods or in the balance. For `manual-csv` only the balance can show it, so a
+skipped stretch in which money in equalled money out goes unnoticed.
 
 ## Commands
 
@@ -120,10 +134,10 @@ and shown in the coverage view until the missing statement arrives.
 | `finstore migrate` | owner | Applies the migrations and the grants. Says so when a `renormalise` is required |
 | `finstore serve` | app | The HTTP server, the scheduler and the Monzo worker |
 | `finstore account add`, `finstore account list` | app | Create and list file-fed accounts |
-| `finstore account accept-difference --slug S --reason TEXT` | app | Records that the account's current balance difference is known and accepted, so it stops counting as a mismatch. A different difference later counts again |
+| `finstore account accept-difference --slug S --reason TEXT` | app | For an account an API feeds: records that its current balance difference is known and accepted, so it stops counting as a mismatch. A different difference later counts again. A statement-fed account is refused: its gaps close when the missing statement is imported |
 | `finstore import` | app | Imports one statement from standard input |
-| `finstore load-capture --dir PATH [--dir PATH]...` | app | Loads API responses captured before the service existed. Loading twice loads once |
-| `finstore renormalise [--verify]` | owner | Rebuilds `core` from `raw`. With `--verify` it changes nothing: exit 0 when the rebuilt copy equals the live one, 4 when it differs, listing table, id and column |
+| `finstore load-capture --dir PATH [--dir PATH]...` | app | Loads API responses captured before the service existed. Loading twice loads once, and a capture older than what is already held never replaces newer data |
+| `finstore renormalise [--verify]` | owner | Rebuilds `core` from `raw`. With `--verify` it swaps nothing: exit 0 when the rebuilt copy equals the live one, 4 when it differs, listing table, key, column and kind of difference. Either way it first normalises any stored rows the live record has not caught up with |
 | `finstore coverage [--json]` | app | Prints the coverage view |
 | `finstore healthcheck` | none | Exit 0 when the local server answers `/healthz` with 200, 1 otherwise |
 | `finstore version` | none | Version, commit and build date |
@@ -152,7 +166,7 @@ Environment variables only.
 | `FINSTORE_MONZO_NIGHTLY_AT` | `serve` | `03:20` | Local time of the 89-day sync |
 | `FINSTORE_MONZO_BACKFILL_CONCURRENCY` | `serve` | `6` | Ranges fetched at once during the full-history fetch |
 | `FINSTORE_MONZO_WINDOW` | `serve` | `240s` | How long after the email link the full-history fetch runs |
-| `FINSTORE_TIMEZONE` | all | `Europe/London` | Zone for a transaction's day and for the nightly time |
+| `FINSTORE_TIMEZONE` | all | `Europe/London` | Zone for a transaction's day and for the nightly time. Changing it after data is stored needs a `renormalise`, or days are mixed between the two zones |
 | `FINSTORE_DUMP_STATUS_FILE` | `serve` | empty | The dump script's status file; the dump metric is off when empty |
 | `FINSTORE_OTLP_ENDPOINT`, `FINSTORE_OTLP_INSTANCE_ID`, `FINSTORE_OTLP_TOKEN` | `serve` | empty | OTLP over HTTP with basic auth; export is off when the endpoint is empty |
 | `FINSTORE_ENVIRONMENT` | `serve` | `dev` | Value of `deployment.environment.name` |
@@ -208,7 +222,7 @@ only then replaces the previous one. Point your backup tool at the dump director
 Postgres data directory out of it: a file-level copy of a running data directory is not a backup.
 
 ```sh
-install -m 755 deploy/finstore-dump.sh /opt/backup-dumps/finstore-dump.sh
+install -D -m 755 deploy/finstore-dump.sh /opt/backup-dumps/finstore-dump.sh
 install -m 644 deploy/backup-dump-finstore.service deploy/backup-dump-finstore.timer /etc/systemd/system/
 install -m 644 deploy/finstore-dump.default.example /etc/default/finstore-dump   # then edit it
 systemctl daemon-reload && systemctl enable --now backup-dump-finstore.timer
@@ -230,8 +244,8 @@ docker compose run --rm finstore-admin migrate
 docker compose up -d finstore
 ```
 
-Then reconnect Monzo from the status page: the restored database has no tokens, so Monzo shows as
-not connected. Nothing else is lost.
+Then reconnect Monzo from the status page. The restored database has no tokens, so at its first
+sync the service marks the connection as lost; reconnecting brings it back. Nothing else is lost.
 
 ## Updating
 
@@ -275,5 +289,5 @@ older than 14 hours; `finstore.up` absent for an hour.
 | Coverage shows "the Monzo window closed before this range was fetched" | The five minutes ran out | Reconnect: unfinished ranges are fetched first |
 | Coverage shows "no completed fetch covers this period" | The service was down or disconnected for more than 90 days | Reconnect: the full-history fetch fills it |
 | A Monzo account shows `mismatch` | The stored transactions do not add up to the bank's balance | A sync usually clears it. If it lasts, compare `raw` with `core` and run `renormalise --verify`. A closed account with a difference that will never change can be accepted with `account accept-difference` |
-| An import exits 2 | The statement failed a check, or its layout changed | The file is kept in `raw.import_file`. Nothing was stored. If the layout changed, the reader needs updating |
+| An import exits 2 | The statement failed a check, belongs to another bank account, was given with the wrong `--format`, or its layout changed | The message says which. The file is kept in `raw.import_file` and nothing was stored. A wrong format: give it again with the right one. A changed layout: the reader needs updating, then `renormalise` |
 | Coverage shows "no file covers these days" | A statement was skipped | Import the missing statement |

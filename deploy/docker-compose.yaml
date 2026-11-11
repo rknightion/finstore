@@ -17,7 +17,9 @@ services:
     # No ports: the database is reached only by the service and through `docker exec`.
     networks: [default]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d finstore"]
+      # Over TCP on purpose: during the image's first start a temporary server answers on the
+      # socket before the real one listens on the network.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d finstore"]
       interval: 10s
       timeout: 5s
       retries: 10
