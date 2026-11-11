@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -45,7 +46,8 @@ var ErrNoRecorder = errors.New("bankhttp: rule is recorded but no recorder is co
 
 const (
 	tokenMethod = http.MethodPost
-	tokenPath   = "/oauth2/token" //nolint:gosec // an endpoint path, not a credential
+	// defaultTokenPath is the token path of a client that WithTokenPath does not change.
+	defaultTokenPath = "/oauth2/token" //nolint:gosec // an endpoint path, not a credential
 
 	maxRetries429   = 6
 	maxRetries5xx   = 3
@@ -55,17 +57,62 @@ const (
 	maxBodyBytes    = 64 << 20
 )
 
-// Rule allows one method and exact path. Record says whether every response
-// to it is handed to the Recorder.
+// Rule allows one method and path. A path segment written {id} is a template:
+// it matches one segment of ASCII letters, digits and hyphens, and the
+// template, not the path sent, is what the Recorder and an Error carry. Record
+// says whether every response to it is handed to the Recorder.
 type Rule struct {
 	Method, Path string
 	Record       bool
 }
 
+// idSegment is the template segment.
+const idSegment = "{id}"
+
+var idPattern = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
+
+// matches reports whether path fits template segment by segment.
+func matches(template, path string) bool {
+	ts, ps := strings.Split(template, "/"), strings.Split(path, "/")
+	if len(ts) != len(ps) {
+		return false
+	}
+	for i := range ts {
+		if ts[i] == idSegment {
+			if !idPattern.MatchString(ps[i]) {
+				return false
+			}
+		} else if ts[i] != ps[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // MonzoRules is the allow-list for the Monzo API.
 func MonzoRules() []Rule {
-	rules := []Rule{{Method: tokenMethod, Path: tokenPath}}
+	rules := []Rule{{Method: tokenMethod, Path: defaultTokenPath}}
 	for _, p := range []string{"/ping/whoami", "/accounts", "/balance", "/pots", "/transactions", "/webhooks"} {
+		rules = append(rules, Rule{Method: http.MethodGet, Path: p, Record: true})
+	}
+	return rules
+}
+
+// TrueLayerAuthTokenPath is the token path of TrueLayer's auth server.
+const TrueLayerAuthTokenPath = "/connect/token" //nolint:gosec // an endpoint path, not a credential
+
+// TrueLayerAuthRules is the allow-list for TrueLayer's auth server: the token call only. Its
+// client is created WithTokenPath(TrueLayerAuthTokenPath).
+func TrueLayerAuthRules() []Rule {
+	return []Rule{{Method: tokenMethod, Path: TrueLayerAuthTokenPath}}
+}
+
+// TrueLayerAPIRules is the allow-list for TrueLayer's Data API v1: six reads, every one recorded.
+func TrueLayerAPIRules() []Rule {
+	var rules []Rule
+	for _, p := range []string{"/data/v1/me", "/data/v1/accounts", "/data/v1/accounts/{id}/balance",
+		"/data/v1/accounts/{id}/transactions", "/data/v1/accounts/{id}/standing_orders",
+		"/data/v1/accounts/{id}/direct_debits"} {
 		rules = append(rules, Rule{Method: http.MethodGet, Path: p, Record: true})
 	}
 	return rules
@@ -90,7 +137,8 @@ type Response struct {
 	Duration    time.Duration
 }
 
-// Recorded is one response handed to the Recorder.
+// Recorded is one response handed to the Recorder. Endpoint is the rule's path,
+// the template for a template rule.
 type Recorded struct {
 	Endpoint    string
 	Query       map[string][]string
@@ -98,6 +146,22 @@ type Recorded struct {
 	ContentType string
 	FetchedAt   time.Time
 	Body        []byte
+	// Params are the request parameters the caller put on the context with
+	// WithRequestParams, or nil.
+	Params map[string]string
+}
+
+type paramsKey struct{}
+
+// WithRequestParams returns ctx carrying params, which every response recorded
+// for a request made under it is handed to the Recorder with. The map is copied.
+func WithRequestParams(ctx context.Context, params map[string]string) context.Context {
+	return context.WithValue(ctx, paramsKey{}, maps.Clone(params))
+}
+
+func requestParams(ctx context.Context) map[string]string {
+	p, _ := ctx.Value(paramsKey{}).(map[string]string)
+	return maps.Clone(p)
 }
 
 // Recorder stores a response. It is called for every attempt that received a
@@ -134,6 +198,15 @@ func WithTimeouts(connect, request time.Duration) Option {
 	return func(c *Client) { c.connectTimeout, c.requestTimeout = connect, request }
 }
 
+// WithTokenPath sets the path of the token call (default /oauth2/token): a POST
+// there is never repeated after a transport failure or a 5xx, since a refresh
+// token may have been spent.
+func WithTokenPath(path string) Option { return func(c *Client) { c.tokenPath = path } }
+
+// WithoutRetries turns off every retry (429, 5xx and transport failures), so
+// one call is exactly one attempt.
+func WithoutRetries() Option { return func(c *Client) { c.retries = false } }
+
 // WithClock overrides the clock.
 func WithClock(now func() time.Time) Option { return func(c *Client) { c.now = now } }
 
@@ -147,6 +220,9 @@ func WithSleep(sleep func(ctx context.Context, d time.Duration) error) Option {
 type Client struct {
 	base           *url.URL
 	rules          map[string]Rule
+	templates      []Rule
+	tokenPath      string
+	retries        bool
 	recorder       Recorder
 	connectTimeout time.Duration
 	requestTimeout time.Duration
@@ -164,12 +240,18 @@ func New(baseURL string, rules []Rule, opts ...Option) (*Client, error) {
 	c := &Client{
 		base:           u,
 		rules:          make(map[string]Rule, len(rules)),
+		tokenPath:      defaultTokenPath,
+		retries:        true,
 		connectTimeout: 10 * time.Second,
 		requestTimeout: 30 * time.Second,
 		now:            time.Now,
 		sleep:          sleepCtx,
 	}
 	for _, r := range rules {
+		if strings.Contains(r.Path, idSegment) {
+			c.templates = append(c.templates, r)
+			continue
+		}
 		c.rules[ruleKey(r.Method, r.Path)] = r
 	}
 	for _, o := range opts {
@@ -191,6 +273,20 @@ func New(baseURL string, rules []Rule, opts ...Option) (*Client, error) {
 
 func ruleKey(method, path string) string { return method + " " + path }
 
+// rule returns the rule that allows method and path: an exact rule, else a
+// template rule.
+func (c *Client) rule(method, path string) (Rule, bool) {
+	if r, ok := c.rules[ruleKey(method, path)]; ok {
+		return r, true
+	}
+	for _, r := range c.templates {
+		if r.Method == method && matches(r.Path, path) {
+			return r, true
+		}
+	}
+	return Rule{}, false
+}
+
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -205,24 +301,29 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 // Do sends req if it is on the allow-list. A non-2xx final response is
 // returned together with a *Error.
 func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
-	rule, ok := c.rules[ruleKey(req.Method, req.Path)]
+	rule, ok := c.rule(req.Method, req.Path)
 	if !ok {
 		return nil, ErrNotAllowed
 	}
 	if rule.Record && c.recorder == nil {
 		return nil, ErrNoRecorder
 	}
-	isToken := req.Method == tokenMethod && req.Path == tokenPath
+	isToken := req.Method == tokenMethod && req.Path == c.tokenPath
+	// What leaves the package names the rule's path: a template's concrete path
+	// holds an id from a bank response.
+	named := req
+	named.Path = rule.Path
+	params := requestParams(ctx)
 
 	var n429, n5xx, nNet int
 	for {
 		resp, err := c.attempt(ctx, req)
 		if err != nil {
 			cat := networkCategory(ctx, err)
-			e := &Error{Method: req.Method, Path: req.Path, Category: cat}
+			e := &Error{Method: req.Method, Path: rule.Path, Category: cat}
 			// A token request may have been processed and a refresh token is
 			// single-use, so it is never repeated after a transport failure.
-			if isToken || ctx.Err() != nil || nNet >= maxRetryNetwork {
+			if isToken || !c.retries || ctx.Err() != nil || nNet >= maxRetryNetwork {
 				return nil, e
 			}
 			if c.sleep(ctx, backoff(nNet)) != nil {
@@ -233,7 +334,8 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 		}
 		if rule.Record {
 			rec := Recorded{
-				Endpoint:    req.Path,
+				Endpoint:    rule.Path,
+				Params:      params,
 				Query:       cloneValues(req.Query),
 				Status:      resp.Status,
 				ContentType: resp.ContentType,
@@ -241,14 +343,16 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 				Body:        resp.Body,
 			}
 			if err := c.recorder.Record(ctx, rec); err != nil {
-				return resp, fmt.Errorf("bankhttp: %s %s: recording response: %w", req.Method, req.Path, err)
+				return resp, fmt.Errorf("bankhttp: %s %s: recording response: %w", req.Method, rule.Path, err)
 			}
 		}
 		if resp.Status >= 200 && resp.Status < 300 {
 			return resp, nil
 		}
-		e := classify(req, resp)
+		e := classify(named, resp)
 		switch {
+		case !c.retries:
+			return resp, e
 		case resp.Status == http.StatusTooManyRequests && n429 < maxRetries429:
 			if c.sleep(ctx, backoff(n429)) != nil {
 				return resp, e
@@ -342,11 +446,17 @@ var bankCodePattern = regexp.MustCompile(`^[a-z0-9_.]{1,100}$`)
 
 func classify(req Request, resp *Response) *Error {
 	e := &Error{Method: req.Method, Path: req.Path, Status: resp.Status}
-	var parsed struct {
-		Code string `json:"code"`
-	}
-	if json.NewDecoder(bytes.NewReader(resp.Body)).Decode(&parsed) == nil && bankCodePattern.MatchString(parsed.Code) {
-		e.BankCode = parsed.Code
+	// The code is read from "code" (Monzo) or, failing that, "error" (OAuth and
+	// TrueLayer); a field that is not a well-formed code string is ignored.
+	var parsed map[string]json.RawMessage
+	if json.NewDecoder(bytes.NewReader(resp.Body)).Decode(&parsed) == nil {
+		for _, field := range []string{"code", "error"} {
+			var code string
+			if json.Unmarshal(parsed[field], &code) == nil && bankCodePattern.MatchString(code) {
+				e.BankCode = code
+				break
+			}
+		}
 	}
 	switch {
 	case resp.Status == http.StatusTooManyRequests:

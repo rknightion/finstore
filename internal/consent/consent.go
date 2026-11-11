@@ -44,6 +44,9 @@ const (
 	// ReasonTokenMissing ends a consent that has no stored token, as after a database restore:
 	// the dump holds the consent but never the token.
 	ReasonTokenMissing Reason = "token_missing"
+	// ReasonAccessDenied ends an active consent whose data call the bank refused for access (a 401
+	// or an access_denied error), as TrueLayer does once the bank has withdrawn the consent.
+	ReasonAccessDenied Reason = "access_denied"
 )
 
 // End reasons stored for the two other ending states.
@@ -184,15 +187,25 @@ func (m *Manager) Approved(ctx context.Context, q store.DBTX, id int64) (store.C
 	return c, transitionErr(err)
 }
 
+// ApprovedUntil makes consent id active from now, expected to expire at expiry: the end the bank
+// reports, where Approved assumes Lifetime. Only a consent awaiting approval can be approved.
+func (m *Manager) ApprovedUntil(ctx context.Context, q store.DBTX, id int64, expiry time.Time) (store.Consent, error) {
+	c, err := store.TransitionConsent(ctx, q, id, store.ConsentTransition{
+		To: store.ConsentActive, At: m.now(), ExpectedExpiryAt: &expiry,
+		From: []string{store.ConsentAwaitingApproval},
+	})
+	return c, transitionErr(err)
+}
+
 // Lost ends consent id as lost for reason. An approval timeout ends only a consent awaiting
-// approval; missing permissions end only an active one; a rejected refresh or a missing token
-// ends either.
+// approval; missing permissions and a refused data call end only an active one; a rejected
+// refresh or a missing token ends either.
 func (m *Manager) Lost(ctx context.Context, q store.DBTX, id int64, reason Reason) (store.Consent, error) {
 	var from []string
 	switch reason {
 	case ReasonApprovalTimeout:
 		from = []string{store.ConsentAwaitingApproval}
-	case ReasonInsufficientPermissions:
+	case ReasonInsufficientPermissions, ReasonAccessDenied:
 		from = []string{store.ConsentActive}
 	case ReasonRefreshRejected, ReasonTokenMissing:
 		from = []string{store.ConsentAwaitingApproval, store.ConsentActive}

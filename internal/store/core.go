@@ -813,6 +813,30 @@ func mandateTables(kind string) (table, versionTable, idColumn string, err error
 	return "", "", "", fmt.Errorf("%w: %q", ErrBadMandateKind, kind)
 }
 
+// UnresolvedMandates returns, for every source that holds a standing order or a direct debit, how
+// many of its mandates of either kind have no account: a source whose mandates have all resolved
+// is present with 0.
+func (c Core) UnresolvedMandates(ctx context.Context) (map[string]int, error) {
+	rows, err := c.q.Query(ctx, c.sql(`SELECT source, count(*) FILTER (WHERE account_id IS NULL)::int FROM (
+		  SELECT source, account_id FROM core.standing_order
+		  UNION ALL SELECT source, account_id FROM core.direct_debit) m
+		GROUP BY source`))
+	if err != nil {
+		return nil, fmt.Errorf("store: unresolved mandates: %w", err)
+	}
+	out := map[string]int{}
+	var source string
+	var n int
+	_, err = pgx.ForEachRow(rows, []any{&source, &n}, func() error {
+		out[source] = n
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: unresolved mandates: %w", err)
+	}
+	return out, nil
+}
+
 // MandateState is the version state of a stored mandate.
 type MandateState struct {
 	VersionCount  int

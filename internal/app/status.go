@@ -88,6 +88,13 @@ func (p *statusPublisher) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	unresolved, err := core.UnresolvedMandates(ctx)
+	if err != nil {
+		return err
+	}
+	for source, n := range unresolved {
+		p.m.MandatesUnresolved(ctx, source, n)
+	}
 	accounts, err := core.ListAccounts(ctx)
 	if err != nil {
 		return err

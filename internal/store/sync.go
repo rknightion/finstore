@@ -69,6 +69,21 @@ func GetRun(ctx context.Context, q DBTX, id int64) (Run, error) {
 	return r, nil
 }
 
+// UnfinishedRuns returns the ids of source's runs of kind that recorded no end, oldest first: runs
+// a restart interrupted.
+func UnfinishedRuns(ctx context.Context, q DBTX, source, kind string) ([]int64, error) {
+	rows, err := q.Query(ctx, `SELECT id FROM sync.run WHERE source = $1 AND kind = $2 AND finished_at IS NULL
+		ORDER BY id`, source, kind)
+	if err != nil {
+		return nil, fmt.Errorf("store: unfinished runs: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return nil, fmt.Errorf("store: unfinished runs: %w", err)
+	}
+	return ids, nil
+}
+
 // Consent states.
 const (
 	ConsentAwaitingApproval = "awaiting_approval"
@@ -261,6 +276,23 @@ func ConsumeConnectAttempt(ctx context.Context, q DBTX, stateSHA256 []byte, now 
 		return ConnectAttempt{}, fmt.Errorf("store: consume connect attempt: %w", err)
 	}
 	return a, nil
+}
+
+// ConnectAttemptSource returns the source of the attempt with this state hash without changing
+// it, so a callback shared by several sources can choose the one to hand the state to. It returns
+// ErrAttemptUnusable for an attempt ConsumeConnectAttempt would refuse at now: unknown, expired,
+// already used or already given an outcome.
+func ConnectAttemptSource(ctx context.Context, q DBTX, stateSHA256 []byte, now time.Time) (string, error) {
+	var source string
+	err := q.QueryRow(ctx, `SELECT source FROM sync.connect_attempt
+		WHERE state_sha256 = $1 AND used_at IS NULL AND outcome IS NULL AND expires_at > $2`, stateSHA256, now).Scan(&source)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrAttemptUnusable
+	}
+	if err != nil {
+		return "", fmt.Errorf("store: connect attempt source: %w", err)
+	}
+	return source, nil
 }
 
 // SetConnectAttemptOutcome records the outcome of attempt id (AttemptExchanged or AttemptRefused).
