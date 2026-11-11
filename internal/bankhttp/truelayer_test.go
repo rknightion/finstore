@@ -152,13 +152,64 @@ func TestTrueLayerRules(t *testing.T) {
 	api := collect(TrueLayerAPIRules())
 	want := []string{"GET /data/v1/me", "GET /data/v1/accounts", "GET /data/v1/accounts/{id}/balance",
 		"GET /data/v1/accounts/{id}/transactions", "GET /data/v1/accounts/{id}/standing_orders",
-		"GET /data/v1/accounts/{id}/direct_debits"}
+		"GET /data/v1/accounts/{id}/direct_debits",
+		"GET /data/v1/accounts/{id}/transactions/pending", "GET /data/v1/cards", "GET /data/v1/cards/{id}/balance",
+		"GET /data/v1/cards/{id}/transactions", "GET /data/v1/cards/{id}/transactions/pending", "GET /data/v1/info"}
 	if len(api) != len(want) {
-		t.Fatalf("api rules = %v", api)
+		t.Fatalf("api rules = %v, want %d", api, len(want))
 	}
 	for _, k := range want {
 		if rec, ok := api[k]; !ok || !rec {
 			t.Errorf("%s: present=%v record=%v", k, ok, rec)
 		}
+	}
+}
+
+// Each of the six paths added for pending transactions, cards and identity is allowed as a GET with
+// a one-segment id, and its neighbours are refused before anything is sent: a write, a longer or
+// shorter path, a missing or nested id, and the paths TrueLayer has that finstore never calls.
+func TestTrueLayerRulesAllowTheNewPathsAndNotTheirNeighbours(t *testing.T) {
+	c, rec, _, n := newTest(t, []int{200, 200, 200, 200, 200, 200}, `{}`, TrueLayerAPIRules())
+	for _, p := range []string{
+		"/data/v1/accounts/Ab-12/transactions/pending", "/data/v1/cards", "/data/v1/cards/Cd-34/balance",
+		"/data/v1/cards/Cd-34/transactions", "/data/v1/cards/Cd-34/transactions/pending", "/data/v1/info",
+	} {
+		if _, err := c.Do(t.Context(), Request{Method: "GET", Path: p}); err != nil {
+			t.Errorf("GET %s: %v", p, err)
+		}
+	}
+	if len(rec.recs) != 6 {
+		t.Fatalf("recorded %d responses, want 6", len(rec.recs))
+	}
+	for _, e := range []string{"/data/v1/accounts/{id}/transactions/pending", "/data/v1/cards", "/data/v1/cards/{id}/balance",
+		"/data/v1/cards/{id}/transactions", "/data/v1/cards/{id}/transactions/pending", "/data/v1/info"} {
+		found := false
+		for _, r := range rec.recs {
+			found = found || r.Endpoint == e
+		}
+		if !found {
+			t.Errorf("no response recorded under the template %s", e)
+		}
+	}
+	seen := n.Load()
+	for _, p := range []string{
+		// a write on every new path
+		"POST:/data/v1/cards", "POST:/data/v1/info", "POST:/data/v1/cards/a/transactions/pending",
+		"POST:/data/v1/accounts/a/transactions/pending", "PUT:/data/v1/cards/a/balance", "DELETE:/data/v1/cards/a/transactions",
+		// neighbours finstore never calls
+		"GET:/data/v1/cards/a", "GET:/data/v1/cards/a/", "GET:/data/v1/cards//balance", "GET:/data/v1/cards/a/b/balance",
+		"GET:/data/v1/cards/a/direct_debits", "GET:/data/v1/cards/a/standing_orders", "GET:/data/v1/cards/a/transactions/other",
+		"GET:/data/v1/cards/a/transactions/pending/x", "GET:/data/v1/accounts/a/transactions/pending/x",
+		"GET:/data/v1/accounts/a/pending", "GET:/data/v1/accounts/a/transactions/other", "GET:/data/v1/cards/",
+		"GET:/data/v1/info/", "GET:/data/v1/info/x", "GET:/data/v1/identity", "GET:/data/v1/cards/%7Bid%7D/balance",
+		"GET:/data/v1/cards/{id}/balance", "GET:/data/v1/cards/a_b/balance",
+	} {
+		method, path, _ := strings.Cut(p, ":")
+		if _, err := c.Do(t.Context(), Request{Method: method, Path: path}); !errors.Is(err, ErrNotAllowed) {
+			t.Errorf("%s: err = %v, want ErrNotAllowed", p, err)
+		}
+	}
+	if n.Load() != seen {
+		t.Errorf("the server saw %d requests from refused calls", n.Load()-seen)
 	}
 }

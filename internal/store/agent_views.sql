@@ -3,13 +3,17 @@
 -- Days are Europe/London days: an instant is converted with AT TIME ZONE 'Europe/London'.
 
 -- accounts: detail is the latest raw Monzo object for the account (from /accounts) or the pot
--- (from /pots), and null for a file-fed account. For each endpoint and parameter set only the
+-- (from /pots); for a TrueLayer account or card, which has none of those, it is core.account.detail,
+-- the object the bank listed newest (an account missing from the newest listing keeps the one it
+-- was last seen with); and it is null for a file-fed account. For each endpoint and parameter set only the
 -- newest readable successful (200) response is read, newest by fetched_at then seq (a capture
 -- loaded later but fetched earlier does not win), so the parse stays a handful of bodies however
 -- many responses raw holds. A body that is not UTF-8 JSON holding the list is skipped (load-capture
 -- stores bodies unchecked), so it can neither shadow a readable response nor fail the read. Monzo
 -- lists closed accounts and deleted pots, so that response names every account it ever did. An id
 -- listed under more than one parameter set takes the newest response by the same order.
+-- pending_as_of is when the newest pending response for the account was fetched (agent.pending_transactions),
+-- null when no pending read has succeeded.
 -- New columns are appended so a reader selecting by position is unaffected.
 CREATE VIEW agent.accounts AS
 WITH request AS (
@@ -43,12 +47,34 @@ monzo_object AS (
 )
 SELECT a.slug, a.source, a.type, a.feed, a.currency, a.name,
        p.slug AS parent_slug, a.opened_on, a.closed,
-       m.obj AS detail, a.bank_ref, a.ended_on
+       coalesce(m.obj, a.detail) AS detail, a.bank_ref, a.ended_on,
+       ps.as_of AS pending_as_of
 FROM core.account a
 LEFT JOIN core.account p ON p.id = a.parent_id
 LEFT JOIN monzo_object m
   ON a.source = 'monzo' AND a.feed = 'api' AND m.id = a.source_key
- AND m.endpoint = CASE WHEN a.type = 'pot' THEN '/pots' ELSE '/accounts' END;
+ AND m.endpoint = CASE WHEN a.type = 'pot' THEN '/pots' ELSE '/accounts' END
+LEFT JOIN core.pending_snapshot ps ON ps.account_id = a.id;
+
+-- pending_transactions: the pending transactions the bank listed for a Lloyds account or card in its
+-- newest pending response, one row each, with account_slug, source and as_of (when that response was
+-- fetched); detail is the whole row as the bank gave it. An ended account has none here: pending rows
+-- are current by nature, so an ended account has none worth showing. THESE ROWS
+-- ARE NOT ADDITIVE WITH THE LEDGER: TrueLayer gives a settled transaction another id than the pending
+-- row it was, so a payment is in this view until the bank stops listing it as pending and in
+-- agent.transactions once it settles, and a sum over both counts it twice. Monzo is the other way
+-- round: its pending rows are in agent.transactions with status 'pending' and in its sums, because
+-- Monzo keeps one id from pending to settled, so this view has none of them. An account that has had
+-- no pending read has no rows here and a null agent.accounts.pending_as_of; one whose last read found
+-- nothing pending has no rows and a pending_as_of that says when.
+CREATE VIEW agent.pending_transactions AS
+SELECT a.slug AS account_slug, a.source, s.as_of,
+       p.transaction_id, p.txn_date, p.amount_minor, p.currency, p.description, p.merchant_name,
+       p.content AS detail
+FROM core.pending_transaction p
+JOIN core.pending_snapshot s ON s.account_id = p.account_id
+JOIN core.account a ON a.id = p.account_id
+WHERE a.ended_on IS NULL;
 
 -- transactions: detail is the latest version's full source record (the Monzo transaction object,
 -- or a statement import's parsed row). pot_slug names the pot a Monzo pot transfer moved money to

@@ -55,6 +55,8 @@ type fAcc struct {
 	Currency string `json:"currency,omitempty"`
 	Name     string `json:"name,omitempty"`
 	BankRef  string `json:"bank_ref,omitempty"`
+	// Detail is the made-up account object the source keeps as the account's detail.
+	Detail json.RawMessage `json:"detail,omitempty"`
 }
 
 type fTxn struct {
@@ -108,8 +110,33 @@ type fBal struct {
 	Balance int64  `json:"balance"`
 }
 
+// fCardList is a made-up card list marker: the source and the keys it listed.
+type fCardList struct {
+	Source string   `json:"source"`
+	Keys   []string `json:"keys"`
+}
+
+// fPending is one made-up pending row. ID stands for the bank's id of the row; a row with an empty
+// ID is a bad one.
+type fPending struct {
+	ID     string `json:"id"`
+	Date   string `json:"date"` // YYYY-MM-DD
+	Amount int64  `json:"amount"`
+	Desc   string `json:"desc,omitempty"`
+	Seller string `json:"seller,omitempty"`
+}
+
+// fPendingSnap is a made-up pending snapshot of one account.
+type fPendingSnap struct {
+	Account string     `json:"account"`
+	Rows    []fPending `json:"rows"`
+	Skipped int        `json:"skipped,omitempty"`
+}
+
 type fBody struct {
 	Accounts     []fAcc            `json:"accounts,omitempty"`
+	CardLists    []fCardList       `json:"card_lists,omitempty"`
+	Pending      []fPendingSnap    `json:"pending,omitempty"`
 	Transactions []json.RawMessage `json:"transactions,omitempty"`
 	Balances     []fBal            `json:"balances,omitempty"`
 	SOs          []fSO             `json:"standing_orders,omitempty"`
@@ -132,7 +159,7 @@ func (fakeNormaliser) NormaliseResponse(r ledger.Response, loc *time.Location) (
 	var res ledger.Result
 	for _, a := range b.Accounts {
 		rec := ledger.AccountRec{SourceKey: a.ID, Type: a.Type, Currency: "GBP", Name: "made-up " + a.Type,
-			ParentSourceKey: a.Parent, Closed: a.Closed, BankRef: a.BankRef}
+			ParentSourceKey: a.Parent, Closed: a.Closed, BankRef: a.BankRef, Content: a.Detail}
 		if a.Currency != "" {
 			rec.Currency = a.Currency
 		}
@@ -217,6 +244,23 @@ func (fakeNormaliser) NormaliseResponse(r ledger.Response, loc *time.Location) (
 	}
 	for _, l := range b.Lists {
 		res.MandateLists = append(res.MandateLists, ledger.MandateList{Kind: l.Kind, BankRef: l.BankRef})
+	}
+	for _, c := range b.CardLists {
+		res.CardLists = append(res.CardLists, ledger.CardList{Source: c.Source, Keys: c.Keys})
+	}
+	for _, p := range b.Pending {
+		snap := ledger.PendingSnapshot{AccountSourceKey: p.Account, AsOf: r.FetchedAt, RawSeq: r.Seq, Skipped: p.Skipped,
+			Rows: []ledger.PendingRec{}}
+		for _, row := range p.Rows {
+			d, err := time.Parse("2006-01-02", row.Date)
+			if err != nil {
+				return ledger.Result{}, err
+			}
+			content, _ := json.Marshal(row)
+			snap.Rows = append(snap.Rows, ledger.PendingRec{ID: row.ID, Date: d, AmountMinor: row.Amount, Currency: "GBP",
+				Description: row.Desc, MerchantName: row.Seller, Content: content})
+		}
+		res.Pending = append(res.Pending, snap)
 	}
 	return res, nil
 }

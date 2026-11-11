@@ -3,6 +3,7 @@ package truelayer
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -66,8 +67,11 @@ func TestLloydsAccounts(t *testing.T) {
 		t.Fatalf("accounts = %+v", res.Accounts)
 	}
 	for i := range want {
-		if res.Accounts[i] != want[i] {
-			t.Errorf("account %d = %+v, want %+v", i, res.Accounts[i], want[i])
+		// Content is the account object as listed; TestLloydsAccountDetail checks it.
+		got := res.Accounts[i]
+		got.Content = nil
+		if !reflect.DeepEqual(got, want[i]) {
+			t.Errorf("account %d = %+v, want %+v", i, got, want[i])
 		}
 	}
 	// "JOINT" in any case is the joint account.

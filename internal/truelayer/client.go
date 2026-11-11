@@ -205,28 +205,42 @@ func (a *api) get(ctx context.Context, c call) (*bankhttp.Response, error) {
 	return resp, err
 }
 
-// me returns the consent's end as /data/v1/me reports it.
-func (a *api) me(ctx context.Context) (time.Time, error) {
+// meInfo is what /data/v1/me reports about the consent: when it ends and the scopes it was granted.
+type meInfo struct {
+	Expiry time.Time
+	Scopes []string
+}
+
+// me returns the consent's end and granted scopes as /data/v1/me reports them. It is an error when
+// the body names no readable consent expiry.
+func (a *api) me(ctx context.Context) (meInfo, error) {
 	resp, err := a.get(ctx, call{template: pathMe})
 	if err != nil {
-		return time.Time{}, err
+		return meInfo{}, err
 	}
 	items, err := decodeResults(resp.Body, pathMe)
 	if err != nil {
-		return time.Time{}, err
+		return meInfo{}, err
 	}
 	for _, raw := range items {
 		var m struct {
-			ConsentExpiresAt string `json:"consent_expires_at"`
+			ConsentExpiresAt string   `json:"consent_expires_at"`
+			Scopes           []string `json:"scopes"`
 		}
 		if decode(raw, &m) != nil {
 			continue
 		}
 		if t, err := time.Parse(time.RFC3339Nano, m.ConsentExpiresAt); err == nil {
-			return t, nil
+			return meInfo{Expiry: t, Scopes: m.Scopes}, nil
 		}
 	}
-	return time.Time{}, errBody(pathMe, "no consent expiry")
+	return meInfo{}, errBody(pathMe, "no consent expiry")
+}
+
+// info reads /data/v1/info. The answer is only stored: nothing in it is read.
+func (a *api) info(ctx context.Context) error {
+	_, err := a.get(ctx, call{template: pathInfo})
+	return err
 }
 
 // listedAccount is an account from /data/v1/accounts: TrueLayer's id for this call, its type and
@@ -260,16 +274,31 @@ func (a *api) read(ctx context.Context, template string, acct listedAccount) err
 	return err
 }
 
-// transactions fetches acct's transactions dated from to to, both inclusive, and returns how many
-// rows came back.
-func (a *api) transactions(ctx context.Context, acct listedAccount, from, to time.Time) (int, error) {
-	resp, err := a.get(ctx, call{template: pathTransactions, accountID: acct.id, bankRef: acct.bankRef,
+// transactions fetches the transactions of acct (an account, or a card with pathCardTransactions as
+// template) dated from to to, both inclusive, and returns how many rows came back.
+func (a *api) transactions(ctx context.Context, template string, acct listedAccount, from, to time.Time) (int, error) {
+	resp, err := a.get(ctx, call{template: template, accountID: acct.id, bankRef: acct.bankRef,
 		query: url.Values{paramFrom: {from.Format(time.DateOnly)}, paramTo: {to.Format(time.DateOnly)}}})
 	if err != nil {
 		return 0, err
 	}
-	items, err := decodeResults(resp.Body, pathTransactions)
+	items, err := decodeResults(resp.Body, template)
 	return len(items), err
+}
+
+// cards reads /data/v1/cards and returns the cards a run can key (usableCards).
+func (a *api) cards(ctx context.Context) (cardList, error) {
+	resp, err := a.get(ctx, call{template: pathCards})
+	if err != nil {
+		return cardList{}, err
+	}
+	return usableCards(resp.Body)
+}
+
+// listCards reads /data/v1/cards for the Monzo connection, which only stores the answer.
+func (a *api) listCards(ctx context.Context) error {
+	_, err := a.get(ctx, call{template: pathCards})
+	return err
 }
 
 // runTally collects what a run did.
@@ -345,6 +374,11 @@ const (
 	categorySuperseded = "superseded"
 	// categoryInterrupted ends a Monzo connect run that stopped before its fetch was done.
 	categoryInterrupted = "interrupted"
+	// categoryCardKeyShared marks a run in which two cards shared their last four digits and were skipped.
+	categoryCardKeyShared = "card_key_shared"
+	// categoryCardsRefused marks a run in which the bank refused a card read: the consent is kept and the
+	// run makes no further card call.
+	categoryCardsRefused = "cards_refused"
 )
 
 // category is the error category of err for logs and sync.run.
@@ -380,6 +414,29 @@ func isAccessDenied(err error) bool {
 	var be *bankhttp.Error
 	return errors.As(err, &be) && be.Path != bankhttp.TrueLayerAuthTokenPath &&
 		(be.Status == http.StatusUnauthorized || be.BankCode == "access_denied")
+}
+
+// isRefused reports whether a data call was refused by the bank: a 401, a 403 or an access_denied
+// error. A refused token call is not a data call. On a ledger read it ends the consent (see
+// isAccessDenied); on an optional read it is only counted.
+func isRefused(err error) bool {
+	var be *bankhttp.Error
+	return errors.As(err, &be) && be.Path != bankhttp.TrueLayerAuthTokenPath &&
+		(be.Status == http.StatusUnauthorized || be.Status == http.StatusForbidden || be.BankCode == "access_denied")
+}
+
+// isUnsupported reports whether the bank answered a data call by saying it does not offer the
+// endpoint: a 501, or the bank code endpoint_not_supported or not_supported.
+func isUnsupported(err error) bool {
+	var be *bankhttp.Error
+	return errors.As(err, &be) && be.Path != bankhttp.TrueLayerAuthTokenPath &&
+		(be.Status == http.StatusNotImplemented || be.BankCode == "endpoint_not_supported" || be.BankCode == "not_supported")
+}
+
+// isTokenCall reports whether err is a failed call to the token endpoint.
+func isTokenCall(err error) bool {
+	var be *bankhttp.Error
+	return errors.As(err, &be) && be.Path == bankhttp.TrueLayerAuthTokenPath
 }
 
 // isBankFailure reports whether err is a failed request or a response that could not be read, as

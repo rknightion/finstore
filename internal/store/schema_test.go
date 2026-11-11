@@ -220,7 +220,7 @@ func durableTables(t *testing.T, conn *pgx.Conn) map[string][]string {
 }
 
 var agentViews = []string{"accounts", "transactions", "transaction_history", "balances", "coverage", "sync_status",
-	"pot_transactions", "pot_reconciliation", "standing_orders", "direct_debits"}
+	"pot_transactions", "pot_reconciliation", "standing_orders", "direct_debits", "pending_transactions"}
 
 // assertAgentBoundary checks that finstore_agent can read every agent view and no table.
 func assertAgentBoundary(t *testing.T, superURL string) {

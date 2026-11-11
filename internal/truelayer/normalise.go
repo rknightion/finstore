@@ -2,9 +2,11 @@ package truelayer
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -19,12 +21,18 @@ const (
 
 // Endpoint templates, as raw.api_response.endpoint stores them.
 const (
-	pathMe             = "/data/v1/me"
-	pathAccounts       = "/data/v1/accounts"
-	pathBalance        = "/data/v1/accounts/{id}/balance"
-	pathTransactions   = "/data/v1/accounts/{id}/transactions"
-	pathStandingOrders = "/data/v1/accounts/{id}/standing_orders"
-	pathDirectDebits   = "/data/v1/accounts/{id}/direct_debits"
+	pathMe               = "/data/v1/me"
+	pathAccounts         = "/data/v1/accounts"
+	pathBalance          = "/data/v1/accounts/{id}/balance"
+	pathTransactions     = "/data/v1/accounts/{id}/transactions"
+	pathStandingOrders   = "/data/v1/accounts/{id}/standing_orders"
+	pathDirectDebits     = "/data/v1/accounts/{id}/direct_debits"
+	pathInfo             = "/data/v1/info"
+	pathPending          = "/data/v1/accounts/{id}/transactions/pending"
+	pathCards            = "/data/v1/cards"
+	pathCardBalance      = "/data/v1/cards/{id}/balance"
+	pathCardTransactions = "/data/v1/cards/{id}/transactions"
+	pathCardPending      = "/data/v1/cards/{id}/transactions/pending"
 )
 
 // Request parameters the worker records with every per-account response.
@@ -39,14 +47,19 @@ const (
 const (
 	typeTransaction = "TRANSACTION"
 	typeSavings     = "SAVINGS"
+	// typeCard is the account type of a listed card, which TrueLayer does not give one.
+	typeCard = "CARD"
+	// typeCreditCard is the ledger type of a card account.
+	typeCreditCard = "credit_card"
 )
 
 const defaultCurrency = "GBP"
 
 // Normaliser turns stored TrueLayer responses of one connection into ledger records. It implements
-// ledger.SourceNormaliser. For ob-lloyds it reads accounts, transactions, balances and mandates;
-// for ob-monzo only mandates, which attach to the Monzo accounts Monzo's own API feeds. Its errors
-// name the endpoint and what was wrong, never a value.
+// ledger.SourceNormaliser. For ob-lloyds it reads accounts, cards, transactions, balances, pending
+// transactions and mandates; for ob-monzo only mandates, which attach to the Monzo accounts Monzo's
+// own API feeds. Nothing is read from /info. Its errors name the endpoint and what was wrong, never
+// a value.
 type Normaliser struct {
 	// Connection is ConnLloyds or ConnMonzo.
 	Connection string
@@ -74,9 +87,19 @@ func (n Normaliser) NormaliseResponse(r ledger.Response, loc *time.Location) (le
 	case r.Endpoint == pathAccounts && lloyds:
 		return normaliseAccounts(r.Body)
 	case r.Endpoint == pathTransactions && lloyds:
-		return normaliseTransactions(r, loc)
+		return normaliseTransactions(r, loc, pathTransactions, false)
 	case r.Endpoint == pathBalance && lloyds:
-		return normaliseBalance(r)
+		return normaliseBalance(r, pathBalance, false)
+	case r.Endpoint == pathCards && lloyds:
+		return normaliseCards(r.Body)
+	case r.Endpoint == pathCardTransactions && lloyds:
+		return normaliseTransactions(r, loc, pathCardTransactions, true)
+	case r.Endpoint == pathCardBalance && lloyds:
+		return normaliseBalance(r, pathCardBalance, true)
+	case r.Endpoint == pathPending && lloyds:
+		return normalisePending(r, pathPending, false)
+	case r.Endpoint == pathCardPending && lloyds:
+		return normalisePending(r, pathCardPending, true)
 	case r.Endpoint == pathStandingOrders:
 		return normaliseStandingOrders(r)
 	case r.Endpoint == pathDirectDebits:
@@ -198,7 +221,7 @@ func normaliseAccounts(body []byte) (ledger.Result, error) {
 			cur = defaultCurrency
 		}
 		out.Accounts = append(out.Accounts, ledger.AccountRec{SourceKey: ref, Type: accountType(a.DisplayName, a.AccountType),
-			Currency: cur, Name: a.DisplayName, BankRef: ref})
+			Currency: cur, Name: a.DisplayName, BankRef: ref, Content: raw})
 	}
 	return out, nil
 }
@@ -227,6 +250,9 @@ type txItem struct {
 	} `json:"running_balance"`
 	NormalisedID string `json:"normalised_provider_transaction_id"`
 	ProviderID   string `json:"provider_transaction_id"`
+	// TransactionID is TrueLayer's own id, which may change on every call: only a pending row with
+	// no other id is keyed on it.
+	TransactionID string `json:"transaction_id"`
 }
 
 // txHash is what a transaction's version hash is computed over: its business fields, never
@@ -243,12 +269,34 @@ type txHash struct {
 	RunningBalance *int64          `json:"running_balance_minor"`
 }
 
-func normaliseTransactions(r ledger.Response, loc *time.Location) (ledger.Result, error) {
+// cardAmount signs a card transaction's amount from its transaction_type, whichever sign the bank
+// wrote it with. In core a credit card is a liability: a purchase (DEBIT) is negative and a
+// repayment (CREDIT) positive. Any other or missing type is an unexpected body, since the sign
+// would be a guess.
+func cardAmount(amount int64, typ, endpoint string) (int64, error) {
+	if amount == math.MinInt64 {
+		return 0, errBody(endpoint, "an amount is out of range")
+	}
+	if amount < 0 {
+		amount = -amount
+	}
+	switch typ {
+	case "DEBIT":
+		return -amount, nil
+	case "CREDIT":
+		return amount, nil
+	}
+	return 0, errBody(endpoint, "a card transaction has no usable transaction_type")
+}
+
+// normaliseTransactions turns a transactions response into settled rows. For a card
+// (endpoint pathCardTransactions) the amount is signed from transaction_type (cardAmount).
+func normaliseTransactions(r ledger.Response, loc *time.Location, endpoint string, card bool) (ledger.Result, error) {
 	ref, err := bankRefParam(r)
 	if err != nil {
 		return ledger.Result{}, err
 	}
-	items, err := decodeResults(r.Body, pathTransactions)
+	items, err := decodeResults(r.Body, endpoint)
 	if err != nil {
 		return ledger.Result{}, err
 	}
@@ -256,32 +304,39 @@ func normaliseTransactions(r ledger.Response, loc *time.Location) (ledger.Result
 	for _, raw := range items {
 		var x txItem
 		if err := decode(raw, &x); err != nil {
-			return ledger.Result{}, errBody(pathTransactions, "a transaction is not the expected JSON")
+			return ledger.Result{}, errBody(endpoint, "a transaction is not the expected JSON")
 		}
 		key := x.NormalisedID
 		if key == "" {
 			key = x.ProviderID
 		}
 		if key == "" {
-			return ledger.Result{}, errBody(pathTransactions, "a transaction has no provider id")
+			return ledger.Result{}, errBody(endpoint, "a transaction has no provider id")
 		}
-		amount, err := minor(x.Amount, pathTransactions)
+		amount, err := minor(x.Amount, endpoint)
 		if err != nil {
 			return ledger.Result{}, err
 		}
 		if amount == nil {
-			return ledger.Result{}, errBody(pathTransactions, "a transaction has no amount")
+			return ledger.Result{}, errBody(endpoint, "a transaction has no amount")
 		}
-		date, err := day(x.Timestamp, pathTransactions)
+		if card {
+			signed, err := cardAmount(*amount, x.Type, endpoint)
+			if err != nil {
+				return ledger.Result{}, err
+			}
+			amount = &signed
+		}
+		date, err := day(x.Timestamp, endpoint)
 		if err != nil {
 			return ledger.Result{}, err
 		}
 		if date.IsZero() {
-			return ledger.Result{}, errBody(pathTransactions, "a transaction has no date")
+			return ledger.Result{}, errBody(endpoint, "a transaction has no date")
 		}
 		var running *int64
 		if x.RunningBalance != nil {
-			if running, err = minor(x.RunningBalance.Amount, pathTransactions); err != nil {
+			if running, err = minor(x.RunningBalance.Amount, endpoint); err != nil {
 				return ledger.Result{}, err
 			}
 		}
@@ -296,7 +351,7 @@ func normaliseTransactions(r ledger.Response, loc *time.Location) (ledger.Result
 			Description: x.Description, Type: x.Type, Category: x.Category, Classification: compact(x.Classification),
 			MerchantName: x.MerchantName, RunningBalance: running})
 		if err != nil {
-			return ledger.Result{}, errBody(pathTransactions, "a transaction cannot be encoded")
+			return ledger.Result{}, errBody(endpoint, "a transaction cannot be encoded")
 		}
 		out.Txns = append(out.Txns, ledger.TxnRec{
 			AccountSourceKey: ref, SourceKey: key, AmountMinor: *amount, Currency: cur,
@@ -319,12 +374,14 @@ func compact(raw json.RawMessage) json.RawMessage {
 	return b.Bytes()
 }
 
-func normaliseBalance(r ledger.Response) (ledger.Result, error) {
+// normaliseBalance turns a balance response into readings. For a card (endpoint pathCardBalance)
+// the balance is the negative of current, the amount owed: a card is a liability.
+func normaliseBalance(r ledger.Response, endpoint string, card bool) (ledger.Result, error) {
 	ref, err := bankRefParam(r)
 	if err != nil {
 		return ledger.Result{}, err
 	}
-	items, err := decodeResults(r.Body, pathBalance)
+	items, err := decodeResults(r.Body, endpoint)
 	if err != nil {
 		return ledger.Result{}, err
 	}
@@ -336,20 +393,27 @@ func normaliseBalance(r ledger.Response) (ledger.Result, error) {
 			UpdateTimestamp string      `json:"update_timestamp"`
 		}
 		if err := decode(raw, &b); err != nil {
-			return ledger.Result{}, errBody(pathBalance, "a balance is not the expected JSON")
+			return ledger.Result{}, errBody(endpoint, "a balance is not the expected JSON")
 		}
-		cur, err := minor(b.Current, pathBalance)
+		cur, err := minor(b.Current, endpoint)
 		if err != nil {
 			return ledger.Result{}, err
 		}
 		if cur == nil {
-			return ledger.Result{}, errBody(pathBalance, "a balance has no current amount")
+			return ledger.Result{}, errBody(endpoint, "a balance has no current amount")
+		}
+		if card {
+			if *cur == math.MinInt64 {
+				return ledger.Result{}, errBody(endpoint, "an amount is out of range")
+			}
+			owed := -*cur
+			cur = &owed
 		}
 		at := r.FetchedAt
 		if b.UpdateTimestamp != "" {
 			t, err := time.Parse(time.RFC3339Nano, b.UpdateTimestamp)
 			if err != nil {
-				return ledger.Result{}, errBody(pathBalance, "update_timestamp is not RFC 3339")
+				return ledger.Result{}, errBody(endpoint, "update_timestamp is not RFC 3339")
 			}
 			at = t
 		}
@@ -497,4 +561,82 @@ func normaliseDirectDebits(r ledger.Response) (ledger.Result, error) {
 			Status: x.Status, PreviousDate: prev, PreviousAmountMinor: amount, Currency: x.Currency, Content: raw, HashInput: hash})
 	}
 	return out, nil
+}
+
+// normaliseCards turns a Lloyds /cards response into credit_card accounts keyed card:<last4>,
+// carrying the card object as their content and no bank reference, and a card list marker naming
+// every key the list held. The skip rules are usableCards': a card it leaves out gets no account.
+func normaliseCards(body []byte) (ledger.Result, error) {
+	list, err := usableCards(body)
+	if err != nil {
+		return ledger.Result{}, err
+	}
+	keys := list.Keys
+	if keys == nil {
+		keys = []string{}
+	}
+	out := ledger.Result{CardLists: []ledger.CardList{{Source: Source(ConnLloyds), Keys: keys}}}
+	for _, c := range list.Cards {
+		cur := c.Currency
+		if cur == "" {
+			cur = defaultCurrency
+		}
+		out.Accounts = append(out.Accounts, ledger.AccountRec{SourceKey: c.Key, Type: typeCreditCard, Currency: cur,
+			Name: c.DisplayName, Content: c.Raw})
+	}
+	return out, nil
+}
+
+// normalisePending turns a pending-transactions response of an account or, with card set, a card
+// into one snapshot: the whole list as at the response's fetch time, empty or not. Amounts of an
+// account are as the bank gave them; a card's are signed from transaction_type, as its settled rows
+// are. A row's id is normalised_provider_transaction_id, else provider_transaction_id, else
+// transaction_id; a row with none, or with an id already in the snapshot, is left out and counted.
+func normalisePending(r ledger.Response, endpoint string, card bool) (ledger.Result, error) {
+	ref, err := bankRefParam(r)
+	if err != nil {
+		return ledger.Result{}, err
+	}
+	items, err := decodeResults(r.Body, endpoint)
+	if err != nil {
+		return ledger.Result{}, err
+	}
+	snap := ledger.PendingSnapshot{AccountSourceKey: ref, AsOf: r.FetchedAt, RawSeq: r.Seq, Rows: []ledger.PendingRec{}}
+	seen := map[string]bool{}
+	for _, raw := range items {
+		var x txItem
+		if err := decode(raw, &x); err != nil {
+			return ledger.Result{}, errBody(endpoint, "a pending transaction is not the expected JSON")
+		}
+		id := cmp.Or(x.NormalisedID, x.ProviderID, x.TransactionID)
+		if id == "" || seen[id] {
+			snap.Skipped++
+			continue
+		}
+		seen[id] = true
+		amount, err := minor(x.Amount, endpoint)
+		if err != nil {
+			return ledger.Result{}, err
+		}
+		if amount == nil {
+			return ledger.Result{}, errBody(endpoint, "a pending transaction has no amount")
+		}
+		if card {
+			signed, err := cardAmount(*amount, x.Type, endpoint)
+			if err != nil {
+				return ledger.Result{}, err
+			}
+			amount = &signed
+		}
+		date, err := day(x.Timestamp, endpoint)
+		if err != nil {
+			return ledger.Result{}, err
+		}
+		if date.IsZero() {
+			return ledger.Result{}, errBody(endpoint, "a pending transaction has no date")
+		}
+		snap.Rows = append(snap.Rows, ledger.PendingRec{ID: id, Date: date, AmountMinor: *amount,
+			Currency: cmp.Or(x.Currency, defaultCurrency), Description: x.Description, MerchantName: x.MerchantName, Content: raw})
+	}
+	return ledger.Result{Pending: []ledger.PendingSnapshot{snap}}, nil
 }

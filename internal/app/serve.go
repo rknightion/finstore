@@ -67,7 +67,7 @@ var (
 		truelayer.ConnLloyds: "You approve access at Lloyds through TrueLayer. The full history is fetched " +
 			"as soon as you come back here.",
 		truelayer.ConnMonzo: "You approve access in the Monzo app through TrueLayer. This connection reads " +
-			"standing orders and direct debits for the Monzo accounts above.",
+			"standing orders and direct debits, and lists cards. Monzo's own connection supplies everything else.",
 	}
 )
 

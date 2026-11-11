@@ -39,6 +39,11 @@ const (
 	srcTLMonzo      = "truelayer:ob-monzo"
 	cancelledPayee  = "MADE UP GYM"
 	tlDescMarker    = "TL-DESCRIPTION-MARKER-4410"
+	// Markers that must reach the database but never a log: a card's name, a pending row's
+	// description and the identity /info serves.
+	tlCardMarker    = "TL-CARD-MARKER-7731"
+	tlPendingMarker = "TL-PENDING-MARKER-5502"
+	tlIdentity      = "Made Up Person"
 )
 
 func civilDate(y int, m time.Month, d int) time.Time { return time.Date(y, m, d, 0, 0, 0, 0, time.UTC) }
@@ -210,6 +215,13 @@ func TestTrueLayerEndToEnd(t *testing.T) {
 		Reference: "MADE UP MEMBER", Frequency: "MONTHLY", Status: "Active", NextDate: now.AddDate(0, 1, 0), NextAmount: 2500})
 	tfake.AddDirectDebit(truelayer.ConnLloyds, lloydsJointID, truelayertest.DirectDebit{Name: "MADE UP ENERGY",
 		Status: "Active", MandateID: "MANDATE-E2E-1"})
+	// A credit card (what is owed is positive in the bank's own balance) with a purchase and a
+	// repayment, and a pending purchase on the joint account.
+	card := tfake.AddCard(truelayer.ConnLloyds, truelayertest.Card{PartialNumber: "4321", DisplayName: tlCardMarker})
+	tfake.SetCardBalance(card, 20000, 130000)
+	tfake.AddCardTransaction(card, truelayertest.CardTxn{Type: "DEBIT", Amount: "30.00", Date: now.AddDate(0, 0, -5), Description: "MADE UP CARD SHOP"})
+	tfake.AddCardTransaction(card, truelayertest.CardTxn{Type: "CREDIT", Amount: "10.00", Date: now.AddDate(0, 0, -4), Description: "MADE UP CARD PAYMENT"})
+	tfake.AddPending(truelayer.ConnLloyds, lloydsJointID, truelayertest.PendingTxn{Date: now.AddDate(0, 0, -1), Amount: "-4.20", Description: tlPendingMarker})
 	// Monzo through TrueLayer: the two accounts Monzo's own API lists, and a pot.
 	tfake.AddAccount(truelayer.ConnMonzo, truelayertest.Account{ID: "tl-mz-personal", Type: "TRANSACTION",
 		DisplayName: "Personal", SortCode: "223344", Number: "11111111"})
@@ -221,6 +233,8 @@ func TestTrueLayerEndToEnd(t *testing.T) {
 		Reference: "RENT", Frequency: "MONTHLY", Status: "Active", NextDate: now.AddDate(0, 1, 0), NextAmount: 90000})
 	tfake.AddDirectDebit(truelayer.ConnMonzo, "tl-mz-joint", truelayertest.DirectDebit{Name: "MADE UP COUNCIL",
 		Status: "Active", MandateID: "MANDATE-E2E-2"})
+	// A card at Monzo: only listed, stored raw, never an account.
+	tfake.AddCard(truelayer.ConnMonzo, truelayertest.Card{PartialNumber: "7654", DisplayName: "MADE UP E2E FLEX"})
 
 	cfg := tlEnv(t, super, msrv.URL, tsrv.URL)
 	w := &tlWorld{
@@ -437,6 +451,38 @@ func TestTrueLayerEndToEnd(t *testing.T) {
 		t.Fatalf("Lloyds connect run ended %q", outcome)
 	}
 
+	// The card is a credit_card account: its purchase is negative, its repayment positive, its balance
+	// minus what is owed, and its detail the card object. The pending purchase is in
+	// agent.pending_transactions and not in the transactions, and identity data is in no agent view.
+	if n := w.queryInt(`SELECT count(*) FROM agent.accounts WHERE slug = 'lloyds-card-4321' AND type = 'credit_card'
+		AND bank_ref IS NULL AND detail ->> 'display_name' = $1`, tlCardMarker); n != 1 {
+		t.Fatalf("the card is not a credit_card account with its object as detail: %d", n)
+	}
+	if got := w.queryText(`SELECT string_agg(amount_minor::text, ',' ORDER BY txn_date) FROM agent.transactions WHERE account_slug = 'lloyds-card-4321'`); got != "-3000,1000" {
+		t.Fatalf("card transactions %q, want -3000,1000", got)
+	}
+	if got := w.queryInt(`SELECT balance_minor FROM agent.balances WHERE account_slug = 'lloyds-card-4321'`); got != -20000 {
+		t.Fatalf("card balance %d, want -20000", got)
+	}
+	if got := w.queryText(`SELECT account_slug || ' ' || amount_minor::text FROM agent.pending_transactions WHERE description = $1`, tlPendingMarker); got != "lloyds-joint -420" {
+		t.Fatalf("pending row %q, want lloyds-joint -420", got)
+	}
+	if n := w.queryInt(`SELECT count(*) FROM agent.transactions WHERE description = $1`, tlPendingMarker); n != 0 {
+		t.Fatalf("a pending row is in agent.transactions: %d", n)
+	}
+	if n := w.queryInt(`SELECT count(*) FROM agent.accounts WHERE slug LIKE 'lloyds-%' AND pending_as_of IS NULL`); n != 0 {
+		t.Fatalf("%d Lloyds accounts have no pending_as_of after the connect", n)
+	}
+	for _, view := range []string{"accounts", "transactions", "transaction_history", "balances", "coverage", "sync_status",
+		"pot_transactions", "pot_reconciliation", "standing_orders", "direct_debits", "pending_transactions"} {
+		if n := w.queryInt(`SELECT count(*) FROM agent.`+view+` x WHERE x::text LIKE '%' || $1 || '%'`, tlIdentity); n != 0 {
+			t.Errorf("agent.%s shows the account holder's identity in %d rows", view, n)
+		}
+	}
+	if n := w.queryInt(`SELECT count(*) FROM raw.api_response WHERE source = $1 AND endpoint = '/data/v1/info' AND status = 200`, srcLloyds); n != 1 {
+		t.Fatalf("%d /info answers stored for Lloyds, want 1", n)
+	}
+
 	// The ended statement account and Lloyds overlap on 2024-08-22 and 2024-08-27: the agent views
 	// show each of those rows once, under lloyds-joint, and halifax-joint only up to its end.
 	if n := w.queryInt(`SELECT count(*) FROM agent.transactions WHERE txn_date IN ('2024-08-22', '2024-08-27')`); n != 2 {
@@ -469,6 +515,14 @@ func TestTrueLayerEndToEnd(t *testing.T) {
 	w.worker(srcTLMonzo).Wait()
 	if n := w.queryInt(`SELECT count(*) FROM core.account`); n != accountsBefore {
 		t.Fatalf("Monzo through TrueLayer created %d accounts", n-accountsBefore)
+	}
+	if n := w.queryInt(`SELECT count(*) FROM raw.api_response WHERE source = $1 AND endpoint = '/data/v1/cards' AND status = 200`, srcTLMonzo); n != 1 {
+		t.Fatalf("%d Monzo /cards answers stored, want 1", n)
+	}
+	for _, r := range tfake.Requests() {
+		if strings.Contains(r.Path, "/cards/") && !strings.Contains(r.Path, "card-01-") {
+			t.Fatalf("a card path other than the Lloyds card's was asked for: %s", r.Path)
+		}
 	}
 	if got := w.queryText(`SELECT account_slug FROM agent.standing_orders WHERE source = $1 AND payee = 'MADE UP LANDLORD'`, srcTLMonzo); got != "monzo-current" {
 		t.Fatalf("the Monzo standing order is on %q, want monzo-current", got)
@@ -524,7 +578,8 @@ func TestTrueLayerEndToEnd(t *testing.T) {
 		t.Fatalf("the service made requests to Monzo a read-only client never makes: %+v", v)
 	}
 	logs := w.stderr.String()
-	for _, marker := range []string{tlDescMarker, state, code, lloydsJointID, "12345678", "MADE UP LANDLORD"} {
+	for _, marker := range []string{tlDescMarker, state, code, lloydsJointID, "12345678", "MADE UP LANDLORD",
+		tlCardMarker, tlPendingMarker, tlIdentity, "4321", "7654"} {
 		if strings.Contains(logs, marker) {
 			t.Errorf("the log contains %q", marker)
 		}
@@ -603,6 +658,12 @@ func TestServeWiresTrueLayerOnlyWhenConfigured(t *testing.T) {
 	}
 	if !strings.Contains(page, "Connect Lloyds (TrueLayer)") || !strings.Contains(page, "Connect Monzo (TrueLayer)") {
 		t.Errorf("configured page lacks the TrueLayer sections")
+	}
+	// Before any consent the Monzo (TrueLayer) section says what the connection reads: mandates, and
+	// the card list, with Monzo's own connection supplying everything else.
+	if !strings.Contains(page, "This connection reads standing orders and direct debits, and lists cards.") ||
+		!strings.Contains(page, "own connection supplies everything else.") {
+		t.Errorf("configured page lacks the Monzo (TrueLayer) notice:\n%s", page)
 	}
 	if connect != http.StatusBadRequest || callback != http.StatusBadRequest {
 		t.Errorf("configured routes: connect %d, callback %d; want 400 and 400", connect, callback)

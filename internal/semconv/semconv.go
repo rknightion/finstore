@@ -27,6 +27,11 @@ const (
 	MetricDumpLastSuccessTime    = "finstore.dump.last_success.time"
 	MetricUp                     = "finstore.up"
 	MetricMandatesUnresolved     = "finstore.mandates.unresolved"
+	// MetricTrueLayerOptionalReads counts TrueLayer reads whose answer never reaches the ledger, by
+	// endpoint and result (AttrResult).
+	MetricTrueLayerOptionalReads = "finstore.truelayer.optional_reads"
+	// MetricTrueLayerCardsUnlisted is how many card accounts of a source its newest card list left out.
+	MetricTrueLayerCardsUnlisted = "finstore.truelayer.cards_unlisted"
 )
 
 // Metric attribute keys.
@@ -38,6 +43,8 @@ const (
 	AttrStatusClass = "status_class"
 	AttrState       = "state"
 	AttrAccount     = "account"
+	// AttrResult is how an optional read ended: ok, unsupported, refused, rate_limited or failed.
+	AttrResult = "result"
 	// AttrErrorCategory is a finished run's error category on finstore.sync.runs, present only
 	// when the run recorded one: a fixed category word, never text from a response.
 	AttrErrorCategory = "error_category"

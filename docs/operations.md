@@ -101,12 +101,37 @@ itself.
 TrueLayer's Data API adds two connections, each its own source with its own consent:
 
 - **`truelayer:ob-lloyds`**: the Lloyds accounts, their transactions, balances, standing orders
-  and direct debits. Its accounts are `lloyds-joint`, `lloyds-current` and so on, and are checked
-  by running balance (see [How the data is checked](#how-the-data-is-checked)).
+  and direct debits, their [pending transactions](#pending-transactions), and the Lloyds credit
+  cards. Its accounts are `lloyds-joint`, `lloyds-current` and so on, and are checked by running
+  balance (see [How the data is checked](#how-the-data-is-checked)). A credit card is an account
+  of its own, `lloyds-card-<last four digits>`, of type `credit_card`.
 - **`truelayer:ob-monzo`**: standing orders and direct debits for the Monzo accounts finstore
-  already holds from Monzo's own API. It creates no account: each mandate attaches to the Monzo
-  account with the same [bank reference](#bank-references), so connect Monzo first. Pots are
-  skipped.
+  already holds from Monzo's own API, and the list of Monzo's cards, which is only stored. It
+  creates no account: each mandate attaches to the Monzo account with the same
+  [bank reference](#bank-references), so connect Monzo first. Pots are skipped. Monzo's own
+  connection stays the only source of Monzo's transactions and balances.
+
+Both connections also read `/data/v1/info` once a local day when the consent allows it. That is the
+account holder's identity as each bank holds it: name, addresses, date of birth, emails and phones.
+It is stored in `raw` and nothing reads it: no view shows it, and `finstore_agent` cannot read
+`raw`. It is personal data, and it sits in the nightly dump and the backups like every other bank
+body.
+
+**Scopes and the cards reconnect.** A run takes the scopes from the `/me` answer of the consent it
+runs under, and calls `/data/v1/cards` and everything under it only when `cards` is among them, and
+`/data/v1/info` only when `info` is. A consent made before cards were added lacks `cards` until you
+reconnect it, so reconnect Lloyds and Monzo (TrueLayer) once from the status page after updating.
+Pending transactions and the account detail need no reconnect. When `/me` cannot be read, a run
+treats `cards` and `info` as not granted.
+
+**Refused card reads.** The card reads of a Lloyds run (the card list, each card's transactions and balance) are ledger reads, but a refusal of one (401, 403 or `access_denied`) never ends the consent: a `cards` scope the bank does not honour must not cost the working account feed. The run ends `partial` with `cards_refused`, makes no further card call (not even a pending read), and its account reads are unaffected. On a connect the missing card history does not make the run `history_failed`. A refused token refresh is not a refusal of the card call and still ends the consent, as it does anywhere else.
+
+**Optional reads.** The pending transactions, Monzo's card list and `/info` are optional reads. They
+come after every ledger read of a run, and nothing a bank answers to one of them changes the run's
+outcome or ends a consent: a refusal (401, 403, `access_denied`) is only counted, a 429 stops the
+run's remaining optional reads, and a bank that says an endpoint is unsupported (501, or the codes
+`endpoint_not_supported` and `not_supported`) is logged at info level. Each is counted by
+`finstore.truelayer.optional_reads` (see [Telemetry](#telemetry)).
 
 To turn them on, create a TrueLayer Data API client with the redirect URI
 `<FINSTORE_PUBLIC_URL>/callback/truelayer` and set `FINSTORE_TRUELAYER_CLIENT_ID` and
@@ -124,7 +149,10 @@ reconnect to fetch it again. Declining at the bank changes nothing.
 
 **Syncing.** Each connection syncs at 06:20 and 18:20 in `FINSTORE_TIMEZONE`, each up to five
 minutes late at random: accounts and mandates, and for Lloyds the last 35 days of transactions and
-the balance. TrueLayer allows four calls a day to each endpoint for each account. The service counts
+the balance, and the same for each credit card when the consent has the `cards` scope. The ledger
+reads come first; the optional reads (pending transactions, Monzo's card list, `/info`) follow, so
+a rate limit on one never costs ledger data. TrueLayer allows four calls a day to each endpoint
+for each account, and each card is counted by its own key. The service counts
 its own calls in `raw.api_response` and skips a fifth (the run ends `partial` with `rate_limited`);
 a connect day uses three. A `raw.api_response` row with status 0 and no body records a call that got
 no whole response (a transport failure): it may still have reached the bank, so it counts toward the
@@ -133,8 +161,8 @@ daily limit.
 **Reconnecting.** finstore holds three consents, each on its own 90-day clock: Monzo's own and the
 two TrueLayer ones. The status page lists them together, so renew all three in one sitting. A
 reconnect is a fresh connect: the old consent becomes `replaced` and the new one active, and Lloyds
-refetches its full history. A consent ends `lost` when TrueLayer refuses a token refresh or a data
-call; reconnect from the status page.
+refetches its full history. A consent ends `lost` when TrueLayer refuses a token refresh or a ledger data
+call (a refused card read or optional read does not); reconnect from the status page.
 
 ## Accounts that no API reaches
 
@@ -223,6 +251,40 @@ Two accounts from different sources may share a bank reference only while one of
 Any other shared reference means one bank account is held twice: both accounts are reported as a
 mismatch in `agent.coverage`, with a gap naming the other account, until one of them is ended.
 
+A credit card has no sort code or account number, so it has no bank reference. Its key is `card:`
+and the last four digits of the card's partial number, and that key stands in for the reference on
+every per-card call. A card whose partial number does not end in four digits is skipped with a
+warning. Two cards in one list that share their last four digits are both skipped for that run, a
+warning is logged and the run ends `partial` with `card_key_shared`, since merging two cards into
+one account would be worse than having neither.
+
+### Ending a replaced card
+
+A new card number is a new key and so a new account. The old account stops being listed but stays
+open with its last balance, so a sum of card balances would count the debt twice (and if TrueLayer's
+card resource is the account rather than the plastic, the new key's history repeats the old rows).
+finstore warns when a card account that has not ended is missing from a successful card list, and
+sets `finstore.truelayer.cards_unlisted` to how many. The warning carries the source and a count
+only, since nothing from a bank response goes in a log. Find the card in the data: the open card
+accounts that stopped getting new rows are the ones, for example
+
+```sql
+SELECT a.slug, c.latest_date
+FROM agent.accounts a JOIN agent.coverage c ON c.account_slug = a.slug
+WHERE a.type = 'credit_card' AND a.ended_on IS NULL
+ORDER BY c.latest_date NULLS FIRST;
+```
+
+(`agent.accounts.detail` holds the card object, with its partial number and name). End the old
+account the day before the new card's first row:
+
+```sh
+docker exec finstore finstore account end --slug lloyds-card-1234 --last-date 2026-11-30
+```
+
+The old account's later rows are then left out of the agent views and its balance out of the
+current balances.
+
 ## Commands
 
 | Command | Database role | Behaviour |
@@ -280,7 +342,7 @@ Five schemas:
 | Schema | Holds | Kept how |
 |---|---|---|
 | `raw` | Every API response and every imported file, byte for byte, plus what the operator entered | Append-only. Never updated, never deleted from |
-| `core` | Accounts, transactions, standing orders and direct debits and every version of each, balances, the periods each completed fetch covered, the reconciliation state | Disposable: `renormalise` rebuilds it from `raw` |
+| `core` | Accounts, transactions, standing orders and direct debits and every version of each, balances, pending transactions, the periods each completed fetch covered, the reconciliation state | Disposable: `renormalise` rebuilds it from `raw` |
 | `sync` | Runs, the consent's history, connect attempts, the full-history fetch's progress | Durable |
 | `secret` | The bank tokens | Durable, and left out of dumps |
 | `agent` | Read-only views for whatever queries the data | Rebuilt with `core` |
@@ -319,7 +381,11 @@ leave out:
   capture loaded later with older responses does not replace it. A stored body that cannot be read
   as JSON is skipped. Monzo keeps closed accounts and deleted pots in those lists. The account
   object includes Monzo's identifiers for the account (account number and sort code), its owners'
-  names and Monzo user ids, so anyone given `finstore_agent` can read them.
+  names and Monzo user ids, so anyone given `finstore_agent` can read them. For a TrueLayer account
+  or card it is the account or card object the bank listed newest (`core.account.detail`); an
+  account missing from the newest listing keeps the one it was last seen with. A TrueLayer account
+  object holds the account number, sort code and IBAN, and a card object the card's partial number
+  and the name on it, so the same warning applies.
 - `agent.transactions.detail` is the latest version of the transaction's source record: the whole
   Monzo transaction object, or the parsed statement row for an imported one. Earlier versions are
   in `agent.transaction_history`.
@@ -328,8 +394,41 @@ leave out:
   status. It is null for every other transaction.
 
 These columns come after the others, so a query that reads columns by position is unaffected.
-`agent.accounts` also ends with `bank_ref` (see [Bank references](#bank-references)) and `ended_on`
-(see [Ending an account](#ending-an-account)).
+`agent.accounts` also ends with `bank_ref` (see [Bank references](#bank-references)), `ended_on`
+(see [Ending an account](#ending-an-account)) and `pending_as_of`: when the newest pending
+response for the account was fetched, null when no pending read has succeeded. It tells a reader
+how fresh the pending list is even when that list is empty.
+
+### Pending transactions
+
+`agent.pending_transactions` lists the pending transactions the bank gave for each Lloyds account
+and card in its newest pending response: `account_slug`, `source`, `as_of` (when that response was
+fetched), the transaction id, date, `amount_minor`, currency, description, merchant name and the
+whole row in `detail`. An ended account has none. Amounts are signed as the account's settled rows
+are: an account's as the bank gave them, a card's from its `transaction_type` (a purchase is
+negative).
+
+**These rows are not additive with the ledger.** TrueLayer gives a settled transaction another id
+than the pending row it was, so a payment is in this view until the bank stops listing it as
+pending and in `agent.transactions` once it settles; a sum over both counts it twice. Monzo is the
+other way round: its pending rows are already in `agent.transactions` with status `pending` and in
+its sums, because Monzo keeps one id from pending to settled, so this view has none of them and the
+Monzo connection through TrueLayer reads no pending transactions.
+
+An account that has had no successful pending read has no rows and a null `pending_as_of`; one
+whose last read found nothing pending has no rows and a `pending_as_of` that says when.
+
+### Credit cards
+
+A Lloyds credit card is an account of type `credit_card`, `lloyds-card-<last four digits>`, in
+`agent.accounts`, `agent.transactions` and `agent.balances`, with its card object as `detail` and
+no bank reference. In the ledger a card is a liability: a purchase is negative, a repayment is
+positive, and the balance is minus what is owed. The sign comes from the transaction's
+`transaction_type`, not from the sign the bank wrote, and a card transaction whose type is neither
+`DEBIT` nor `CREDIT` is rejected as an unexpected body. A card is reconciled `balances_only`:
+balances are recorded and nothing is compared, so `agent.coverage` reports no gaps for it and a
+wrong sign is caught only by reading its figures against the bank's app. A connect fetches a card's
+history from 2021-01-01, and a scheduled run the last 35 days.
 
 Standing orders and direct debits ("mandates") have a view each, with one row per mandate per
 account:
@@ -384,6 +483,8 @@ Two views follow the money into and out of pots:
   and `agent.coverage.failed_on` names the earliest. The newest closing balance is also compared
   with the bank's balance; because the two are read moments apart, a difference counts only when
   the next reading shows the same one.
+- **Credit cards** (`balances_only`): balances are recorded and nothing is compared. Nothing
+  checks a card's transactions against its balance yet.
 - **Bank references**: two accounts from different sources with the same bank reference, neither
   ended, are both a mismatch.
 - **Pots** have balances only; Monzo's API does not list a pot's own transactions. The transfers
@@ -464,6 +565,8 @@ metric value, a label or a log field; the log handler drops any field that is no
 | `finstore.sync.last_success.time` | `source` | Unix time of the last successful scheduled sync |
 | `finstore.sync.runs` (counter) | `source`, `kind`, `outcome` | Runs finished |
 | `finstore.bank.requests` (counter) | `source`, `endpoint`, `status_class` | Bank requests made |
+| `finstore.truelayer.optional_reads` (counter) | `source`, `endpoint`, `result` | TrueLayer reads whose answer never reaches the ledger (pending transactions, Monzo's card list, `/info`), by result: `ok`, `unsupported`, `refused`, `rate_limited` or `failed` |
+| `finstore.truelayer.cards_unlisted` | `source` | How many card accounts that have not ended the newest card list left out |
 | `finstore.consent.state` | `source`, `state` | 1 for the current state, 0 for the others |
 | `finstore.consent.expiry.time` | `source` | Unix time the consent is expected to end |
 | `finstore.reconciliation.mismatch` | `account` | 1 while the account's last check failed or it has a statement gap |
@@ -482,7 +585,11 @@ older than 14 hours; `finstore.up` absent for an hour.
 |---|---|---|
 | Consent `lost` | Monzo ended the consent, a token refresh was rejected, or nobody approved within a day; for a TrueLayer source, TrueLayer refused a refresh or a data call, or the token was missing at start (`token_missing`, after a database restore) | Reconnect from the status page |
 | A TrueLayer run ends `partial` with `rate_limited` | A fifth call of the day to one endpoint for one account was skipped, or TrueLayer answered 429 | Nothing: the next day's syncs catch up. Do not reconnect and sync by hand several times in a day |
-| A Lloyds connect run ends `partial` with `history_failed` | The full-history call failed, or the service stopped before it ran | Reconnect from the status page |
+| A Lloyds connect run ends `partial` with `history_failed` | The full-history call of an account or a card failed (a refusal of a card read is `cards_refused` instead), the card list failed, or the service stopped before it ran | Reconnect from the status page |
+| A run ends `partial` with `cards_refused` | The bank refused a card read although `/me` lists `cards`. The consent is kept and the run made no further card call | Nothing breaks: accounts sync as usual. Check whether the bank offers cards on this consent; reconnecting may help. Cards simply stay as they were |
+| A run ends `partial` with `card_key_shared` | Two cards in one list share their last four digits, so both were skipped | Nothing finstore can do: the cards cannot be told apart by their number. Look at the cards at the bank |
+| `finstore.truelayer.optional_reads` has results `refused`, `failed` or `unsupported` for an endpoint | The bank does not honour a scope the consent lists, or the call keeps failing. The run is not marked partial by an optional read | Check the endpoint's results over several days: an endpoint with no `ok` for 48 hours is worth an alert. A consent without `cards` makes no card call: reconnect to add it |
+| `finstore.truelayer.cards_unlisted` is above 0 | A card account that has not ended is missing from the newest card list, usually a replaced card | [End the old card's account](#ending-a-replaced-card) |
 | Coverage shows "the Monzo window closed before this range was fetched" | The five minutes ran out | Reconnect: unfinished ranges are fetched first |
 | Coverage shows "no completed fetch covers this period" | The service was down or disconnected for more than 90 days | Reconnect: the full-history fetch fills it |
 | A Monzo account shows `mismatch` | The stored transactions do not add up to the bank's balance | A sync usually clears it. If it lasts, compare `raw` with `core` and run `renormalise --verify`. A closed account with a difference that will never change can be accepted with `account accept-difference` |

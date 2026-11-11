@@ -22,7 +22,7 @@ import (
 const RefreshMargin = 5 * time.Minute
 
 // Scopes is what a connect asks the bank for.
-const Scopes = "info accounts balance transactions direct_debits standing_orders offline_access"
+const Scopes = "info accounts balance transactions direct_debits standing_orders offline_access cards"
 
 // providersAll lists the provider types the auth dialog offers; provider_id preselects one of them.
 const providersAll = "uk-ob-all"

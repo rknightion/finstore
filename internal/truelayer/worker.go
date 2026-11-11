@@ -2,8 +2,14 @@
 // its own finstore source with its own consent. It exchanges the code, approves the consent with
 // the expiry TrueLayer reports, runs the connect-time fetch on the exchanged token, runs the
 // scheduled syncs, and normalises the stored responses into ledger records. It only reads: every
-// request goes through internal/bankhttp, whose TrueLayer allow-lists hold the token call and six
-// GET endpoints and nothing else.
+// request goes through internal/bankhttp, whose TrueLayer allow-lists hold the token call and
+// twelve GET endpoints and nothing else.
+//
+// A run makes its ledger reads first (the accounts, their mandates, for Lloyds their transactions
+// and balances, and for Lloyds with the cards scope its cards as accounts of their own), then its
+// optional reads (pending transactions, the Monzo connection's card list, and /info once a day),
+// whose answers never reach a ledger table and never end a consent or change the run's outcome.
+// What a run may call is decided by the scopes the /me of its own consent lists.
 package truelayer
 
 import (
@@ -39,6 +45,11 @@ const (
 // at TrueLayer starts on 2024-08-22.
 var DefaultHistoryFrom = time.Date(2024, 8, 1, 0, 0, 0, 0, time.UTC)
 
+// DefaultCardHistoryFrom is the first day the Lloyds connect-time card transactions fetch asks for:
+// a credit card may predate the move to Lloyds, and 2021-01-01 is the earliest start Lloyds
+// accepted in the smoke test.
+var DefaultCardHistoryFrom = time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
+
 // Options configures a Worker. A zero value takes its default.
 type Options struct {
 	// Connection is ConnLloyds or ConnMonzo.
@@ -49,6 +60,8 @@ type Options struct {
 	AuthURL, APIURL, PublicURL string
 	// HistoryFrom is the first day of the Lloyds connect-time transactions fetch.
 	HistoryFrom time.Time
+	// CardHistoryFrom is the first day of the Lloyds connect-time card transactions fetch.
+	CardHistoryFrom time.Time
 	// SyncDays is how many days before today a scheduled Lloyds transactions fetch starts.
 	SyncDays int
 	// DailyLimit is how many calls a day are made to one endpoint for one bank reference.
@@ -117,6 +130,9 @@ func New(opts Options, st *store.Store, proj Projector, m *telemetry.Metrics, lo
 	}
 	if opts.HistoryFrom.IsZero() {
 		opts.HistoryFrom = DefaultHistoryFrom
+	}
+	if opts.CardHistoryFrom.IsZero() {
+		opts.CardHistoryFrom = DefaultCardHistoryFrom
 	}
 	if opts.SyncDays <= 0 {
 		opts.SyncDays = DefaultSyncDays
@@ -230,7 +246,8 @@ var (
 // When the fetch does not run (the consent was replaced, the worker stopped, the token expired
 // while the connect waited for the lock) the run is ended by abandonConnect.
 func (w *Worker) connect(ctx context.Context, consentID int64, pair tokenPair, runID int64) {
-	if _, err := w.approve(ctx, consentID, pair.access); err != nil {
+	_, me, err := w.approve(ctx, consentID, pair.access)
+	if err != nil {
 		w.abandonConnect(ctx, runID, consentID, err)
 		return
 	}
@@ -238,7 +255,7 @@ func (w *Worker) connect(ctx context.Context, consentID int64, pair tokenPair, r
 		w.afterApprove(ctx)
 	}
 	started := false
-	err := w.st.HoldWriterLock(ctx, func(ctx context.Context, conn *pgx.Conn) error {
+	err = w.st.HoldWriterLock(ctx, func(ctx context.Context, conn *pgx.Conn) error {
 		c, err := store.GetConsent(ctx, w.st.DB(), consentID)
 		if err != nil {
 			return err
@@ -252,7 +269,7 @@ func (w *Worker) connect(ctx context.Context, consentID int64, pair tokenPair, r
 			return errTokenExpired
 		}
 		started = true
-		return w.runLocked(ctx, conn, runID, consentID, KindConnect, pair.access)
+		return w.runLocked(ctx, conn, runID, consentID, KindConnect, pair.access, me.Scopes)
 	})
 	switch {
 	case !started:
@@ -295,35 +312,40 @@ func (w *Worker) abandonConnect(ctx context.Context, runID, consentID int64, cau
 
 // approve reads /data/v1/me under a meta fetch, with token when it is set and otherwise the stored
 // one, and makes consent id active until the expiry it reports, or for consent.Lifetime when the
-// call fails.
-func (w *Worker) approve(ctx context.Context, id int64, token string) (store.Consent, error) {
+// call fails. It also returns what /me said (the zero meInfo when the call failed), so the connect
+// run can take its scopes from the consent it is running under.
+func (w *Worker) approve(ctx context.Context, id int64, token string) (store.Consent, meInfo, error) {
 	expiry := w.now().Add(consent.Lifetime)
+	var read meInfo
 	err := w.st.HoldWriterLock(ctx, func(ctx context.Context, _ *pgx.Conn) error {
 		fid, err := store.InsertFetch(ctx, w.st.DB(), store.Fetch{Source: w.source, Kind: kindMeta, StartedAt: w.now()})
 		if err != nil {
 			return err
 		}
-		end, err := w.api.me(withAccessToken(withFetch(ctx, fid), token))
+		me, err := w.api.me(withAccessToken(withFetch(ctx, fid), token))
 		switch {
 		case errors.Is(err, ErrConsentLost):
 			return err
 		case err != nil:
 			w.log.WarnContext(ctx, "truelayer consent expiry unknown: assuming 90 days", semconv.LogErrorCategory, category(err))
-		case end.After(w.now()):
-			expiry = end
+		default:
+			read = me
+			if me.Expiry.After(w.now()) {
+				expiry = me.Expiry
+			}
 		}
 		return nil
 	})
 	if err != nil {
-		return store.Consent{}, err
+		return store.Consent{}, meInfo{}, err
 	}
 	act, err := w.consents.ApprovedUntil(ctx, w.st.DB(), id, expiry)
 	if err != nil {
-		return store.Consent{}, err
+		return store.Consent{}, meInfo{}, err
 	}
 	w.recordConsent(ctx, act)
 	w.log.InfoContext(ctx, "truelayer consent approved", semconv.LogState, act.State)
-	return act, nil
+	return act, read, nil
 }
 
 // Resume restores state after a restart: a connect run left unfinished ends partial with
@@ -361,7 +383,7 @@ func (w *Worker) Resume(ctx context.Context) error {
 	if cur.State == store.ConsentAwaitingApproval {
 		id := cur.ID
 		w.goConnect(func(ctx context.Context) {
-			if _, err := w.approve(ctx, id, ""); err != nil {
+			if _, _, err := w.approve(ctx, id, ""); err != nil {
 				if ctx.Err() != nil || errors.Is(err, consent.ErrIllegalTransition) {
 					// Stopped, or a newer connect replaced the consent first.
 					w.log.InfoContext(ctx, "truelayer approval not recorded", semconv.LogErrorCategory, category(err))
