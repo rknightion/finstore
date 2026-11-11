@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -174,7 +175,7 @@ func TestFilterURLFull(t *testing.T) {
 		{"query", "https://api.example.test/v1/accounts?code=CANARY-CODE", false},
 		{"empty query marker", "https://api.example.test/v1/accounts?", false},
 		{"fragment", "https://api.example.test/v1/accounts#CANARY-FRAG", false},
-		{"userinfo", "https://user:CANARY-PASS@api.example.test/v1", false},
+		{"userinfo", (&url.URL{Scheme: "https", User: url.UserPassword("user", "CANARY-PASS"), Host: "api.example.test", Path: "/v1"}).String(), false},
 		{"not a url", "::CANARY::", false},
 	}
 	for _, tt := range tests {

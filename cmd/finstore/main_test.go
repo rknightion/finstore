@@ -43,7 +43,7 @@ func TestBootstrapHealthcheckVersionAndHelpExportNothing(t *testing.T) {
 		"FINSTORE_OTLP_ENDPOINT":          sink.URL(),
 		"FINSTORE_LISTEN_ADDR":            "127.0.0.1:1",
 		"FINSTORE_LOG_LEVEL":              "debug",
-		"FINSTORE_SUPERUSER_DATABASE_URL": "postgres://superuser:CANARY-PASSWORD@127.0.0.1:1/finstore",
+		"FINSTORE_SUPERUSER_DATABASE_URL": "host=127.0.0.1 port=1 user=superuser password=CANARY-PASSWORD dbname=finstore",
 		"FINSTORE_APP_PASSWORD":           "CANARY-APP",
 		"FINSTORE_OWNER_PASSWORD":         "CANARY-OWNER",
 	}
