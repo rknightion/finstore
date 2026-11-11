@@ -9,6 +9,8 @@ import (
 	"io"
 	"log/slog"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/rknightion/finstore/internal/semconv"
 )
 
@@ -107,10 +109,63 @@ func (f fanOut) WithGroup(name string) slog.Handler {
 	return out
 }
 
+// Keys the stderr sink adds from the span in the context. They are added after the allow-list,
+// so they are not log fields; the OTLP sink derives the same ids from the context itself.
+const (
+	logTraceID = "trace_id"
+	logSpanID  = "span_id"
+)
+
+// traceIDHandler adds trace_id and span_id to records that carry a valid span in their context.
+// It sits on the stderr sink only, which serves docker logs. The keys must reach the top level of
+// the line, not a group a caller opened, so it keeps what was applied to base (WithAttrs and
+// WithGroup, in order) and replays it after adding the ids to a fresh base.
+type traceIDHandler struct {
+	base slog.Handler
+	ops  []func(slog.Handler) slog.Handler
+	cur  slog.Handler // base with ops applied
+}
+
+func newTraceIDHandler(base slog.Handler) *traceIDHandler {
+	return &traceIDHandler{base: base, cur: base}
+}
+
+func (h *traceIDHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	return h.cur.Enabled(ctx, l)
+}
+
+func (h *traceIDHandler) Handle(ctx context.Context, r slog.Record) error {
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		return h.cur.Handle(ctx, r)
+	}
+	inner := h.base.WithAttrs([]slog.Attr{
+		slog.String(logTraceID, sc.TraceID().String()),
+		slog.String(logSpanID, sc.SpanID().String()),
+	})
+	for _, op := range h.ops {
+		inner = op(inner)
+	}
+	return inner.Handle(ctx, r)
+}
+
+func (h *traceIDHandler) with(op func(slog.Handler) slog.Handler) *traceIDHandler {
+	return &traceIDHandler{base: h.base, ops: append(append([]func(slog.Handler) slog.Handler(nil), h.ops...), op), cur: op(h.cur)}
+}
+
+func (h *traceIDHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return h.with(func(x slog.Handler) slog.Handler { return x.WithAttrs(attrs) })
+}
+
+func (h *traceIDHandler) WithGroup(name string) slog.Handler {
+	return h.with(func(x slog.Handler) slog.Handler { return x.WithGroup(name) })
+}
+
 // NewLogger returns a logger that writes JSON to w at level and also sends
-// every record to the extra handlers, all behind the allow-list filter.
+// every record to the extra handlers, all behind the allow-list filter. The JSON line carries
+// the trace and span id of the span in the record's context.
 func NewLogger(w io.Writer, level slog.Level, extra ...slog.Handler) *slog.Logger {
-	sinks := fanOut{slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level})}
+	sinks := fanOut{newTraceIDHandler(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level}))}
 	sinks = append(sinks, extra...)
 	return slog.New(newFilterHandler(sinks))
 }

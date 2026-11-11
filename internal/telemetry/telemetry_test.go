@@ -126,7 +126,7 @@ func TestMetricsRecordContractNamesAndAttributes(t *testing.T) {
 }
 
 func TestSetupWithoutEndpointIsNoOp(t *testing.T) {
-	p, err := Setup(context.Background(), config.Config{})
+	p, err := Setup(context.Background(), config.Config{}, serveID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +157,7 @@ func TestSetupRejectsBadEndpoints(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := Setup(context.Background(), tt.cfg)
+			_, err := Setup(context.Background(), tt.cfg, serveID)
 			if err == nil {
 				t.Fatal("want error")
 			}
@@ -180,7 +180,7 @@ func TestSetupExportsFilteredLogsAndMetrics(t *testing.T) {
 	defer srv.Close()
 
 	ctx := context.Background()
-	p, err := Setup(ctx, config.Config{OTLPEndpoint: srv.URL + "/otlp/", Environment: "test", LogLevel: slog.LevelInfo})
+	p, err := Setup(ctx, config.Config{OTLPEndpoint: srv.URL + "/otlp/", Environment: "test", LogLevel: slog.LevelInfo}, serveID)
 	if err != nil {
 		t.Fatal(err)
 	}

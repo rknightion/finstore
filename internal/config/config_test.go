@@ -240,3 +240,22 @@ func TestTrueLayerDefaultsAndBothOrNeither(t *testing.T) {
 		}
 	}
 }
+
+// OTEL_SDK_DISABLED is the OpenTelemetry standard switch: only the word true, in any case, turns
+// the SDK off. Any other value leaves it on, as the specification says.
+func TestOTelSDKDisabled(t *testing.T) {
+	for in, want := range map[string]bool{
+		"": false, "true": true, "TRUE": true, " True ": true, "false": false, "1": false, "yes": false,
+	} {
+		c, err := Load(env(map[string]string{EnvOTelSDKDisabled: in}))
+		if err != nil {
+			t.Fatalf("%q: %v", in, err)
+		}
+		if c.OTelSDKDisabled != want {
+			t.Errorf("OTEL_SDK_DISABLED=%q: OTelSDKDisabled = %t, want %t", in, c.OTelSDKDisabled, want)
+		}
+	}
+	if EnvOTelSDKDisabled != "OTEL_SDK_DISABLED" {
+		t.Errorf("variable name = %q", EnvOTelSDKDisabled)
+	}
+}

@@ -44,6 +44,9 @@ const (
 	EnvOTLPToken             = "FINSTORE_OTLP_TOKEN"
 	EnvEnvironment           = "FINSTORE_ENVIRONMENT"
 	EnvLogLevel              = "FINSTORE_LOG_LEVEL"
+	// EnvOTelSDKDisabled is the OpenTelemetry standard switch, not a FINSTORE_ variable: the
+	// word true gives no-op telemetry providers.
+	EnvOTelSDKDisabled = "OTEL_SDK_DISABLED"
 )
 
 // TimeOfDay is a wall-clock time, in the configured zone, without a date.
@@ -85,6 +88,8 @@ type Config struct {
 	OTLPInstanceID string
 	OTLPToken      string
 	Environment    string
+	// OTelSDKDisabled is set by OTEL_SDK_DISABLED=true: every telemetry provider is a no-op.
+	OTelSDKDisabled bool
 
 	LogLevel slog.Level
 }
@@ -123,6 +128,7 @@ func Load(getenv func(string) string) (Config, error) {
 		OTLPInstanceID:        get(EnvOTLPInstanceID, ""),
 		OTLPToken:             get(EnvOTLPToken, ""),
 		Environment:           get(EnvEnvironment, "dev"),
+		OTelSDKDisabled:       strings.EqualFold(get(EnvOTelSDKDisabled, ""), "true"),
 	}
 	for _, e := range strings.Split(getenv(EnvAllowedEmails), ",") {
 		if e = strings.ToLower(strings.TrimSpace(e)); e != "" {

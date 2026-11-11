@@ -5,7 +5,55 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/rknightion/finstore/internal/telemetry/telemetrytest"
 )
+
+// withVersion sets the build version for one test.
+func withVersion(t *testing.T, v string) {
+	t.Helper()
+	old := version
+	version = v
+	t.Cleanup(func() { version = old })
+}
+
+// The binary passes its build version to telemetry. A command that fails for want of its
+// database settings still exports its root span, so it is the cheapest command to observe.
+func TestTheBuildVersionReachesTelemetry(t *testing.T) {
+	withVersion(t, "main-1234567")
+	sink := telemetrytest.New(t)
+	code, _, errOut := runWith(t, map[string]string{"FINSTORE_OTLP_ENDPOINT": sink.URL(), "FINSTORE_ENVIRONMENT": "test"}, "coverage")
+	if code != 1 || !strings.Contains(errOut, "FINSTORE_DATABASE_URL") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+	spans := sink.Spans()
+	if len(spans) != 1 || spans[0].Name != "finstore coverage" {
+		t.Fatalf("spans = %+v, want the coverage command's root span", spans)
+	}
+	if got := spans[0].Resource["service.version"]; got != "main-1234567" {
+		t.Errorf("service.version = %q, want the build version", got)
+	}
+}
+
+// Leak test 6 at the binary: bootstrap, the health check, version and help set no telemetry up,
+// so nothing reaches the collector even with every setting present.
+func TestBootstrapHealthcheckVersionAndHelpExportNothing(t *testing.T) {
+	sink := telemetrytest.New(t)
+	env := map[string]string{
+		"FINSTORE_OTLP_ENDPOINT":          sink.URL(),
+		"FINSTORE_LISTEN_ADDR":            "127.0.0.1:1",
+		"FINSTORE_LOG_LEVEL":              "debug",
+		"FINSTORE_SUPERUSER_DATABASE_URL": "host=127.0.0.1 port=1 user=superuser password=CANARY-PASSWORD dbname=finstore",
+		"FINSTORE_APP_PASSWORD":           "CANARY-APP",
+		"FINSTORE_OWNER_PASSWORD":         "CANARY-OWNER",
+	}
+	for _, args := range [][]string{{"bootstrap"}, {"healthcheck"}, {"version"}, {"help"}, {"--help"}, {"-h"}} {
+		runWith(t, env, args...)
+	}
+	if reqs := sink.Requests(); len(reqs) != 0 {
+		t.Fatalf("%d requests reached the collector: %v", len(reqs), sink.Paths())
+	}
+}
 
 func runWith(t *testing.T, env map[string]string, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
