@@ -1,4 +1,7 @@
 {
   "TCP": {"443": {"HTTPS": true}},
-  "Web": {"${TS_CERT_DOMAIN}:443": {"Handlers": {"/": {"Proxy": "http://finstore:8080"}}}}
+  "Web": {"${TS_CERT_DOMAIN}:443": {"Handlers": {"/": {
+    "Proxy": "http://finstore:8080",
+    "AcceptAppCaps": ["example.com/cap/finstore"]
+  }}}}
 }

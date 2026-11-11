@@ -46,6 +46,8 @@ of each transaction, balances, and a coverage view that says what is held for ea
 it agrees with the bank's balance, and where the gaps are. The role `finstore_agent` can read those
 views and nothing else: not the raw payloads, not the tokens.
 
+Agents read the data through an MCP endpoint at `/mcp` on the tailnet; see docs/operations.md.
+
 ## Development
 
 `just check` is the gate. The tests need the PostgreSQL 18 server binaries on `PATH`.

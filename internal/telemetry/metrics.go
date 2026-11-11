@@ -41,6 +41,7 @@ type Metrics struct {
 	lastRateLimited metric.Int64Gauge
 	historyOK       metric.Int64Gauge
 	unanswered      metric.Int64Gauge
+	mcpToolCalls    metric.Int64Counter
 	bank            bankInstruments
 }
 
@@ -86,6 +87,7 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 	gauge(&m.lastRateLimited, semconv.MetricSyncLastRateLimitedTime, "s", "Unix time the newest rate-limited run of a source ended; absent for a source that never had one")
 	gauge(&m.historyOK, semconv.MetricConsentHistoryOK, "1", "1 when a connect, backfill or capture run ended ok since the source's current consent was approved, 0 when none has")
 	gauge(&m.unanswered, semconv.MetricConnectUnanswered, "1", "Connect attempts of a source that expired unused in the last 24 hours")
+	counter(&m.mcpToolCalls, semconv.MetricMCPToolCalls, "MCP tool calls, by tool, outcome (ok, invalid, busy, timeout, refused or error) and client (the grant group of the caller)")
 	if err == nil {
 		m.syncRunDuration, err = meter.Float64Histogram(semconv.MetricSyncRunDuration,
 			metric.WithUnit("s"), metric.WithDescription("Sync run duration, by source, kind and outcome"))
@@ -218,6 +220,17 @@ func (m *Metrics) ConsentHistory(ctx context.Context, source string, ok bool) {
 // 24 hours.
 func (m *Metrics) ConnectsUnanswered(ctx context.Context, source string, n int) {
 	m.unanswered.Record(ctx, int64(n), metric.WithAttributes(attribute.String(semconv.AttrSource, source)))
+}
+
+// MCPToolCall counts one MCP tool call. tool is one of semconv's MCPTool values (a name the caller
+// chose that is not one of them is semconv.MCPToolUnknown), outcome one of its MCPOutcome values,
+// and client the grant group of the caller. The three are the only attributes: nothing the call
+// asked for or read is ever a metric dimension.
+func (m *Metrics) MCPToolCall(ctx context.Context, tool, outcome, client string) {
+	m.mcpToolCalls.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(semconv.AttrTool, tool),
+		attribute.String(semconv.AttrOutcome, outcome),
+		attribute.String(semconv.AttrClient, client)))
 }
 
 // MandatesUnresolved records how many of a source's mandates have no account.

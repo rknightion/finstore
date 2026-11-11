@@ -6,6 +6,9 @@
 // the pages check that address against an allow-list and answer 404 to everyone else, because the
 // proxy in front may turn a 401 or 403 into a login redirect and loop. The OAuth callback and the
 // health route carry no such check: the callback is protected by its single-use state value.
+//
+// The MCP endpoint, when one is configured, is mounted at /mcp outside that check: its callers are
+// devices, tagged ones included, which have no signed-in address, so it brings its own gate.
 package web
 
 import (
@@ -87,6 +90,11 @@ type Options struct {
 	Log      *slog.Logger
 	// Tracer makes the connect and callback spans. Nil means no spans.
 	Tracer trace.Tracer
+	// MCP serves the MCP endpoint at /mcp, for every method. Nil leaves /mcp unmounted, so it
+	// answers 404. It is not behind the allow-list of the pages, which needs a signed-in user:
+	// callers of /mcp are devices, tagged ones included, and the handler brings its own gate
+	// (mcpserver.Gate).
+	MCP http.Handler
 }
 
 // Server holds the HTTP handlers.
@@ -191,6 +199,9 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /healthz", s.logged("/healthz", http.HandlerFunc(s.healthz)))
 	mux.Handle("GET /{$}", s.logged("/", s.allowed(http.HandlerFunc(s.status))))
+	if s.opts.MCP != nil {
+		mux.Handle("/mcp", s.logged("/mcp", s.opts.MCP))
+	}
 	for _, src := range s.opts.Sources {
 		mux.Handle("POST "+src.ConnectPath, s.logged(src.ConnectPath, s.allowed(s.connect(src))))
 	}

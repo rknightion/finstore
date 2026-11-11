@@ -45,6 +45,8 @@ const (
 	EnvOTLPToken             = "FINSTORE_OTLP_TOKEN"
 	EnvEnvironment           = "FINSTORE_ENVIRONMENT"
 	EnvLogLevel              = "FINSTORE_LOG_LEVEL"
+	EnvMCPDatabaseURL        = "FINSTORE_MCP_DATABASE_URL"
+	EnvMCPAppCap             = "FINSTORE_MCP_APP_CAP"
 	// EnvOTelSDKDisabled is the OpenTelemetry standard switch, not a FINSTORE_ variable: the
 	// word true gives no-op telemetry providers.
 	EnvOTelSDKDisabled = "OTEL_SDK_DISABLED"
@@ -96,6 +98,12 @@ type Config struct {
 	OTelSDKDisabled bool
 
 	LogLevel slog.Level
+
+	// MCPDatabaseURL is the libpq connection string of the finstore_mcp login the /mcp tools read
+	// with, and MCPAppCap is the Tailscale app capability a caller must hold. /mcp is served only
+	// when both are set; any combination loads, and neither is required by any command.
+	MCPDatabaseURL string
+	MCPAppCap      string
 }
 
 // FromEnv loads the configuration from the process environment.
@@ -134,6 +142,8 @@ func Load(getenv func(string) string) (Config, error) {
 		OTLPToken:             get(EnvOTLPToken, ""),
 		Environment:           get(EnvEnvironment, "dev"),
 		OTelSDKDisabled:       strings.EqualFold(get(EnvOTelSDKDisabled, ""), "true"),
+		MCPDatabaseURL:        get(EnvMCPDatabaseURL, ""),
+		MCPAppCap:             get(EnvMCPAppCap, ""),
 	}
 	for _, e := range strings.Split(getenv(EnvAllowedEmails), ",") {
 		if e = strings.ToLower(strings.TrimSpace(e)); e != "" {
@@ -274,13 +284,17 @@ func (c Config) String() string {
 		}
 		return "[redacted]"
 	}
+	capName := c.MCPAppCap
+	if capName == "" {
+		capName = "unset"
+	}
 	return fmt.Sprintf("Config{listen=%q environment=%q log_level=%s sync_interval=%s nightly_at=%02d:%02d "+
 		"backfill_concurrency=%d window=%s otlp_export=%t database_url=%s owner_database_url=%s "+
-		"superuser_database_url=%s app_password=%s owner_password=%s mcp_password=%s monzo_client_secret=%s truelayer_client_secret=%s otlp_token=%s allowed_emails=%d}",
+		"superuser_database_url=%s app_password=%s owner_password=%s mcp_password=%s monzo_client_secret=%s truelayer_client_secret=%s otlp_token=%s allowed_emails=%d mcp_database_url=%s mcp_app_cap=%s}",
 		c.ListenAddr, c.Environment, c.LogLevel, c.MonzoSyncInterval, c.MonzoNightlyAt.Hour, c.MonzoNightlyAt.Minute,
 		c.MonzoBackfillConc, c.MonzoWindow, c.OTLPEndpoint != "", set(c.DatabaseURL), set(c.OwnerDatabaseURL),
 		set(c.SuperuserDatabaseURL), set(c.AppPassword), set(c.OwnerPassword), set(c.MCPPassword), set(c.MonzoClientSecret), set(c.TrueLayerClientSecret), set(c.OTLPToken),
-		len(c.AllowedEmails))
+		len(c.AllowedEmails), set(c.MCPDatabaseURL), capName)
 }
 
 // GoString keeps %#v from dumping the fields.

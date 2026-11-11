@@ -47,7 +47,8 @@ no network.
 
 - **Who it is.** For a request from a user's device, `tailscale serve` adds `Tailscale-User-Login`
   and drops any copy the client sent. Set `FINSTORE_AUTH_HEADER=Tailscale-User-Login` and list your
-  tailnet login in `FINSTORE_ALLOWED_EMAILS`. A tagged device gets no header, so it gets 404.
+  tailnet login in `FINSTORE_ALLOWED_EMAILS`. A tagged device gets no header, so it gets 404 from
+  the pages; `/mcp` admits it by a capability instead (see "Agent access over MCP").
 - **Who can connect.** Before minting the auth key, add the tag to `tagOwners` in your tailnet
   policy and grant only the users who should reach it, on port 443. Policy tests that deny your
   servers' tags are cheap insurance.
@@ -336,6 +337,8 @@ Environment variables only.
 | `FINSTORE_TRUELAYER_CLIENT_ID`, `FINSTORE_TRUELAYER_CLIENT_SECRET` | `serve` | none | The TrueLayer Data API client. Both or neither: with neither, TrueLayer is off. See [Connecting through TrueLayer](#connecting-through-truelayer) |
 | `FINSTORE_TRUELAYER_AUTH_URL` | `serve` | `https://auth.truelayer.com` | TrueLayer's auth server: the auth link and the token call |
 | `FINSTORE_TRUELAYER_API_URL` | `serve` | `https://api.truelayer.com` | TrueLayer's Data API |
+| `FINSTORE_MCP_DATABASE_URL` | `serve` | empty | Connection string for `finstore_mcp`, the login the `/mcp` tools read with. Empty turns `/mcp` off. See [Agent access over MCP](#agent-access-over-mcp) |
+| `FINSTORE_MCP_APP_CAP` | `serve` | empty | The Tailscale app capability a caller of `/mcp` must hold, such as `example.com/cap/finstore`. Empty turns `/mcp` off |
 | `FINSTORE_TIMEZONE` | all | `Europe/London` | Zone for a transaction's day and for the nightly time. Changing it after data is stored needs a `renormalise`, or days are mixed between the two zones |
 | `FINSTORE_DUMP_STATUS_FILE` | `serve` | empty | The dump script's status file; the dump metric is off when empty |
 | `FINSTORE_OTLP_ENDPOINT`, `FINSTORE_OTLP_INSTANCE_ID`, `FINSTORE_OTLP_TOKEN` | `serve` and every command except `bootstrap`, `healthcheck`, `version` and `help` | empty | OTLP over HTTP with basic auth, for traces (`/v1/traces`), metrics and logs; export is off when the endpoint is empty. A command whose OTLP settings are unusable runs without telemetry and says so on stderr |
@@ -536,6 +539,108 @@ Two views follow the money into and out of pots:
   compares them with the pot's balance. That comparison is information, not a check: it raises no
   alarm.
 
+## Agent access over MCP
+
+`serve` can serve an MCP (Model Context Protocol) endpoint at `/mcp` on the same address as the
+status page, so an agent on the tailnet can read the data. It is off unless `FINSTORE_MCP_DATABASE_URL`
+and `FINSTORE_MCP_APP_CAP` are both set; with either empty `serve` logs `mcp endpoint off: <variable>
+unset` and `/mcp` answers 404. With both set, `serve` opens the reader at start and refuses to start
+unless the URL logs in as `finstore_mcp` (and its session user is `finstore_mcp` too), so a URL that
+names the app role cannot give agents write access. It uses MCP Streamable HTTP, stateless, with
+plain JSON responses.
+Clients that call from a vendor's servers (a hosted connector) cannot reach a tailnet address and do
+not work.
+
+### Who may call
+
+`/mcp` is not behind the status page's email allow-list: a tagged device has no signed-in address.
+It admits a caller by a Tailscale app capability instead.
+
+1. **Grant.** Add one grant to the tailnet policy for each group of callers. The value names the
+   group, and the name reaches the logs, the traces and the `client` metric attribute:
+
+   ```json
+   { "src": ["tag:agents"], "dst": ["tag:finstore"],
+     "app": { "example.com/cap/finstore": [ { "client": "agents" } ] } }
+   ```
+
+   Use a domain you control in place of `example.com`. The grant gives no network access that the
+   other grants do not already give.
+2. **Proxy.** List the capability in `AcceptAppCaps` on the handler in `ts/tailscale-serve.json`
+   (see `deploy/ts/tailscale-serve.json`) and restart `finstore-ts` if `tailscale serve status` does
+   not show it within a minute. The proxy (Tailscale 1.92 or later) removes any
+   `Tailscale-App-Capabilities` header a client sends and sets its own from the caller's grants,
+   and sets `X-Forwarded-For` to the caller's tailnet address.
+3. **Service.** Set `FINSTORE_MCP_APP_CAP` to the same capability name.
+
+The gate answers 404, never 403, to everything it refuses: no header, more than one header value,
+a value that is not a JSON object, a value without the capability or with an empty list for it, and
+a browser request from another origin (`Sec-Fetch-Site` or `Origin`, which an MCP client does not
+send). That last check is a CSRF guard: a page on another site cannot make a permitted device's
+browser post to `/mcp`. It is not what stops DNS rebinding, which the TLS certificate of the node
+and `tailscale serve`'s host-keyed configuration stop. The value may be RFC 2047 Q-encoded. The `client` of a request is every distinct `client`
+string in the capability's values, sorted and joined by a comma, or `unknown` when none has one. The
+first `X-Forwarded-For` address, when it parses as an address, is logged as `peer`; it is never a
+metric attribute.
+
+Every device the grant names can read all the bank data outside `secret`, account numbers and
+identity records included, with one request: a process on such a device is as trusted as its owner.
+
+### Client setup
+
+```sh
+claude mcp add --transport http --scope user finstore https://<finance node MagicDNS name>/mcp
+```
+
+Codex takes an `[mcp_servers.finstore]` entry with `url` set to the same address. No headers or
+tokens are needed: the tailnet and the grant are the credential.
+
+### The tools
+
+All five are read-only (`readOnlyHint`, `idempotentHint`; not destructive; not open world) and return
+structured JSON beside a text rendering. Money is integer minor units with a currency. Dates are
+`YYYY-MM-DD`, and a `from` and `to` pair includes both ends. Invalid input (an account slug that is
+not letters, digits, hyphens, underscores and dots, or is over 100 characters; a `from` after its
+`to`; an unknown option) is a tool error result of one line, not a protocol error.
+
+| Tool | What it does | Limits |
+|---|---|---|
+| `overview` | Every account with its coverage (dates, count, reconciliation state, gaps) and every source with its sync status. Call it first | none |
+| `search_transactions` | Transactions from `agent.transactions`, newest first, filtered by accounts, dates, text (literal, case-insensitive), category, direction, amount range; `include_detail` adds each source record | `limit` 100 by default, 1000 at most; 512 KiB |
+| `spending_summary` | Totals of spending (`out`) or income (`in`) by month, category, merchant, counterparty or account, per currency, declined transactions and pot transfers left out by default. Transfers between your own accounts at different banks are not detected | `limit` 100 by default, 1000 at most; 512 KiB |
+| `describe_schema` | The tables and views readable by the `finstore_mcp` login, with kind, comment and columns | none |
+| `query_sql` | One read-only SQL statement over `agent`, `core`, `raw` and `sync`; select `raw.json_body(body)` to read a stored response | `max_rows` 200 by default, 2000 at most; 1 MiB |
+
+Text from a bank (descriptions, references, names, notes) was chosen by other people. The server's
+instructions and the descriptions of the tools that return it tell the agent to treat it as data;
+the server has no tool that changes anything, so such text can lead an agent only to read more.
+
+A call has 50 seconds in all, the wait for the database connection included, and one call runs at a
+time: a call that waits 30 seconds for the connection ends `busy`. The login role caps the statement
+at 15 seconds and its temporary files at 1 GB. A result cut at a row or size limit says
+`truncated`.
+
+### What it records
+
+Every tool call is one span, one increment of `finstore.mcp.tool.calls` and one log line.
+
+- **Span.** `tools/call <tool>` (a server span, child of the request's span; `tools/call` alone when
+  the tool is not one of the five) with `mcp.method.name`, `gen_ai.operation.name` (`execute_tool`),
+  `gen_ai.tool.name`, `mcp.protocol.version` when the client sent one shaped like a date,
+  `finstore.mcp.client`,
+  `finstore.mcp.rows` and `finstore.mcp.truncated`. A failed call has status `error`, with the
+  outcome as the description, and `error.type` `tool_error`. No span or metric holds SQL, arguments
+  or a row.
+- **Log line** `mcp tool call`: `tool`, `client`, `peer`, `outcome`, `rows`, `truncated`,
+  `duration_ms`, `args` (the arguments of a curated tool as one JSON string) or `sql` (the statement
+  of `query_sql`), each cut to 2 KiB. This is the audit of what agents read; it holds no row. A
+  panic in a tool is recovered: the agent gets a fixed error, the call counts as `error`, and the log
+  gets one `mcp tool panic` line with the stack (never the panic value).
+- **Outcomes.** `ok` (a truncated result is `ok`), `invalid` (the input failed validation, in the
+  tool or in the store, or no such tool), `busy`, `timeout` (the statement or the 50 seconds ran out), `refused` (Postgres
+  refused a privilege, a write in a read-only transaction, or the syntax, a second statement
+  included) and `error`.
+
 ## Backups
 
 `deploy/finstore-dump.sh` writes one uncompressed custom-format dump, checks it can be listed, and
@@ -635,6 +740,7 @@ metric value, a label or a log field; the log handler drops any field that is no
 | `finstore.scheduler.job.runs` (counter) | `finstore.job`, `outcome` | Scheduler job runs, by the job's registered name (the attribute is `finstore.job`, queried as `finstore_job`: Grafana Cloud's OTLP gateway sets the Prometheus `job` label from the service, so a metric attribute named `job` would be overwritten and every job would read as one series) and outcome: `ok`, `error`, `panic` or `cancelled`. `cancelled` is a job that returned an error after `serve` was told to stop, such as a deploy interrupting a running sync; it is not a failure |
 | `finstore.scheduler.job.duration` (histogram) | `finstore.job` | Seconds one job run took, with buckets from 1 s to 1 hour |
 | `finstore.scheduler.job.last_ok` | `finstore.job` | 1 when the job's last run ended `ok`, 0 for `error` or `panic`. A `cancelled` run does not change it. It is held in the `serve` process, not read from the database, so after a restart it is absent until each job has run once. The `status` job runs every minute, so a failing `status` shows within a minute and every other finstore gauge is stale until it recovers |
+| `finstore.mcp.tool.calls` (counter) | `tool`, `outcome`, `client` | MCP tool calls, by tool (`overview`, `search_transactions`, `spending_summary`, `describe_schema`, `query_sql`, or `unknown` for a name the server does not have), outcome (`ok`, `invalid`, `busy`, `timeout`, `refused`, `error`) and client (the grant group of the caller). Latency is `http.server.request.duration` for the route `/mcp`, one tool call per request |
 | `finstore.telemetry.export.failures` (counter) | `signal` | Exports that failed, by `traces`, `metrics` or `logs` |
 | `finstore.telemetry.span_attributes.dropped` (counter) | `key` | Span attributes the exporter allow-list removed, by key. A key here is a library that added an attribute; nothing leaked. The Postgres driver's own attributes (`pgx.rows_affected`, a count, and `pgx.prepare_stmt.name`, a hash of constant SQL) are on the list, so a plain query drops nothing: any key here is new |
 | `finstore.store.writer_lock.held` (gauge) | `holder` | Seconds the writer lock has been held so far, by who holds it (`monzo.sync`, `monzo.backfill`, `monzo.approval`, `truelayer.sync`, `truelayer.connect`, `truelayer.approve`, `renormalise`, `load-capture`, `account`, `import`). Absent while the lock is free. Every process that can hold the lock reports it: `serve` and the commands that write |
