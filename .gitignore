@@ -1,0 +1,27 @@
+.DS_Store
+*.exe
+*.test
+*.out
+coverage.*
+go.work
+go.work.sum
+
+# Local env files and credentials are never committed. The examples under deploy/ are.
+.env
+*.env
+!deploy/*.env.example
+
+# Agent scaffolding and local plans are working state, not deliverables.
+codex/
+docs/superpowers/
+
+# Claude Code local state is never committed. .claude/skills/ is tracked: it holds the links to
+# the contributor skills.
+.claude/*
+!.claude/skills/
+
+.tools/
+bin/
+dist/
+.pi/
+.review/

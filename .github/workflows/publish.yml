@@ -1,0 +1,51 @@
+name: publish
+
+# Publishes ghcr.io/<owner>/finstore:main and :main-<sha7> on every push to main. There are no
+# versioned releases yet, so a deployment pins the image by digest.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: resolve build metadata
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.build.outputs.commit }}
+      build_date: ${{ steps.build.outputs.build_date }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: build
+        run: |
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
+  image:
+    name: publish image
+    needs: metadata
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write # publishes release metadata through the reusable workflow
+      packages: write # pushes the OCI image
+      id-token: write # obtains keyless signing credentials
+      attestations: write # publishes provenance attestations
+      security-events: write # uploads container scan results
+    uses: rknightion/.github/.github/workflows/container-publish.yml@3aee36ed9f327d9238e387c7af7da9ec5369a263 # v1.25.31
+    with:
+      release-tag: ""
+      dockerfile: Dockerfile
+      build-args: |
+        COMMIT=${{ needs.metadata.outputs.commit }}
+        BUILD_DATE=${{ needs.metadata.outputs.build_date }}

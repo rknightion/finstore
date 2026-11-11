@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # `edited` re-runs CI when the pull request body changes, so the acceptance evidence check reads
+    # the new table.
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build-test:
+    name: build / vet / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: "1.59.0"
+      # The tests start a private PostgreSQL 18 cluster from the server binaries; they never use a
+      # running service or a container.
+      - name: Install PostgreSQL 18 binaries
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y -qq postgresql-18
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+      - run: just check </dev/null
+
+  docker-build:
+    name: docker image build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          tags: finstore:ci
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}
+
+  # A pull request that closes an issue shows evidence for each of its acceptance criteria. Checks
+  # only pull requests with a closing keyword. The reusable fails on any event but pull_request.
+  # Check run: `ac-evidence / Acceptance evidence`.
+  ac-evidence:
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    uses: rknightion/.github/.github/workflows/ac-evidence.yml@8f00b7fb896191e598f12ed565395697c539add1 # v1.26.9
+
+  # The lines a pull request adds carry no identifier, email address, public address or credential
+  # shape. The reusable fails on any event but pull_request. Check run: `privacy-sweep / Privacy sweep`.
+  privacy-sweep:
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    uses: rknightion/.github/.github/workflows/privacy-sweep.yml@8f00b7fb896191e598f12ed565395697c539add1 # v1.26.9
+
+  ci-success:
+    name: ci-success
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [build-test, docker-build, ac-evidence, privacy-sweep]
+    steps:
+      - if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1
+      # A skipped job reports success, so on a pull request the pull request checks must have
+      # actually run and passed.
+      - name: Fail if a pull request check did not run
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          AC_EVIDENCE: ${{ needs.ac-evidence.result }}
+          PRIVACY_SWEEP: ${{ needs.privacy-sweep.result }}
+        run: |
+          if [[ "$AC_EVIDENCE" != "success" || "$PRIVACY_SWEEP" != "success" ]]; then
+            echo "ac-evidence: ${AC_EVIDENCE}, privacy-sweep: ${PRIVACY_SWEEP}; both must pass on a pull request"
+            exit 1
+          fi

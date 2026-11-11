@@ -1,0 +1,17 @@
+name: CodeQL
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 3 * * 2'
+permissions: {}
+jobs:
+  codeql:
+    permissions:
+      security-events: write # uploads CodeQL results
+      packages: read # permits analysis of package metadata
+      actions: read # reads workflow metadata for Actions analysis
+      contents: read # checks out and analyzes repository source
+    uses: rknightion/.github/.github/workflows/codeql.yml@3aee36ed9f327d9238e387c7af7da9ec5369a263 # v1.25.31
+    with:
+      languages: '[{"language":"go","build-mode":"autobuild"},{"language":"actions","build-mode":"none"}]'

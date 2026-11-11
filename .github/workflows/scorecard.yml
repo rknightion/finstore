@@ -1,0 +1,13 @@
+name: Scorecard
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '41 7 * * 3'
+permissions: {}
+jobs:
+  scorecard:
+    permissions:
+      security-events: write
+      id-token: write
+    uses: rknightion/.github/.github/workflows/scorecard.yml@3aee36ed9f327d9238e387c7af7da9ec5369a263 # v1.25.31

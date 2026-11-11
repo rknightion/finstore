@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "postUpdateOptions": ["gomodTidy"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Update tool version assignments in the justfile",
+      "managerFilePatterns": ["/^justfile$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[^\\s]+) depName=(?<depName>[^\\s]+)\\s*\\n[a-z_]+_version := \"(?<currentValue>[^\"]+)\""
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Update OpenTelemetry stable and experimental log modules together",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["go.opentelemetry.io/otel{,/**}"],
+      "groupName": "OpenTelemetry",
+      "automerge": false
+    }
+  ]
+}
