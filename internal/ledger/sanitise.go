@@ -81,6 +81,8 @@ func sanitiseResult(r Result) Result {
 		StandingOrders: make([]StandingOrderRec, len(r.StandingOrders)),
 		DirectDebits:   make([]DirectDebitRec, len(r.DirectDebits)),
 		MandateLists:   make([]MandateList, len(r.MandateLists)),
+		Pending:        make([]PendingSnapshot, len(r.Pending)),
+		CardLists:      make([]CardList, len(r.CardLists)),
 	}
 	for i, a := range r.Accounts {
 		a.SourceKey = cleanText(a.SourceKey)
@@ -89,6 +91,7 @@ func sanitiseResult(r Result) Result {
 		a.Name = cleanText(a.Name)
 		a.ParentSourceKey = cleanText(a.ParentSourceKey)
 		a.BankRef = cleanText(a.BankRef)
+		a.Content = cleanJSON(a.Content)
 		out.Accounts[i] = a
 	}
 	for i, m := range r.StandingOrders {
@@ -107,6 +110,26 @@ func sanitiseResult(r Result) Result {
 	}
 	for i, l := range r.MandateLists {
 		out.MandateLists[i] = MandateList{Kind: cleanText(l.Kind), BankRef: cleanText(l.BankRef)}
+	}
+	for i, p := range r.Pending {
+		p.AccountSourceKey = cleanText(p.AccountSourceKey)
+		rows := make([]PendingRec, len(p.Rows))
+		for j, row := range p.Rows {
+			for _, f := range []*string{&row.ID, &row.Currency, &row.Description, &row.MerchantName} {
+				*f = cleanText(*f)
+			}
+			row.Content = cleanJSON(row.Content)
+			rows[j] = row
+		}
+		p.Rows = rows
+		out.Pending[i] = p
+	}
+	for i, l := range r.CardLists {
+		keys := make([]string, len(l.Keys))
+		for j, k := range l.Keys {
+			keys[j] = cleanText(k)
+		}
+		out.CardLists[i] = CardList{Source: cleanText(l.Source), Keys: keys}
 	}
 	return out
 }

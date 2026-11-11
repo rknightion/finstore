@@ -107,12 +107,14 @@ func TrueLayerAuthRules() []Rule {
 	return []Rule{{Method: tokenMethod, Path: TrueLayerAuthTokenPath}}
 }
 
-// TrueLayerAPIRules is the allow-list for TrueLayer's Data API v1: six reads, every one recorded.
+// TrueLayerAPIRules is the allow-list for TrueLayer's Data API v1: twelve reads, every one recorded.
 func TrueLayerAPIRules() []Rule {
 	var rules []Rule
 	for _, p := range []string{"/data/v1/me", "/data/v1/accounts", "/data/v1/accounts/{id}/balance",
 		"/data/v1/accounts/{id}/transactions", "/data/v1/accounts/{id}/standing_orders",
-		"/data/v1/accounts/{id}/direct_debits"} {
+		"/data/v1/accounts/{id}/direct_debits", "/data/v1/accounts/{id}/transactions/pending",
+		"/data/v1/cards", "/data/v1/cards/{id}/balance", "/data/v1/cards/{id}/transactions",
+		"/data/v1/cards/{id}/transactions/pending", "/data/v1/info"} {
 		rules = append(rules, Rule{Method: http.MethodGet, Path: p, Record: true})
 	}
 	return rules

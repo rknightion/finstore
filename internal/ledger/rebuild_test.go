@@ -191,7 +191,7 @@ func TestRenormaliseOverAnOlderRevisionCoreSkipsTheLiveCatchUp(t *testing.T) {
 	e.accounts(fAcc{ID: "acc_1", Type: "current", BankRef: refA})
 	e.catchUp()
 	if _, err := e.owner.DB().Exec(ctx, `DROP VIEW agent.accounts, agent.transactions, agent.balances, agent.coverage,
-		agent.standing_orders, agent.direct_debits CASCADE`); err != nil {
+		agent.standing_orders, agent.direct_debits, agent.pending_transactions CASCADE`); err != nil {
 		t.Fatal(err)
 	}
 	for _, stmt := range []string{

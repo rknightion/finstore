@@ -12,8 +12,9 @@ Status: early. It runs one person's deployment; expect rough edges and breaking 
   then an hourly sync. Monzo only serves full history for a few minutes after each approval, so
   the download runs the moment you approve.
 - **TrueLayer** (optional), through its Data API: Lloyds accounts with their full history, balances,
-  standing orders and direct debits, and the standing orders and direct debits of the Monzo
-  accounts above. Each bank is its own connection, synced twice a day.
+  standing orders, direct debits and pending transactions, Lloyds credit cards, and the standing
+  orders and direct debits of the Monzo accounts above. Each bank is its own connection, synced
+  twice a day.
 - **Statement files** for accounts no API reaches. The first format is the PDF statement from the
   Halifax mobile app; a plain CSV layout covers anything you type in by hand.
 - **Postgres** holds it: raw payloads, a normalised projection rebuilt from them, and read-only

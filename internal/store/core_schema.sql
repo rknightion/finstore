@@ -22,6 +22,9 @@ CREATE TABLE {{schema}}.account (
   -- the last day the account has transactions on, set by an account_end operator entry; null
   -- while it has none. Its later rows stay here but the agent views leave them out.
   ended_on date,
+  -- the source's whole account object (a TrueLayer account or card, as the bank listed it). Null
+  -- when the source gives none: Monzo's is read from raw by agent.accounts instead.
+  detail jsonb,
   UNIQUE (source, source_key));
 CREATE INDEX account_bank_ref ON {{schema}}.account (bank_ref);
 
@@ -90,6 +93,27 @@ CREATE TABLE {{schema}}.fetch_period (
   account_id uuid NOT NULL REFERENCES {{schema}}.account(id),
   period_start timestamptz NOT NULL, period_end timestamptz NOT NULL);
 CREATE INDEX fetch_period_account ON {{schema}}.fetch_period (account_id);
+
+-- The pending transactions a bank listed for an account, as of the newest response: one
+-- pending_snapshot row per account that has had a successful pending read (also when nothing was
+-- pending), and that response's rows in pending_transaction, replaced as a whole by every newer
+-- response. They are never part of core.transaction: a pending row has another id than the settled
+-- row it becomes, so counting both would count the payment twice.
+CREATE TABLE {{schema}}.pending_snapshot (
+  account_id uuid PRIMARY KEY REFERENCES {{schema}}.account (id),
+  as_of      timestamptz NOT NULL,   -- fetched_at of the response
+  raw_seq    bigint NOT NULL,        -- that response's seq
+  row_count  integer NOT NULL);
+CREATE TABLE {{schema}}.pending_transaction (
+  account_id     uuid NOT NULL REFERENCES {{schema}}.account (id),
+  transaction_id text NOT NULL,
+  txn_date       date NOT NULL,      -- date part of the timestamp as the bank wrote it, as settled rows
+  amount_minor   bigint NOT NULL,    -- signed as settled rows of the account are
+  currency       text NOT NULL,
+  description    text NOT NULL,
+  merchant_name  text,
+  content        jsonb NOT NULL,     -- the whole row
+  PRIMARY KEY (account_id, transaction_id));
 
 -- Standing orders and direct debits ("mandates"), one row per mandate per account, versioned
 -- like transactions. account_id is null while no account has the mandate's bank reference.

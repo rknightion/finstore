@@ -4,7 +4,9 @@
 // with: a transactions range refused when it starts too early, a history that can start later than
 // asked, four calls a day per endpoint and account before 429, transaction and direct debit ids
 // that change on every call and account ids that change on every account listing, and consents
-// that expire or are revoked.
+// that expire or are revoked. It also serves credit cards, pending transactions and /data/v1/info,
+// reports the scopes a consent was granted in /data/v1/me and refuses a path whose scope was not
+// granted with 403 access_denied.
 package truelayertest
 
 import (
@@ -58,6 +60,76 @@ type Transaction struct {
 	Amount       int64
 	Description  string
 	Category     string
+	MerchantName string
+	NormalisedID string
+	ProviderID   string
+}
+
+// AllScopes is every scope a connect asks for, in the order the service asks for them
+// (truelayer.Scopes, which this package cannot import; a test in the truelayer package checks the
+// two agree). A provider grants all of them unless SetScopes says otherwise.
+var AllScopes = []string{"info", "accounts", "balance", "transactions", "direct_debits", "standing_orders", "offline_access", "cards"}
+
+// scopesFor is the scopes a Data API path needs, by endpoint template. A path not listed needs none.
+var scopesFor = map[string][]string{
+	"/data/v1/accounts":                           {"accounts"},
+	"/data/v1/accounts/{id}/balance":              {"balance"},
+	"/data/v1/accounts/{id}/transactions":         {"transactions"},
+	"/data/v1/accounts/{id}/transactions/pending": {"transactions"},
+	"/data/v1/accounts/{id}/standing_orders":      {"standing_orders"},
+	"/data/v1/accounts/{id}/direct_debits":        {"direct_debits"},
+	"/data/v1/cards":                              {"cards"},
+	"/data/v1/cards/{id}/balance":                 {"cards", "balance"},
+	"/data/v1/cards/{id}/transactions":            {"cards", "transactions"},
+	"/data/v1/cards/{id}/transactions/pending":    {"cards", "transactions"},
+	"/data/v1/info":                               {"info"},
+}
+
+// Card is a credit card at one provider. PartialNumber is what /data/v1/cards calls
+// partial_card_number. An empty Currency becomes GBP and an empty DisplayName "Made Up Card".
+type Card struct {
+	PartialNumber string
+	DisplayName   string
+	Currency      string
+}
+
+// FakeCard is a card added with AddCard. ID is the fake's own stable id for it, for AddPending.
+type FakeCard struct {
+	ID string
+	Card
+	served    []string
+	txs       []*cardTxn
+	pending   []PendingTxn
+	current   int64
+	available int64
+}
+
+// CardTxn is one card transaction on a day. Amount is a decimal string as TrueLayer writes a
+// number ("24.25", "-24.25"), so both signs can be served; an empty Type leaves transaction_type
+// out. Empty ids get synthetic stable ones.
+type CardTxn struct {
+	Date         time.Time
+	Type         string
+	Amount       string
+	Description  string
+	NormalisedID string
+	ProviderID   string
+}
+
+type cardTxn struct {
+	CardTxn
+	order int
+}
+
+// PendingTxn is one pending transaction of an account or a card. Amount is a decimal string and an
+// empty Type leaves transaction_type out. NormalisedID and ProviderID are served only when set,
+// since a bank's pending rows often carry neither; transaction_id is always served and changes on
+// every call.
+type PendingTxn struct {
+	Date         time.Time
+	Type         string
+	Amount       string
+	Description  string
 	MerchantName string
 	NormalisedID string
 	ProviderID   string
@@ -139,12 +211,17 @@ type account struct {
 	dds    []DirectDebit
 	// balance overrides the balance computed from the transactions when set.
 	balance *int64
+	pending []PendingTxn
 }
 
 // provider is one bank's consent, tokens and data.
 type provider struct {
 	id       string
 	accounts []*account
+	cards    []*FakeCard
+	cardN    int
+	// scopes is what the consent grants; nil means AllScopes.
+	scopes []string
 
 	generation int
 	access     string
@@ -183,7 +260,9 @@ type Fake struct {
 	// failStatus is the status the calls fail429 counts down answer.
 	failStatus map[string]int
 	failMe     map[string]int
-	daily      map[string]int
+	// failCode is the error code the calls fail429 counts down answer with.
+	failCode map[string]string
+	daily    map[string]int
 
 	log        []Request
 	violations []Request
@@ -211,6 +290,7 @@ func New(opts ...Option) *Fake {
 		fail429:      map[string]int{},
 		failStatus:   map[string]int{},
 		failMe:       map[string]int{},
+		failCode:     map[string]string{},
 		daily:        map[string]int{},
 	}
 	for _, o := range opts {
@@ -372,11 +452,24 @@ func (f *Fake) Fail429(providerID, template string, n int) {
 	f.Fail(providerID, template, http.StatusTooManyRequests, n)
 }
 
-// Fail makes the next n data calls to a provider for the endpoint template answer status.
+// Fail makes the next n data calls to a provider for the endpoint template answer status, with
+// the error code the fake gives that status (provider_too_many_requests for 429, otherwise
+// internal_server_error).
 func (f *Fake) Fail(providerID, template string, status, n int) {
+	code := "internal_server_error"
+	if status == http.StatusTooManyRequests {
+		code = "provider_too_many_requests"
+	}
+	f.FailWith(providerID, template, status, code, n)
+}
+
+// FailWith makes the next n data calls to a provider for the endpoint template answer status with
+// the error code given in the body's "error" field; an empty code gives a body with no usable code.
+func (f *Fake) FailWith(providerID, template string, status int, code string, n int) {
 	f.mu.Lock()
 	f.fail429[providerID+" "+template] = n
 	f.failStatus[providerID+" "+template] = status
+	f.failCode[providerID+" "+template] = code
 	f.mu.Unlock()
 }
 
@@ -464,17 +557,20 @@ func (f *Fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(b)
 }
 
-// templateOf returns the endpoint template of a data path and the account id in it.
+// templateOf returns the endpoint template of a data path and the account or card id in it.
 func templateOf(path string) (template, id string) {
-	rest, ok := strings.CutPrefix(path, "/data/v1/accounts/")
-	if !ok {
-		return path, ""
+	for _, kind := range []string{"accounts", "cards"} {
+		rest, ok := strings.CutPrefix(path, "/data/v1/"+kind+"/")
+		if !ok {
+			continue
+		}
+		id, tail, ok := strings.Cut(rest, "/")
+		if !ok {
+			return path, ""
+		}
+		return "/data/v1/" + kind + "/{id}/" + tail, id
 	}
-	id, kind, ok := strings.Cut(rest, "/")
-	if !ok {
-		return path, ""
-	}
-	return "/data/v1/accounts/{id}/" + kind, id
+	return path, ""
 }
 
 func (f *Fake) handle(r *http.Request) reply {
@@ -508,29 +604,46 @@ func (f *Fake) handle(r *http.Request) reply {
 		return oauthErr(http.StatusForbidden, "access_denied")
 	}
 	template, servedID := templateOf(r.URL.Path)
-	var acct *account
-	if servedID != "" {
-		for _, a := range p.accounts {
-			if slices.Contains(a.served, servedID) {
-				acct = a
-			}
+	for _, need := range scopesFor[template] {
+		if !slices.Contains(p.granted(), need) {
+			return oauthErr(http.StatusForbidden, "access_denied")
 		}
-		if acct == nil {
-			return oauthErr(http.StatusNotFound, "account_not_found")
+	}
+	var acct *account
+	var card *FakeCard
+	if servedID != "" {
+		if strings.HasPrefix(template, "/data/v1/cards/") {
+			for _, c := range p.cards {
+				if slices.Contains(c.served, servedID) {
+					card = c
+				}
+			}
+			if card == nil {
+				return oauthErr(http.StatusNotFound, "card_not_found")
+			}
+		} else {
+			for _, a := range p.accounts {
+				if slices.Contains(a.served, servedID) {
+					acct = a
+				}
+			}
+			if acct == nil {
+				return oauthErr(http.StatusNotFound, "account_not_found")
+			}
 		}
 	}
 	key := p.id + " " + template
 	if f.fail429[key] > 0 {
 		f.fail429[key]--
-		if st := f.failStatus[key]; st != http.StatusTooManyRequests {
-			return oauthErr(st, "internal_server_error")
-		}
-		return oauthErr(http.StatusTooManyRequests, "provider_too_many_requests")
+		return oauthErr(f.failStatus[key], f.failCode[key])
 	}
 	day := now.In(f.loc).Format(time.DateOnly)
 	countKey := key + " " + day
-	if acct != nil {
+	switch {
+	case acct != nil:
 		countKey += " " + acct.ID
+	case card != nil:
+		countKey += " " + card.ID
 	}
 	f.daily[countKey]++
 	if f.daily[countKey] > DailyLimit {
@@ -548,6 +661,7 @@ func (f *Fake) handle(r *http.Request) reply {
 			"client_id": f.clientID, "credentials_id": fmt.Sprintf("cred-test-%04d", p.generation),
 			"consent_status": "Authorised", "consent_created_at": ts(p.consentEnd.Add(-f.consentLife)),
 			"consent_expires_at": ts(p.consentEnd),
+			"scopes":             p.granted(),
 			"provider":           map[string]any{"provider_id": p.id, "display_name": "Made Up Bank"},
 		})
 	case "/data/v1/accounts":
@@ -564,6 +678,23 @@ func (f *Fake) handle(r *http.Request) reply {
 		return standingOrders(acct, servedID, now)
 	case "/data/v1/accounts/{id}/direct_debits":
 		return f.directDebits(acct, servedID, now)
+	case "/data/v1/accounts/{id}/transactions/pending":
+		return f.pendingRows(acct.pending, acct.Currency, "pend")
+	case "/data/v1/cards":
+		return f.listCards(p, now)
+	case "/data/v1/cards/{id}/balance":
+		return cardBalance(card, now)
+	case "/data/v1/cards/{id}/transactions":
+		return f.cardTransactions(p, card, q)
+	case "/data/v1/cards/{id}/transactions/pending":
+		return f.pendingRows(card.pending, card.Currency, "cpend")
+	case "/data/v1/info":
+		return results(map[string]any{
+			"full_name": "Made Up Person", "date_of_birth": "1990-01-01",
+			"emails": []string{"made.up@example.com"}, "phones": []string{"+440000000000"},
+			"addresses":        []map[string]any{{"address": "1 Made Up Street", "city": "Madeup", "zip": "ZZ1 1ZZ", "country": "GB"}},
+			"update_timestamp": ts(now),
+		})
 	}
 	return oauthErr(http.StatusNotFound, "not_found")
 }
@@ -644,7 +775,7 @@ func (f *Fake) token(r *http.Request, now time.Time) reply {
 	p.accessExp = now.Add(f.tokenLife)
 	return reply{status: http.StatusOK, body: map[string]any{
 		"access_token": p.access, "expires_in": int(f.tokenLife / time.Second), "token_type": "Bearer",
-		"refresh_token": p.refresh, "scope": "info accounts balance transactions direct_debits standing_orders offline_access",
+		"refresh_token": p.refresh, "scope": strings.Join(p.granted(), " "),
 	}}
 }
 

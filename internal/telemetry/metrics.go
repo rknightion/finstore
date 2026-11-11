@@ -24,6 +24,8 @@ type Metrics struct {
 	dumpLastSuccess metric.Int64Gauge
 	up              metric.Int64Gauge
 	unresolved      metric.Int64Gauge
+	optionalReads   metric.Int64Counter
+	cardsUnlisted   metric.Int64Gauge
 }
 
 // NewMetrics creates every instrument on meter.
@@ -58,6 +60,8 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 	gauge(&m.dumpLastSuccess, semconv.MetricDumpLastSuccessTime, "s", "Unix time of the last successful dump")
 	gauge(&m.up, semconv.MetricUp, "1", "1 while the service is running")
 	gauge(&m.unresolved, semconv.MetricMandatesUnresolved, "1", "Mandates whose account is not known")
+	counter(&m.optionalReads, semconv.MetricTrueLayerOptionalReads, "TrueLayer reads whose answer never reaches the ledger, by endpoint and result")
+	gauge(&m.cardsUnlisted, semconv.MetricTrueLayerCardsUnlisted, "1", "Card accounts the newest card list left out")
 	if err != nil {
 		return nil, err
 	}
@@ -95,6 +99,20 @@ func (m *Metrics) SyncRunWithCategory(ctx context.Context, source, kind, outcome
 // MandatesUnresolved records how many of a source's mandates have no account.
 func (m *Metrics) MandatesUnresolved(ctx context.Context, source string, n int) {
 	m.unresolved.Record(ctx, int64(n), metric.WithAttributes(attribute.String(semconv.AttrSource, source)))
+}
+
+// OptionalRead counts an optional read (one whose answer never reaches the ledger) by its result:
+// ok, unsupported, refused, rate_limited or failed.
+func (m *Metrics) OptionalRead(ctx context.Context, source, endpoint, result string) {
+	m.optionalReads.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(semconv.AttrSource, source),
+		attribute.String(semconv.AttrEndpoint, endpoint),
+		attribute.String(semconv.AttrResult, result)))
+}
+
+// CardsUnlisted records how many card accounts of a source its newest card list left out.
+func (m *Metrics) CardsUnlisted(ctx context.Context, source string, n int) {
+	m.cardsUnlisted.Record(ctx, int64(n), metric.WithAttributes(attribute.String(semconv.AttrSource, source)))
 }
 
 // BankRequest counts a request made to a bank.

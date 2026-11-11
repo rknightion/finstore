@@ -193,7 +193,7 @@ func TestAccountsShowBankRefAndEndDate(t *testing.T) {
 	f := newMandateFixture(t)
 	ctx := context.Background()
 	requireColumns(t, f.q, "accounts", []string{"slug", "source", "type", "feed", "currency", "name",
-		"parent_slug", "opened_on", "closed", "detail", "bank_ref", "ended_on"})
+		"parent_slug", "opened_on", "closed", "detail", "bank_ref", "ended_on", "pending_as_of"})
 	var ref *string
 	var ended *time.Time
 	if err := f.q.QueryRow(ctx, `SELECT bank_ref, ended_on FROM agent.accounts WHERE slug = 'bank-joint'`).Scan(&ref, &ended); err != nil {

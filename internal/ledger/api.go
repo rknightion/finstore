@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"slices"
 	"strconv"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/rknightion/finstore/internal/semconv"
 	"github.com/rknightion/finstore/internal/store"
 )
 
@@ -50,7 +52,13 @@ const (
 	feedFile = "file"
 )
 
-const typePot = "pot"
+const (
+	typePot        = "pot"
+	typeCreditCard = "credit_card"
+)
+
+// cardKeyPrefix begins the source key of a card account: card:<last four digits>.
+const cardKeyPrefix = "card:"
 
 // normalise runs a source normaliser over one stored response.
 func (l *Ledger) normalise(n SourceNormaliser, r store.APIResponse) (Result, error) {
@@ -108,7 +116,92 @@ func (a *applier) apiResponse(ctx context.Context, r *store.APIResponse) error {
 			return err
 		}
 	}
+	if err := a.applyPending(ctx, r.Source, res.Pending); err != nil {
+		return err
+	}
+	if err := a.applyCardLists(ctx, res.CardLists); err != nil {
+		return err
+	}
 	return a.applyMandates(ctx, r.Source, res, r.FetchedAt)
+}
+
+// applyPending makes each snapshot the pending list of its account: the account's earlier pending
+// rows are replaced as a whole, and an empty snapshot clears them and records that nothing was
+// pending at its time. Pending rows are never core.transaction rows, so they move no running sum. A
+// snapshot for an account the ledger does not hold, or one with a row the tables would refuse (no
+// id, an id twice, content that is not JSON), skips the raw row and leaves the account's pending
+// rows as they were. The count of rows a normaliser left out is logged, with no text from them.
+func (a *applier) applyPending(ctx context.Context, source string, snaps []PendingSnapshot) error {
+	for _, s := range snaps {
+		acc, err := a.knownAccount(ctx, AccountID(source, s.AccountSourceKey))
+		if err != nil {
+			return err
+		}
+		if s.AsOf.IsZero() {
+			return unparseable("bad_pending")
+		}
+		rows := make([]store.PendingTransaction, 0, len(s.Rows))
+		seen := make(map[string]bool, len(s.Rows))
+		for _, r := range s.Rows {
+			if r.ID == "" || seen[r.ID] || r.Date.IsZero() || !json.Valid(r.Content) {
+				return unparseable("bad_pending")
+			}
+			seen[r.ID] = true
+			currency := r.Currency
+			if currency == "" {
+				currency = acc.Currency
+			}
+			rows = append(rows, store.PendingTransaction{TransactionID: r.ID, TxnDate: r.Date, AmountMinor: r.AmountMinor,
+				Currency: currency, Description: r.Description, MerchantName: optional(r.MerchantName), Content: r.Content})
+		}
+		if err := a.core.ReplacePendingSnapshot(ctx, acc.ID, store.PendingSnapshot{AsOf: s.AsOf, RawSeq: s.RawSeq, Rows: rows}); err != nil {
+			return err
+		}
+		a.stats.PendingSnapshots++
+		a.stats.PendingSkipped += s.Skipped
+		if s.Skipped > 0 {
+			a.l.log.LogAttrs(ctx, slog.LevelWarn, "pending transactions left out by the normaliser",
+				slog.String(semconv.LogSource, source), slog.Int(semconv.LogCount, s.Skipped))
+		}
+	}
+	return nil
+}
+
+// applyCardLists compares each card list with the card accounts of its source that have not ended:
+// the list is warned of with a count when it leaves any out (a card that was replaced leaves
+// its old account open, and the two would count the debt twice until an operator ends the old one),
+// and the count is left in the stats. It changes no account.
+func (a *applier) applyCardLists(ctx context.Context, lists []CardList) error {
+	for _, l := range lists {
+		if l.Source == "" {
+			return unparseable("bad_card_list")
+		}
+		held, err := a.core.UnendedCardKeys(ctx, l.Source)
+		if err != nil {
+			return err
+		}
+		listed := make(map[string]bool, len(l.Keys))
+		for _, k := range l.Keys {
+			listed[k] = true
+		}
+		missing := 0
+		for _, key := range held {
+			if !listed[key] {
+				missing++
+			}
+		}
+		if missing > 0 {
+			// The source and a count only: nothing from a bank response (not even a card's last four
+			// digits) goes in a log. The operator finds the card in agent.accounts or agent.coverage.
+			a.l.log.LogAttrs(ctx, slog.LevelWarn, "card accounts not in the newest card list",
+				slog.String(semconv.LogSource, l.Source), slog.Int(semconv.LogCount, missing))
+		}
+		if a.stats.CardsUnlisted == nil {
+			a.stats.CardsUnlisted = map[string]int{}
+		}
+		a.stats.CardsUnlisted[l.Source] = missing
+	}
+	return nil
 }
 
 // knownAccount returns the account with id, or skips the row as unparseable when there is none.
@@ -150,7 +243,12 @@ func (a *applier) applyAccounts(ctx context.Context, source string, recs []Accou
 			if !ok {
 				prefix = source
 			}
-			slug, err := a.freeSlug(ctx, prefix+"-"+rec.Type)
+			base := prefix + "-" + rec.Type
+			if rec.Type == typeCreditCard {
+				// lloyds-card-5678, not lloyds-credit_card-2: the slug says which card it is.
+				base = prefix + "-card-" + strings.TrimPrefix(rec.SourceKey, cardKeyPrefix)
+			}
+			slug, err := a.freeSlug(ctx, base)
 			if err != nil {
 				return err
 			}
@@ -174,6 +272,8 @@ func (a *applier) applyAccounts(ctx context.Context, source string, recs []Accou
 		}
 		acc.Closed = rec.Closed
 		acc.BankRef = optional(rec.BankRef)
+		// A record with no object leaves the detail the account has (UpsertAccount keeps it).
+		acc.Detail = rec.Content
 		if err := a.core.UpsertAccount(ctx, acc); err != nil {
 			return err
 		}
@@ -184,7 +284,9 @@ func (a *applier) applyAccounts(ctx context.Context, source string, recs []Accou
 		if !ok {
 			method = methodMonzoAbsolute
 		}
-		if rec.Type == typePot {
+		if rec.Type == typePot || rec.Type == typeCreditCard {
+			// A pot has only balances; nothing is checked against a card's yet (a card's rows may
+			// carry no running balance).
 			method = methodBalancesOnly
 		}
 		if err := a.core.EnsureReconciliation(ctx, id, method); err != nil {

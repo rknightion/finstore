@@ -61,7 +61,7 @@ type Account struct {
 	Source         string
 	SourceKey      string
 	Slug           string
-	Type           string // current | joint | pot | savings | mortgage | flex | loan | rewards | business | prepaid
+	Type           string // current | joint | pot | savings | mortgage | flex | loan | rewards | business | prepaid | credit_card
 	Feed           string // api | file
 	Currency       string
 	Name           string
@@ -75,6 +75,8 @@ type Account struct {
 	// EndedOn is the last day the account has transactions on (a date), set by an account_end
 	// operator entry; nil while the account has no end.
 	EndedOn *time.Time
+	// Detail is the source's whole account object as JSON, or nil when the source gave none.
+	Detail json.RawMessage
 }
 
 // Transaction is a core.transaction row. It always mirrors the latest version.
@@ -203,26 +205,34 @@ type ProjectionState struct {
 }
 
 const accountColumns = `id, source, source_key, slug, type, feed, currency, name, parent_id, expects_imports, opened_on, closed,
-	bank_ref, ended_on`
+	bank_ref, ended_on, detail`
 
 func scanAccount(r pgx.CollectableRow) (Account, error) {
 	var a Account
+	var detail []byte
 	err := r.Scan(&a.ID, &a.Source, &a.SourceKey, &a.Slug, &a.Type, &a.Feed, &a.Currency, &a.Name,
-		&a.ParentID, &a.ExpectsImports, &a.OpenedOn, &a.Closed, &a.BankRef, &a.EndedOn)
+		&a.ParentID, &a.ExpectsImports, &a.OpenedOn, &a.Closed, &a.BankRef, &a.EndedOn, &detail)
+	a.Detail = detail
 	return a, err
 }
 
-// UpsertAccount inserts a, or replaces every column of the row with a's id.
+// UpsertAccount inserts a, or replaces every column of the row with a's id, except that an a with no
+// Detail keeps the detail the row has: a path that reads an account and writes it back (an account
+// end, a file account) must not lose it, and a source that gives none (Monzo) leaves it null.
 func (c Core) UpsertAccount(ctx context.Context, a Account) error {
+	var detail any
+	if len(a.Detail) > 0 {
+		detail = string(a.Detail)
+	}
 	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.account (`+accountColumns+`)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		ON CONFLICT (id) DO UPDATE SET source = EXCLUDED.source, source_key = EXCLUDED.source_key,
 		  slug = EXCLUDED.slug, type = EXCLUDED.type, feed = EXCLUDED.feed, currency = EXCLUDED.currency,
 		  name = EXCLUDED.name, parent_id = EXCLUDED.parent_id, expects_imports = EXCLUDED.expects_imports,
 		  opened_on = EXCLUDED.opened_on, closed = EXCLUDED.closed, bank_ref = EXCLUDED.bank_ref,
-		  ended_on = EXCLUDED.ended_on`),
+		  ended_on = EXCLUDED.ended_on, detail = COALESCE(EXCLUDED.detail, account.detail)`),
 		a.ID, a.Source, a.SourceKey, a.Slug, a.Type, a.Feed, a.Currency, a.Name, a.ParentID,
-		a.ExpectsImports, a.OpenedOn, a.Closed, a.BankRef, a.EndedOn)
+		a.ExpectsImports, a.OpenedOn, a.Closed, a.BankRef, a.EndedOn, detail)
 	if err != nil {
 		return fmt.Errorf("store: upsert account: %w", err)
 	}
@@ -588,6 +598,108 @@ func (c Core) LatestBalanceSnapshot(ctx context.Context, accountID uuid.UUID) (B
 		return BalanceSnapshot{}, fmt.Errorf("store: latest balance snapshot: %w", err)
 	}
 	return b, nil
+}
+
+// PendingTransaction is a core.pending_transaction row: one pending transaction of an account, as
+// of its account's newest pending snapshot. It is never part of core.transaction.
+type PendingTransaction struct {
+	TransactionID string
+	TxnDate       time.Time // a date
+	AmountMinor   int64
+	Currency      string
+	Description   string
+	MerchantName  *string
+	Content       json.RawMessage
+}
+
+// PendingSnapshot is the whole pending list one response gave for one account.
+type PendingSnapshot struct {
+	AsOf   time.Time
+	RawSeq int64
+	Rows   []PendingTransaction
+}
+
+// PendingSnapshotRow is a core.pending_snapshot row.
+type PendingSnapshotRow struct {
+	AccountID uuid.UUID
+	AsOf      time.Time
+	RawSeq    int64
+	RowCount  int
+}
+
+// ReplacePendingSnapshot makes snap the account's pending list: it writes the account's
+// pending_snapshot row (an empty snapshot included, which records that nothing was pending at
+// snap.AsOf), deletes the account's pending_transaction rows and inserts snap.Rows. Run it inside
+// the transaction that applies the raw row, so the three steps are one.
+func (c Core) ReplacePendingSnapshot(ctx context.Context, accountID uuid.UUID, snap PendingSnapshot) error {
+	if _, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.pending_snapshot (account_id, as_of, raw_seq, row_count)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (account_id) DO UPDATE SET as_of = EXCLUDED.as_of, raw_seq = EXCLUDED.raw_seq,
+		  row_count = EXCLUDED.row_count`), accountID, snap.AsOf, snap.RawSeq, len(snap.Rows)); err != nil {
+		return fmt.Errorf("store: write pending snapshot: %w", err)
+	}
+	if _, err := c.q.Exec(ctx, c.sql(`DELETE FROM core.pending_transaction WHERE account_id = $1`), accountID); err != nil {
+		return fmt.Errorf("store: clear pending transactions: %w", err)
+	}
+	for _, r := range snap.Rows {
+		if _, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.pending_transaction
+			(account_id, transaction_id, txn_date, amount_minor, currency, description, merchant_name, content)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`),
+			accountID, r.TransactionID, r.TxnDate, r.AmountMinor, r.Currency, r.Description, r.MerchantName, string(r.Content)); err != nil {
+			return fmt.Errorf("store: insert pending transaction: %w", err)
+		}
+	}
+	return nil
+}
+
+// GetPendingSnapshot returns the account's pending snapshot record, or ErrNotFound when no pending
+// read has succeeded for it.
+func (c Core) GetPendingSnapshot(ctx context.Context, accountID uuid.UUID) (PendingSnapshotRow, error) {
+	var s PendingSnapshotRow
+	err := c.q.QueryRow(ctx, c.sql(`SELECT account_id, as_of, raw_seq, row_count FROM core.pending_snapshot WHERE account_id = $1`),
+		accountID).Scan(&s.AccountID, &s.AsOf, &s.RawSeq, &s.RowCount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return PendingSnapshotRow{}, ErrNotFound
+	}
+	if err != nil {
+		return PendingSnapshotRow{}, fmt.Errorf("store: get pending snapshot: %w", err)
+	}
+	return s, nil
+}
+
+// ListPending returns the account's pending transactions ordered by transaction id.
+func (c Core) ListPending(ctx context.Context, accountID uuid.UUID) ([]PendingTransaction, error) {
+	rows, err := c.q.Query(ctx, c.sql(`SELECT transaction_id, txn_date, amount_minor, currency, description, merchant_name, content
+		FROM core.pending_transaction WHERE account_id = $1 ORDER BY transaction_id`), accountID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list pending transactions: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (PendingTransaction, error) {
+		var p PendingTransaction
+		var content []byte
+		err := r.Scan(&p.TransactionID, &p.TxnDate, &p.AmountMinor, &p.Currency, &p.Description, &p.MerchantName, &content)
+		p.Content = content
+		return p, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: list pending transactions: %w", err)
+	}
+	return out, nil
+}
+
+// UnendedCardKeys returns the source keys of source's credit_card accounts that have no end,
+// ordered by key.
+func (c Core) UnendedCardKeys(ctx context.Context, source string) ([]string, error) {
+	rows, err := c.q.Query(ctx, c.sql(`SELECT source_key FROM core.account
+		WHERE source = $1 AND type = 'credit_card' AND ended_on IS NULL ORDER BY source_key`), source)
+	if err != nil {
+		return nil, fmt.Errorf("store: list card accounts: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("store: list card accounts: %w", err)
+	}
+	return out, nil
 }
 
 const reconciliationColumns = `account_id, method, running_sum_minor, last_check_at, last_check_ok, last_diff_minor,

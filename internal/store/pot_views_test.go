@@ -429,7 +429,7 @@ func TestAccountsDetail(t *testing.T) {
 	f := newPotFixture(t)
 	ctx := context.Background()
 	requireColumns(t, f.q, "accounts", []string{"slug", "source", "type", "feed", "currency", "name",
-		"parent_slug", "opened_on", "closed", "detail", "bank_ref", "ended_on"})
+		"parent_slug", "opened_on", "closed", "detail", "bank_ref", "ended_on", "pending_as_of"})
 
 	rows, err := f.q.Query(ctx, `SELECT slug, detail FROM agent.accounts`)
 	if err != nil {

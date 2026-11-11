@@ -26,7 +26,8 @@ const (
 type AccountRec struct {
 	// SourceKey is the source's own stable id for the account.
 	SourceKey string
-	// Type is one of: current, joint, pot, savings, mortgage, flex, loan, rewards, business, prepaid.
+	// Type is one of: current, joint, pot, savings, mortgage, flex, loan, rewards, business, prepaid,
+	// credit_card.
 	Type     string
 	Currency string
 	Name     string
@@ -38,6 +39,9 @@ type AccountRec struct {
 	// BankRef is the account's bank reference (BankRef of its sort code and account number), or
 	// empty when the source gives none.
 	BankRef string
+	// Content is the source's whole account object, kept as core.account.detail, or nil when the
+	// source gives none (the account keeps the detail it already has).
+	Content json.RawMessage
 }
 
 // TxnRec is one transaction as a source describes it at one moment.
@@ -155,6 +159,45 @@ type MandateList struct {
 	BankRef string
 }
 
+// PendingRec is one pending transaction as a bank lists it. It never becomes a core.transaction:
+// a pending row has another id than the settled row it turns into.
+type PendingRec struct {
+	// ID is the bank's id for the row, unique within its snapshot.
+	ID string
+	// Date is the calendar day of the row's timestamp as the bank wrote it, at midnight UTC.
+	Date        time.Time
+	AmountMinor int64
+	Currency    string
+	Description string
+	// MerchantName is empty when the bank gives none.
+	MerchantName string
+	// Content is the whole row.
+	Content json.RawMessage
+}
+
+// PendingSnapshot is the whole list of pending transactions a successful response gave for one
+// account: the ledger replaces the account's pending rows with Rows, an empty list included (it says
+// nothing was pending at AsOf).
+type PendingSnapshot struct {
+	// AccountSourceKey names the account by its source key.
+	AccountSourceKey string
+	// AsOf is when the response was fetched and RawSeq its raw row.
+	AsOf   time.Time
+	RawSeq int64
+	Rows   []PendingRec
+	// Skipped counts the rows the normaliser left out (no usable id, or an id already in the
+	// snapshot). The ledger reports it in its skip log.
+	Skipped int
+}
+
+// CardList says that a response was a complete list of a source's cards: Keys are the source keys
+// of every card it listed, whether or not the normaliser made an account of it. The ledger warns of
+// every card account of Source that has not ended and is not among Keys.
+type CardList struct {
+	Source string
+	Keys   []string
+}
+
 // Result is everything one raw row yields.
 type Result struct {
 	Accounts       []AccountRec
@@ -163,6 +206,8 @@ type Result struct {
 	StandingOrders []StandingOrderRec
 	DirectDebits   []DirectDebitRec
 	MandateLists   []MandateList
+	Pending        []PendingSnapshot
+	CardLists      []CardList
 }
 
 // Response is one stored bank response, as the normaliser sees it.
@@ -221,7 +266,7 @@ type FileNormaliser interface {
 // NormaliserRev is the revision of the normalising code. Bump it whenever a change to a
 // normaliser or to the core schema would give different core rows for the same raw rows; a
 // deployment must then run `finstore renormalise`.
-const NormaliserRev = 2
+const NormaliserRev = 3
 
 // Stats counts what one CatchUp did.
 type Stats struct {
@@ -245,4 +290,12 @@ type Stats struct {
 	// unknown_account, api_account, unknown_format, check_failed, bad_result, account_mismatch,
 	// or bad_transaction (a row the schema would refuse). They are the words the skip log uses.
 	Rejections []string
+	// PendingSnapshots counts the pending snapshots applied and PendingSkipped the rows their
+	// normaliser left out.
+	PendingSnapshots int
+	PendingSkipped   int
+	// CardsUnlisted maps a source to the number of its card accounts, not ended, that the newest card
+	// list applied here left out. A source appears only when a card list for it was applied; when
+	// several were, the last one counts.
+	CardsUnlisted map[string]int
 }

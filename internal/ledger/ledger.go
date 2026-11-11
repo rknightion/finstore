@@ -246,6 +246,14 @@ func (s *Stats) add(o Stats) {
 	s.MandatesReturned += o.MandatesReturned
 	s.FilesRejected += o.FilesRejected
 	s.Rejections = append(s.Rejections, o.Rejections...)
+	s.PendingSnapshots += o.PendingSnapshots
+	s.PendingSkipped += o.PendingSkipped
+	for source, n := range o.CardsUnlisted {
+		if s.CardsUnlisted == nil {
+			s.CardsUnlisted = map[string]int{}
+		}
+		s.CardsUnlisted[source] = n
+	}
 }
 
 // applier applies one raw row on q, inside the row's savepoint.

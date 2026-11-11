@@ -87,6 +87,44 @@ func (l *logRecorder) errors() []string {
 	return out
 }
 
+// messages returns the messages logged at exactly level.
+func (l *logRecorder) messages(level slog.Level) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, r := range l.recs {
+		if r.Level == level {
+			out = append(out, r.Message)
+		}
+	}
+	return out
+}
+
+// attrs returns the attributes of every record logged with message msg, flattened to key=value
+// text, for a test that checks a line carries an endpoint and never a body.
+func (l *logRecorder) attrs(msg string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, r := range l.recs {
+		if r.Message != msg {
+			continue
+		}
+		s := ""
+		r.Attrs(func(a slog.Attr) bool { s += a.Key + "=" + a.Value.String() + " "; return true })
+		out = append(out, s)
+	}
+	return out
+}
+
+// optional returns how many optional reads of endpoint ended with result, as counted by
+// finstore.truelayer.optional_reads.
+func (h *harness) optional(endpoint, result string) int64 {
+	h.t.Helper()
+	return h.counter(semconv.MetricTrueLayerOptionalReads,
+		attribute.String(semconv.AttrEndpoint, endpoint), attribute.String(semconv.AttrResult, result))
+}
+
 // holdWriterLock takes the writer lock in the background and returns once it is held; the returned
 // function releases it.
 func (h *harness) holdWriterLock() func() {
@@ -152,7 +190,7 @@ func newHarness(t *testing.T, fakeOpts ...truelayertest.Option) *harness {
 	h.ledger = ledger.New(map[string]ledger.SourceNormaliser{
 		Source(ConnLloyds): Normaliser{Connection: ConnLloyds},
 		Source(ConnMonzo):  Normaliser{Connection: ConnMonzo},
-	}, nil, loc, nil)
+	}, nil, loc, slog.New(h.logs))
 	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if d := h.tokenDelay.Load(); d > 0 && r.URL.Path == truelayertest.TokenPath {
 			time.Sleep(time.Duration(d))
@@ -360,6 +398,34 @@ func (h *harness) counter(name string, attrs ...attribute.KeyValue) int64 {
 		}
 	}
 	return n
+}
+
+// gauge returns the last value of a gauge point whose attributes include attrs, and whether there
+// is one.
+func (h *harness) gauge(name string, attrs ...attribute.KeyValue) (int64, bool) {
+	h.t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := h.reader.Collect(context.Background(), &rm); err != nil {
+		h.t.Fatal(err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			g, ok := m.Data.(metricdata.Gauge[int64])
+			if m.Name != name || !ok {
+				continue
+			}
+		points:
+			for _, dp := range g.DataPoints {
+				for _, a := range attrs {
+					if v, ok := dp.Attributes.Value(a.Key); !ok || v != a.Value {
+						continue points
+					}
+				}
+				return dp.Value, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func (h *harness) syncRuns(outcome, cat string) int64 {

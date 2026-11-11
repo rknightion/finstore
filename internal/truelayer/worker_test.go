@@ -21,12 +21,15 @@ import (
 
 // templateOf returns a logged request's endpoint template.
 func templateOf(path string) string {
-	rest, ok := strings.CutPrefix(path, "/data/v1/accounts/")
-	if !ok {
-		return path
+	for _, family := range []string{"accounts", "cards"} {
+		rest, ok := strings.CutPrefix(path, "/data/v1/"+family+"/")
+		if !ok {
+			continue
+		}
+		_, kind, _ := strings.Cut(rest, "/")
+		return "/data/v1/" + family + "/{id}/" + kind
 	}
-	_, kind, _ := strings.Cut(rest, "/")
-	return "/data/v1/accounts/{id}/" + kind
+	return path
 }
 
 // The auth link names the bank, the shared callback and the scopes, and carries the state.
@@ -82,7 +85,7 @@ func TestConnectFetchesFullHistoryWithTheExchangedTokenAndTransactionsBeforeBala
 		}
 	}
 	perAccount := []string{pathStandingOrders, pathDirectDebits, pathTransactions, pathBalance}
-	want := append(append([]string{pathMe, pathAccounts}, perAccount...), perAccount...)
+	want := append(append(append([]string{pathMe, pathAccounts}, perAccount...), perAccount...), pathCards, pathPending, pathPending, pathInfo)
 	if !slices.Equal(paths, want) {
 		t.Fatalf("calls %v\nwant  %v", paths, want)
 	}
@@ -399,7 +402,7 @@ func TestMonzoMandatesSkipPotsAndAttachToMonzoAccounts(t *testing.T) {
 	for _, r := range h.fake.Requests()[1:] {
 		paths = append(paths, templateOf(r.Path))
 	}
-	want := []string{pathMe, pathAccounts, pathStandingOrders, pathDirectDebits, pathStandingOrders, pathDirectDebits}
+	want := []string{pathMe, pathAccounts, pathStandingOrders, pathDirectDebits, pathStandingOrders, pathDirectDebits, pathCards, pathInfo}
 	if !slices.Equal(paths, want) {
 		t.Fatalf("calls %v, want %v", paths, want)
 	}
