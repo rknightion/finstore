@@ -48,6 +48,11 @@ func New(sources map[string]SourceNormaliser, files map[string]FileNormaliser, l
 // is a transaction), so a crash resumes after the last fully applied row. A row that cannot be
 // understood is counted (Unparseable or FilesRejected), logged, and skipped with none of its
 // writes; only a database error stops CatchUp.
+//
+// The projection records the ledger's time zone the first time it runs. CatchUp into a schema
+// built with another zone returns an error wrapping ErrZoneChanged (and so
+// store.ErrRenormaliseRequired) and changes nothing, because days already projected would be in
+// the old zone and new ones in the new.
 func (l *Ledger) CatchUp(ctx context.Context, q store.DBTX, schema string) (Stats, error) {
 	core, err := store.NewCore(q, schema)
 	if err != nil {
@@ -56,6 +61,15 @@ func (l *Ledger) CatchUp(ctx context.Context, q store.DBTX, schema string) (Stat
 	ps, err := core.GetProjectionState(ctx)
 	if err != nil {
 		return Stats{}, fmt.Errorf("ledger: read projection state: %w", err)
+	}
+	zone := l.loc.String()
+	switch {
+	case ps.Zone == nil:
+		if err := core.SetZone(ctx, zone); err != nil {
+			return Stats{}, err
+		}
+	case *ps.Zone != zone:
+		return Stats{}, fmt.Errorf("%w (core %s, configured %s)", ErrZoneChanged, *ps.Zone, zone)
 	}
 	var stats Stats
 	for row, err := range store.RawRowsAfter(ctx, q, ps.LastSeq) {
@@ -71,10 +85,21 @@ func (l *Ledger) CatchUp(ctx context.Context, q store.DBTX, schema string) (Stat
 	return stats, nil
 }
 
-// Renormalise rebuilds core from raw as the owner role: store.CreateCoreNext, CatchUp into
-// core_next from zero, then either store.SwapCore, or when verify is true store.DiffCore followed
-// by store.DropCoreNext with the differences returned and nothing swapped.
+// ErrZoneChanged is returned by CatchUp when the schema was built with another time zone than
+// the ledger's. It wraps store.ErrRenormaliseRequired.
+var ErrZoneChanged = fmt.Errorf("ledger: the configured time zone differs from the one core was built with: %w",
+	store.ErrRenormaliseRequired)
+
+// Renormalise rebuilds core from raw as the owner role. It first catches live core up (CatchUp on
+// store.SchemaCore), so that rows stored without a catch-up are not reported as differences; a
+// live core built with another time zone is left as it is, since it is about to be compared or
+// replaced. Then store.CreateCoreNext, CatchUp into core_next from zero, and either
+// store.SwapCore, or when verify is true store.DiffCore followed by store.DropCoreNext with the
+// differences returned and nothing swapped.
 func (l *Ledger) Renormalise(ctx context.Context, owner store.DBTX, verify bool) ([]store.CoreDiff, error) {
+	if _, err := l.CatchUp(ctx, owner, store.SchemaCore); err != nil && !errors.Is(err, ErrZoneChanged) {
+		return nil, fmt.Errorf("ledger: catch up live core: %w", err)
+	}
 	if err := store.CreateCoreNext(ctx, owner, NormaliserRev); err != nil {
 		return nil, err
 	}
@@ -139,8 +164,13 @@ func (l *Ledger) step(ctx context.Context, q store.DBTX, schema string, row stor
 		})
 		switch {
 		case errors.As(err, &skipped):
+			// Any skip of an import file is a rejection of that file.
+			if row.Kind == store.RawImportFile {
+				skipped.outcome = outcomeRejected
+			}
 			if skipped.outcome == outcomeRejected {
 				rs.FilesRejected++
+				rs.Rejections = append(rs.Rejections, skipped.category)
 			} else {
 				rs.Unparseable++
 			}
@@ -197,6 +227,7 @@ func (s *Stats) add(o Stats) {
 	s.Disappeared += o.Disappeared
 	s.Returned += o.Returned
 	s.FilesRejected += o.FilesRejected
+	s.Rejections = append(s.Rejections, o.Rejections...)
 }
 
 // applier applies one raw row on q, inside the row's savepoint.

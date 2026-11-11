@@ -39,6 +39,7 @@ func (a *applier) importFile(ctx context.Context, f *store.ImportFile) error {
 	if err != nil {
 		return rejected("check_failed")
 	}
+	fr = sanitiseFileResult(fr)
 	if fr.FirstDate.IsZero() || fr.LastDate.IsZero() || fr.LastDate.Before(fr.FirstDate) {
 		return rejected("bad_result")
 	}
@@ -74,7 +75,7 @@ func (a *applier) importFile(ctx context.Context, f *store.ImportFile) error {
 		return err
 	}
 	if err := a.core.InsertStatement(ctx, store.Statement{AccountID: acc.ID, RawSeq: a.row.Seq, FirstDate: fr.FirstDate,
-		LastDate: fr.LastDate, OpeningMinor: fr.OpeningMinor, ClosingMinor: fr.ClosingMinor}); err != nil {
+		LastDate: fr.LastDate, OpeningMinor: fr.OpeningMinor, ClosingMinor: fr.ClosingMinor, ExactPeriod: fr.PeriodExact}); err != nil {
 		return err
 	}
 	return a.recomputeContinuity(ctx, acc, f.ImportedAt)
@@ -84,9 +85,12 @@ func (a *applier) importFile(ctx context.Context, f *store.ImportFile) error {
 // its statements.
 //
 // Statements are walked in order of first date, then last date descending, then raw seq, keeping
-// reach: the last date covered so far and the balance on it. A statement starting after reach
-// does not overlap what came before; when its opening balance differs from reach's balance a gap
-// is recorded between the two (after_date reach's date, before_date its first date, diff opening
+// reach: the last date covered so far, the balance on it, and whether the statement that set it
+// has an exact (printed) period. A statement starting after reach does not overlap what came
+// before; a gap is recorded between the two when its opening balance differs from reach's
+// balance, or when both it and the statement that set reach have exact periods and its first
+// date is later than the day after reach's date, so that a skipped month whose money in equals
+// its money out is still found, with a difference of 0 (after_date reach's date, before_date its first date, diff opening
 // minus reach's balance, raw_seq its own). A statement starting on or before reach's date
 // overlaps or joins on the same day and is not checked. Either way reach moves to the
 // statement's last date and closing balance when that is later than reach.
@@ -131,18 +135,20 @@ func continuity(stmts []store.Statement) ([]store.FileGap, time.Time) {
 	var gaps []store.FileGap
 	var reachDate time.Time
 	var reachBalance int64
+	var reachExact bool
 	for i, s := range stmts {
 		switch {
 		case i == 0:
-			reachDate, reachBalance = s.LastDate, s.ClosingMinor
+			reachDate, reachBalance, reachExact = s.LastDate, s.ClosingMinor, s.ExactPeriod
 		case s.FirstDate.After(reachDate):
-			if s.OpeningMinor != reachBalance {
+			apart := s.ExactPeriod && reachExact && s.FirstDate.After(reachDate.AddDate(0, 0, 1))
+			if s.OpeningMinor != reachBalance || apart {
 				gaps = append(gaps, store.FileGap{AccountID: s.AccountID, AfterDate: reachDate, BeforeDate: s.FirstDate,
 					DiffMinor: s.OpeningMinor - reachBalance, RawSeq: s.RawSeq})
 			}
-			reachDate, reachBalance = s.LastDate, s.ClosingMinor
+			reachDate, reachBalance, reachExact = s.LastDate, s.ClosingMinor, s.ExactPeriod
 		case s.LastDate.After(reachDate):
-			reachDate, reachBalance = s.LastDate, s.ClosingMinor
+			reachDate, reachBalance, reachExact = s.LastDate, s.ClosingMinor, s.ExactPeriod
 		}
 	}
 	if len(gaps) > 0 {

@@ -29,8 +29,9 @@ type rowContent struct {
 // settled transactions keyed by import row key, one balance per row, and the statement's opening
 // and closing balances and the dates it covers. A halifax-pdf statement covers its printed period,
 // so consecutive monthly statements abut, and names its account by sort code and account number
-// (digits only, joined by a space). A manual-csv statement covers its first to its last row date
-// and names no account. A statement with no rows (only a PDF can have none) has its closing
+// (digits only, joined by a space); its period is exact. A manual-csv statement covers its first
+// to its last row date, which is not exact, and names no account. A statement with no rows (only
+// a PDF can have none) has its closing
 // balance as both opening and closing. The error never carries statement content.
 func (Normaliser) NormaliseFile(f ledger.File) (ledger.FileResult, error) {
 	var st *Statement
@@ -57,7 +58,7 @@ func (Normaliser) NormaliseFile(f ledger.File) (ledger.FileResult, error) {
 		res.FirstDate, res.LastDate = st.Rows[0].Date, st.Rows[len(st.Rows)-1].Date
 	}
 	if st.Format == FormatHalifaxPDF {
-		res.FirstDate, res.LastDate = st.PeriodStart, st.PeriodEnd
+		res.FirstDate, res.LastDate, res.PeriodExact = st.PeriodStart, st.PeriodEnd, true
 		res.AccountRef = accountRef(st.SortCode, st.AccountNumber)
 	}
 	for _, r := range st.Rows {

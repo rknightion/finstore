@@ -216,7 +216,7 @@ func TestStatementForAnotherBankAccountIsRejectedLiveAndOnReplay(t *testing.T) {
 	}
 
 	e.importFile("halifax-current", "halifax-pdf", halifaxPDF(time.February, 50000, halifaxRows(time.February), "11-22-33", "87654321"))
-	if st := e.catchUp(); st.FilesRejected != 1 || st.TransactionsCreated != 0 {
+	if st := e.catchUp(); st.FilesRejected != 1 || st.TransactionsCreated != 0 || len(st.Rejections) != 1 || st.Rejections[0] != "account_mismatch" {
 		t.Fatalf("stats %+v", st)
 	}
 	if n := e.countTxns(accID); n != 2 {
@@ -314,5 +314,72 @@ func TestCompletedFetchWithoutPeriodOrAccountDisappearsNothing(t *testing.T) {
 	e.complete(e.fetch(4, "acc_1", jan))
 	if st := e.catchUp(); st.Disappeared != 1 {
 		t.Fatalf("control: stats %+v", st)
+	}
+}
+
+// flatRows is two made-up rows in month of 2030 whose money in equals money out.
+func flatRows(month time.Month) []importertest.Row {
+	day := func(d int) string { return time.Date(2030, month, d, 0, 0, 0, 0, time.UTC).Format("02 Jan 06") }
+	return []importertest.Row{
+		{Date: day(4), Desc: "MADE UP REFUND", Type: "FPI", In: 3000},
+		{Date: day(9), Desc: "MADE UP SHOP", Type: "DEB", Out: 3000},
+	}
+}
+
+func TestSkippedMonthWithEqualBalancesIsAGapBetweenExactPeriods(t *testing.T) {
+	e := newEnv(t)
+	e.addFileAccount("halifax-current")
+	// January closes at 500.00; March opens there. February, money in equal to money out, is
+	// missing.
+	e.importFile("halifax-current", "halifax-pdf", halifaxPDF(time.January, 40000, halifaxRows(time.January), "11-22-33", "12345678"))
+	e.importFile("halifax-current", "halifax-pdf", halifaxPDF(time.March, 50000, halifaxRows(time.March), "11-22-33", "12345678"))
+	e.catchUp()
+	g := e.gaps("halifax-current")
+	if len(g) != 1 || !g[0].AfterDate.Equal(date("2030-01-31")) || !g[0].BeforeDate.Equal(date("2030-03-01")) || g[0].DiffMinor != 0 {
+		t.Fatalf("gaps %+v, want one from 31 January to 1 March with difference 0", g)
+	}
+	if s := e.coverageState("halifax-current"); s != "mismatch" {
+		t.Fatalf("coverage state %q with February missing", s)
+	}
+	e.importFile("halifax-current", "halifax-pdf", halifaxPDF(time.February, 50000, flatRows(time.February), "11-22-33", "12345678"))
+	e.catchUp()
+	if g := e.gaps("halifax-current"); len(g) != 0 {
+		t.Fatalf("February did not close the gap: %+v", g)
+	}
+	accID := wantAccountID(ledger.SourceManual, "halifax-current")
+	if r := e.recon(accID); r.BreakCount != 0 || !sameDay(r.ReconciledThrough, monthEnd(time.March)) {
+		t.Fatalf("after February: %+v", r)
+	}
+	if s := e.coverageState("halifax-current"); s != "reconciled" {
+		t.Fatalf("coverage state %q after February", s)
+	}
+}
+
+func TestPartMonthStatementThenNextFullMonthIsAGapFromThePartsEnd(t *testing.T) {
+	e := newEnv(t)
+	e.addFileAccount("halifax-current")
+	part := importertest.New(40000, halifaxRows(time.January)[:1])
+	part.Start, part.End = date("2030-01-01"), date("2030-01-10")
+	part.SortCode, part.Account = "11-22-33", "12345678"
+	e.importFile("halifax-current", "halifax-pdf", part.PDF())
+	// February opens at the part statement's closing balance, 520.00.
+	e.importFile("halifax-current", "halifax-pdf", halifaxPDF(time.February, 52000, flatRows(time.February), "11-22-33", "12345678"))
+	e.catchUp()
+	g := e.gaps("halifax-current")
+	if len(g) != 1 || !g[0].AfterDate.Equal(date("2030-01-10")) || !g[0].BeforeDate.Equal(date("2030-02-01")) || g[0].DiffMinor != 0 {
+		t.Fatalf("gaps %+v, want one from 10 January to 1 February", g)
+	}
+}
+
+func TestRowDatedStatementsWithJoiningBalancesAndADateGapRecordNoGap(t *testing.T) {
+	e := newEnv(t)
+	e.addFileAccount("bank-current")
+	// September closes at 97.00; this statement opens there, five weeks later. Row dates cannot
+	// say whether anything happened in between.
+	e.importFile("bank-current", "manual-csv", sepCSV)
+	e.importFile("bank-current", "manual-csv", csvFile(9700, csvRow{"2030-11-10", "DEB", -50, "MADE UP"}))
+	e.catchUp()
+	if g := e.gaps("bank-current"); len(g) != 0 {
+		t.Fatalf("gaps %+v", g)
 	}
 }

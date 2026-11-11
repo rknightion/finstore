@@ -87,6 +87,11 @@ func (a *applier) acceptDifference(ctx context.Context, payload []byte) error {
 	if err != nil {
 		return err
 	}
+	// Accepted differences apply to API-fed accounts only: a file account's state follows its
+	// statement gaps, which an accepted difference does not close.
+	if acc.Feed != feedAPI {
+		return unparseable("file_account")
+	}
 	rec, err := a.core.GetReconciliation(ctx, acc.ID)
 	if err != nil {
 		return err

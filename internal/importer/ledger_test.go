@@ -36,7 +36,7 @@ func TestNormaliserGivesSignedSettledRowsAndStatementBounds(t *testing.T) {
 	if res.OpeningMinor != 50000 || res.ClosingMinor != g.Closing || !res.FirstDate.Equal(d(1)) || !res.LastDate.Equal(d(31)) {
 		t.Fatalf("bounds: opening %d closing %d first %s last %s", res.OpeningMinor, res.ClosingMinor, res.FirstDate, res.LastDate)
 	}
-	if res.AccountRef != "000000 00000000" {
+	if res.AccountRef != "000000 00000000" || !res.PeriodExact {
 		t.Fatalf("account ref %q", res.AccountRef)
 	}
 }
@@ -63,7 +63,7 @@ func TestNormaliserContentIsCanonical(t *testing.T) {
 	if string(a.Txns[0].HashInput) != want {
 		t.Fatalf("hash input %s, want %s", a.Txns[0].HashInput, want)
 	}
-	if a.OpeningMinor != 10000 || a.ClosingMinor != 9500 || a.AccountRef != "" ||
+	if a.OpeningMinor != 10000 || a.ClosingMinor != 9500 || a.AccountRef != "" || a.PeriodExact ||
 		!a.FirstDate.Equal(d(3)) || !a.LastDate.Equal(d(3)) {
 		t.Fatalf("opening %d closing %d", a.OpeningMinor, a.ClosingMinor)
 	}

@@ -43,6 +43,7 @@ type fAcc struct {
 	Parent   string `json:"parent,omitempty"`
 	Closed   bool   `json:"closed,omitempty"`
 	Currency string `json:"currency,omitempty"`
+	Name     string `json:"name,omitempty"`
 }
 
 type fTxn struct {
@@ -83,6 +84,9 @@ func (fakeNormaliser) NormaliseResponse(r ledger.Response, loc *time.Location) (
 			ParentSourceKey: a.Parent, Closed: a.Closed}
 		if a.Currency != "" {
 			rec.Currency = a.Currency
+		}
+		if a.Name != "" {
+			rec.Name = a.Name
 		}
 		if a.Opened != "" {
 			d, err := time.Parse("2006-01-02", a.Opened)
@@ -250,9 +254,21 @@ func (e *env) respond(fetchID int64, endpoint, b string) int64 {
 
 func (e *env) respondAs(fetchID int64, source, endpoint string, status int, b string) int64 {
 	e.t.Helper()
+	return e.store(fetchID, source, endpoint, status, b, e.tick())
+}
+
+// respondAt stores one 200 response of fetchID fetched at at, which may be long before the
+// test's clock: a response from an old capture, loaded late.
+func (e *env) respondAt(fetchID int64, endpoint, b string, at time.Time) int64 {
+	e.t.Helper()
+	return e.store(fetchID, fakeSource, endpoint, 200, b, at)
+}
+
+func (e *env) store(fetchID int64, source, endpoint string, status int, b string, at time.Time) int64 {
+	e.t.Helper()
 	seq, err := store.InsertAPIResponse(context.Background(), e.app.DB(), store.APIResponse{FetchID: fetchID,
 		Source: source, Endpoint: endpoint, Status: status, ContentType: "application/json",
-		FetchedAt: e.tick(), Body: []byte(b)})
+		FetchedAt: at, Body: []byte(b)})
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -262,7 +278,12 @@ func (e *env) respondAs(fetchID int64, source, endpoint string, status int, b st
 // complete records that fetchID received every page and returns the completion time.
 func (e *env) complete(fetchID int64) time.Time {
 	e.t.Helper()
-	at := e.tick()
+	return e.completeAt(fetchID, e.tick())
+}
+
+// completeAt records that fetchID completed at at.
+func (e *env) completeAt(fetchID int64, at time.Time) time.Time {
+	e.t.Helper()
 	if _, err := store.InsertFetchComplete(context.Background(), e.app.DB(),
 		store.FetchComplete{FetchID: fetchID, CompletedAt: at, Pages: 1}); err != nil {
 		e.t.Fatal(err)

@@ -38,8 +38,12 @@ func (l *Ledger) normalise(n SourceNormaliser, r store.APIResponse) (Result, err
 			return Result{}, err
 		}
 	}
-	return n.NormaliseResponse(Response{Seq: r.Seq, Endpoint: r.Endpoint, Params: params, Status: r.Status,
+	res, err := n.NormaliseResponse(Response{Seq: r.Seq, Endpoint: r.Endpoint, Params: params, Status: r.Status,
 		Body: r.Body, FetchedAt: r.FetchedAt}, l.loc)
+	if err != nil {
+		return Result{}, err
+	}
+	return sanitiseResult(res), nil
 }
 
 func (a *applier) apiResponse(ctx context.Context, r *store.APIResponse) error {
@@ -226,7 +230,8 @@ func (a *applier) applyTxn(ctx context.Context, acc store.Account, source string
 	switch res.Outcome {
 	case store.TransactionCreated:
 		a.stats.TransactionsCreated++
-	case store.TransactionChanged:
+	case store.TransactionChanged, store.TransactionOlderVersion:
+		// An older version leaves the row, so Current equals Previous and the delta is 0.
 		a.stats.TransactionsChanged++
 		before = res.Previous.EffectiveAmount()
 	case store.TransactionUnchanged:

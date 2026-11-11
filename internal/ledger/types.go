@@ -130,6 +130,10 @@ type FileResult struct {
 	// the format names none. The ledger rejects a statement whose AccountRef differs from the one
 	// the account's earlier imports set.
 	AccountRef string
+	// PeriodExact says FirstDate and LastDate are the statement's printed period, not just its
+	// first and last row dates, so two statements whose periods do not abut have a gap between
+	// them even when their balances join.
+	PeriodExact bool
 }
 
 // FileNormaliser turns one stored import file into records. It returns an error when the file
@@ -153,4 +157,8 @@ type Stats struct {
 	Disappeared         int
 	Returned            int
 	FilesRejected       int
+	// Rejections holds the fixed category of each rejected file, in raw seq order: one of
+	// unknown_account, api_account, unknown_format, check_failed, bad_result, account_mismatch,
+	// or bad_transaction (a row the schema would refuse). They are the words the skip log uses.
+	Rejections []string
 }

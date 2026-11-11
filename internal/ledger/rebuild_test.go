@@ -39,6 +39,12 @@ func scenario(e *env) {
 	e.respond(e.fetch(3, "acc_1", nil), "/transactions", "not json")
 	e.balance(4, "pot_1", 20)
 	e.catchUp()
+	// An old capture loaded late: an earlier version of tx_1, and a completed January fetch that
+	// predates the live sightings of tx_2. Neither may change the current state.
+	old := e.fetch(8, "acc_1", jan)
+	e.respondAt(old, "/transactions", body(fBody{Transactions: []json.RawMessage{txn("tx_1", "acc_1", 900, jan5)}}), capturedAt)
+	e.completeAt(old, capturedAt.Add(time.Minute))
+	e.catchUp()
 	// A page stored after its fetch's completion row: the live path applied the completion before
 	// the page existed, so replay must not let the page count as present at the completion.
 	txA := txn("tx_a", "acc_2", 40, jan5)
@@ -97,7 +103,7 @@ func TestReplayFromEmptyGivesTheIncrementalCore(t *testing.T) {
 	}
 	// The scenario did exercise what it claims to.
 	accID := wantAccountID(fakeSource, "acc_1")
-	if got := e.txn(wantTxnID(accID, fakeSource, "tx_1")); got.VersionCount != 2 {
+	if got := e.txn(wantTxnID(accID, fakeSource, "tx_1")); got.VersionCount != 3 || got.AmountMinor != 1100 {
 		t.Fatalf("tx_1 has %d versions", got.VersionCount)
 	}
 	if r := e.recon(accID); r.RunningSumMinor != 1050 || r.LastCheckOK == nil || !*r.LastCheckOK {
