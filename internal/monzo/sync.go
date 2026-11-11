@@ -78,6 +78,8 @@ func (w *Worker) scheduledLocked(ctx context.Context, conn *pgx.Conn, c store.Co
 	if err != nil {
 		return err
 	}
+	ctx, span := w.metrics.StartRun(ctx, w.opts.Tracer, Source, kind, runID)
+	defer span.End()
 	tally := &runTally{}
 	runErr := w.scheduledSteps(withTally(ctx, tally), runID, kind, period, tally)
 	outcome := outcomeOK
@@ -85,7 +87,7 @@ func (w *Worker) scheduledLocked(ctx context.Context, conn *pgx.Conn, c store.Co
 	case errors.Is(runErr, errBackfillStarted):
 		runErr = nil
 		outcome = outcomePartial
-		tally.fail("backfill_started")
+		tally.fail(categoryBackfillStarted)
 	case runErr != nil:
 		outcome = outcomeFailed
 		tally.fail(category(runErr))

@@ -21,6 +21,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/rknightion/finstore/internal/bankhttp"
 	"github.com/rknightion/finstore/internal/consent"
@@ -76,7 +77,7 @@ type Options struct {
 	// Sleep pauses the auth client between retries of a rate-limited token call; nil means a real
 	// timer.
 	Sleep func(ctx context.Context, d time.Duration) error
-	// Tracer makes the spans of bank calls; nil means none.
+	// Tracer makes the spans of bank calls and runs; nil means none.
 	Tracer trace.Tracer
 }
 
@@ -151,6 +152,9 @@ func New(opts Options, st *store.Store, proj Projector, m *telemetry.Metrics, lo
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now
+	}
+	if opts.Tracer == nil {
+		opts.Tracer = tracenoop.NewTracerProvider().Tracer(semconv.ServiceName)
 	}
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -237,7 +241,9 @@ func (w *Worker) HandleCallback(ctx context.Context, state, code string) error {
 		w.log.ErrorContext(ctx, "truelayer connect run could not be recorded", semconv.LogErrorCategory, category(err))
 		return err
 	}
-	w.goConnect(func(ctx context.Context) { w.connect(ctx, cons.ID, pair, runID) })
+	// The background work outlives the callback, so its run span is a new root that links to the
+	// callback's span (the one ctx carries).
+	w.goConnect(trace.LinkFromContext(ctx), func(ctx context.Context) { w.connect(ctx, cons.ID, pair, runID) })
 	return nil
 }
 
@@ -251,6 +257,10 @@ var (
 // When the fetch does not run (the consent was replaced, the worker stopped, the token expired
 // while the connect waited for the lock) the run is ended by abandonConnect.
 func (w *Worker) connect(ctx context.Context, consentID int64, pair tokenPair, runID int64) {
+	// The run's span starts here and not at the fetch, so the approval and the wait for the lock
+	// are inside the run's trace.
+	ctx, span := w.metrics.StartRun(ctx, w.opts.Tracer, w.source, KindConnect, runID)
+	defer span.End()
 	_, me, err := w.approve(ctx, consentID, pair.access)
 	if err != nil {
 		w.abandonConnect(ctx, runID, consentID, err)
@@ -360,7 +370,15 @@ func (w *Worker) approve(ctx context.Context, id int64, token string) (store.Con
 // awaiting approval (a restart between the exchange and the approval) is approved in the
 // background with /data/v1/me, or 90 days if that fails. It must run before the worker does
 // anything else.
-func (w *Worker) Resume(ctx context.Context) error {
+func (w *Worker) Resume(ctx context.Context) (err error) {
+	ctx, end := telemetry.StartResume(ctx, w.opts.Tracer, w.source)
+	defer func() {
+		if err != nil {
+			end(outcomeFailed, category(err))
+			return
+		}
+		end(outcomeOK, "")
+	}()
 	q := w.st.DB()
 	ids, err := store.UnfinishedRuns(ctx, q, w.source, KindConnect)
 	if err != nil {
@@ -387,7 +405,9 @@ func (w *Worker) Resume(ctx context.Context) error {
 	}
 	if cur.State == store.ConsentAwaitingApproval {
 		id := cur.ID
-		w.goConnect(func(ctx context.Context) {
+		// No link: this work starts no run span for a link to be carried to (the approval alone is
+		// not a run), so its writer lock, queries and bank call are their own traces.
+		w.goConnect(trace.Link{}, func(ctx context.Context) {
 			if _, _, err := w.approve(ctx, id, ""); err != nil {
 				if ctx.Err() != nil || errors.Is(err, consent.ErrIllegalTransition) {
 					// Stopped, or a newer connect replaced the consent first.
@@ -416,8 +436,9 @@ func (w *Worker) Close() {
 }
 
 // goConnect runs fn in the background as the work of the latest connect, cancelling the work of
-// the one before.
-func (w *Worker) goConnect(fn func(ctx context.Context)) {
+// the one before. link is the span that started the work (the callback or the resume span); the
+// run span fn starts is a new root that links to it, because the work outlives that span.
+func (w *Worker) goConnect(link trace.Link, fn func(ctx context.Context)) {
 	ctx, cancel := context.WithCancel(w.bgCtx)
 	w.mu.Lock()
 	if w.cancelConnect != nil {
@@ -429,7 +450,7 @@ func (w *Worker) goConnect(fn func(ctx context.Context)) {
 	go func() {
 		defer w.bg.Done()
 		defer cancel()
-		fn(ctx)
+		fn(telemetry.WithLink(ctx, link))
 	}()
 }
 

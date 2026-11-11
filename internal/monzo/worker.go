@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/rknightion/finstore/internal/bankhttp"
 	"github.com/rknightion/finstore/internal/consent"
@@ -58,7 +59,7 @@ type Options struct {
 	// Sleep pauses for d or until ctx ends, returning ctx.Err() then. It is used for the approval
 	// poll and the bank client's retry pauses. Nil means a real timer.
 	Sleep func(ctx context.Context, d time.Duration) error
-	// Tracer makes the spans of bank calls; nil means none.
+	// Tracer makes the spans of bank calls, runs and history ranges; nil means none.
 	Tracer trace.Tracer
 }
 
@@ -123,6 +124,9 @@ func New(opts Options, st *store.Store, proj Projector, m *telemetry.Metrics, lo
 	if opts.Sleep == nil {
 		opts.Sleep = sleepTimer
 	}
+	if opts.Tracer == nil {
+		opts.Tracer = tracenoop.NewTracerProvider().Tracer(semconv.ServiceName)
+	}
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
@@ -181,7 +185,8 @@ func (w *Worker) AuthoriseURL(ctx context.Context) (string, error) {
 // the previous one). The exchange and the store hold the token mutex, so they never interleave
 // with a refresh, and run detached from ctx's cancellation (60 s timeout): once the bank has
 // issued the pair the previous token is dead, so it must be stored. It then starts the approval wait and the full-history fetch in the
-// background and returns. An unusable state returns ErrCallbackRefused without exchanging the
+// background and returns; that work links to the span ctx carries (the callback span), so the
+// trace of the history fetch points back at the callback. An unusable state returns ErrCallbackRefused without exchanging the
 // code. A failed exchange gives the attempt the outcome refused and leaves the current consent in
 // place.
 func (w *Worker) HandleCallback(ctx context.Context, state, code string) error {
@@ -197,14 +202,23 @@ func (w *Worker) HandleCallback(ctx context.Context, state, code string) error {
 	}
 	w.recordConsent(ctx, cons)
 	w.log.InfoContext(ctx, "monzo consent awaiting approval", semconv.LogState, cons.State)
-	w.goApproval(cons.ID)
+	w.goApproval(trace.LinkFromContext(ctx), cons.ID)
 	return nil
 }
 
 // Resume restarts background work after a restart: the approval wait of a consent still awaiting
 // approval, or the full-history fetch of an active consent whose window is still open (its
 // deadline counts from the stored token issue time, so it is the same as before the restart).
-func (w *Worker) Resume(ctx context.Context) error {
+// Resume is one resume span, and the background work it starts links to that span.
+func (w *Worker) Resume(ctx context.Context) (err error) {
+	ctx, end := telemetry.StartResume(ctx, w.opts.Tracer, Source)
+	defer func() {
+		if err != nil {
+			end(outcomeFailed, category(err))
+			return
+		}
+		end(outcomeOK, "")
+	}()
 	cur, err := w.consents.Current(ctx, w.st.DB())
 	if errors.Is(err, consent.ErrNoConsent) {
 		return nil
@@ -218,9 +232,9 @@ func (w *Worker) Resume(ctx context.Context) error {
 	}
 	switch {
 	case cur.State == store.ConsentAwaitingApproval:
-		w.goApproval(cur.ID)
+		w.goApproval(trace.LinkFromContext(ctx), cur.ID)
 	case cur.State == store.ConsentActive && w.now().Before(cur.TokenIssuedAt.Add(w.opts.Window)):
-		w.goConnect(func(ctx context.Context) { w.backfillLogged(ctx, cur.ID) })
+		w.goConnect(trace.LinkFromContext(ctx), func(ctx context.Context) { w.backfillLogged(ctx, cur.ID) })
 	}
 	return nil
 }
@@ -240,8 +254,9 @@ func (w *Worker) Close() {
 }
 
 // goConnect runs fn in the background as the work of the latest connect, cancelling the work of
-// the one before.
-func (w *Worker) goConnect(fn func(ctx context.Context)) {
+// the one before. link is the span that started the work (the callback or the resume span); the
+// run span fn starts is a new root that links to it, because the work outlives that span.
+func (w *Worker) goConnect(link trace.Link, fn func(ctx context.Context)) {
 	ctx, cancel := context.WithCancel(w.bgCtx)
 	w.mu.Lock()
 	if w.cancelConnect != nil {
@@ -253,12 +268,12 @@ func (w *Worker) goConnect(fn func(ctx context.Context)) {
 	go func() {
 		defer w.bg.Done()
 		defer cancel()
-		fn(ctx)
+		fn(telemetry.WithLink(ctx, link))
 	}()
 }
 
-func (w *Worker) goApproval(id int64) {
-	w.goConnect(func(ctx context.Context) {
+func (w *Worker) goApproval(link trace.Link, id int64) {
+	w.goConnect(link, func(ctx context.Context) {
 		if w.awaitApproval(ctx, id) {
 			w.backfillLogged(ctx, id)
 		}

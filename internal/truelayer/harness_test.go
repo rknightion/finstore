@@ -169,6 +169,13 @@ func (h *harness) runs(source, kind string) []store.Run {
 
 func newHarness(t *testing.T, fakeOpts ...truelayertest.Option) *harness {
 	t.Helper()
+	return newHarnessWith(t, nil, fakeOpts...)
+}
+
+// newHarnessWith is newHarness with options for the store's connection pool, such as
+// store.WithTelemetry to trace its queries.
+func newHarnessWith(t *testing.T, storeOpts []store.OpenOption, fakeOpts ...truelayertest.Option) *harness {
+	t.Helper()
 	ctx := context.Background()
 	super := testpg.Start(t)
 	if err := store.Bootstrap(ctx, super, "owner-secret", "app-secret"); err != nil {
@@ -177,7 +184,7 @@ func newHarness(t *testing.T, fakeOpts ...truelayertest.Option) *harness {
 	if err := store.Migrate(ctx, testpg.UserURL(t, super, store.RoleOwner), ledger.NormaliserRev); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	st, err := store.Open(ctx, testpg.UserURL(t, super, store.RoleApp))
+	st, err := store.Open(ctx, testpg.UserURL(t, super, store.RoleApp), storeOpts...)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -290,7 +297,12 @@ func (h *harness) worker(conn string, mod func(*Options)) *Worker {
 // fetch.
 func (h *harness) connect(w *Worker) {
 	h.t.Helper()
-	ctx := context.Background()
+	h.connectCtx(context.Background(), w)
+}
+
+// connectCtx is connect with the context HandleCallback is given, which may carry a span.
+func (h *harness) connectCtx(ctx context.Context, w *Worker) {
+	h.t.Helper()
 	link, err := w.AuthoriseURL(ctx)
 	if err != nil {
 		h.t.Fatalf("AuthoriseURL: %v", err)

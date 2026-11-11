@@ -10,6 +10,7 @@ import (
 	"github.com/rknightion/finstore/internal/consent"
 	"github.com/rknightion/finstore/internal/semconv"
 	"github.com/rknightion/finstore/internal/store"
+	"github.com/rknightion/finstore/internal/telemetry"
 )
 
 // RunScheduled runs one scheduled sync: /me, /accounts, and for each account (Monzo pots
@@ -45,6 +46,8 @@ func (w *Worker) RunScheduled(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		ctx, span := w.metrics.StartRun(ctx, w.opts.Tracer, w.source, KindSync, runID)
+		defer span.End()
 		return w.runLocked(ctx, conn, runID, c.ID, KindSync, "", nil)
 	})
 }
@@ -390,14 +393,26 @@ func (w *Worker) history(ctx context.Context, runID int64, kind string, a listed
 
 // finishRun records the end of a run and counts it with its error category.
 func (w *Worker) finishRun(ctx context.Context, runID int64, kind, outcome string, tally *runTally) error {
+	category := tally.category
+	// A run that did not end ok on a context that was cancelled (serve stopping) is cancelled,
+	// whatever the interrupted call reported first (a cut-off attempt reads network): the state
+	// gauges skip such a run, so a deploy never reads as a failure. Two categories are kept: a
+	// connect that a newer connect replaced is superseded (its context here is already detached),
+	// and a Lloyds connect that stopped before its history arrived stays history_failed, because
+	// that history is lost until a reconnect and the History Missing alert is for exactly that.
+	if outcome != outcomeOK && category != categoryHistoryFailed && errors.Is(ctx.Err(), context.Canceled) {
+		category = "cancelled"
+	}
 	var cat *string
-	if tally.category != "" {
-		c := tally.category
+	if category != "" {
+		c := category
 		cat = &c
 	}
 	err := store.FinishRun(context.WithoutCancel(ctx), w.st.DB(), runID, store.RunResult{
 		FinishedAt: w.now(), Outcome: outcome, Requests: int(tally.requests.Load()), RowsSeen: tally.rows, ErrorCategory: cat,
 	})
-	w.metrics.SyncRunWithCategory(ctx, w.source, kind, outcome, tally.category)
+	w.metrics.SyncRunWithCategory(ctx, w.source, kind, outcome, category)
+	// TrueLayer runs have no pages: each read is one call.
+	telemetry.RunFromContext(ctx).Finish(ctx, outcome, category, -1, tally.rows)
 	return err
 }

@@ -393,7 +393,11 @@ func category(err error) string {
 		return string(be.Category)
 	case errors.Is(err, errUnexpectedBody):
 		return "unexpected_body"
-	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, context.DeadlineExceeded):
+		// A deadline is a timeout and a real failure; only a cancellation is "cancelled", which
+		// the state gauges skip.
+		return "timeout"
+	case errors.Is(err, context.Canceled):
 		return "cancelled"
 	}
 	return "internal"

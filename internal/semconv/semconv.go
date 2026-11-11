@@ -321,7 +321,7 @@ var statusCategories = []string{
 	"unexpected_status",
 	// Run categories (monzo, truelayer, consent).
 	"history_failed", "consent_lost", "superseded", "interrupted", "card_key_shared", "cards_refused",
-	"window_closed", "timestamp_group_over_page", "unexpected_body", "cancelled", "internal",
+	"window_closed", "timestamp_group_over_page", "backfill_started", "unexpected_body", "cancelled", "internal",
 	// Import and ledger rejections.
 	"check_failed", "account_mismatch", "unknown_format", "rejected_before",
 	// Connect and callback failures.

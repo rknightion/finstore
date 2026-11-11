@@ -10,10 +10,13 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/rknightion/finstore/internal/bankhttp"
 	"github.com/rknightion/finstore/internal/semconv"
 	"github.com/rknightion/finstore/internal/store"
+	"github.com/rknightion/finstore/internal/telemetry"
 )
 
 const (
@@ -31,6 +34,11 @@ const (
 	outcomeFailed  = "failed"
 
 	categoryWindowClosed = "window_closed"
+	// categoryCancelled marks a run that was cancelled, not one that failed.
+	categoryCancelled = "cancelled"
+	// categoryBackfillStarted marks a scheduled run that found a full-history fetch waiting to
+	// start and gave way to it.
+	categoryBackfillStarted = "backfill_started"
 	// categoryTimestampGroup marks a listing that stepped past a full page of rows sharing one
 	// timestamp: the bank skipped the rest of that group, so the listing is incomplete.
 	categoryTimestampGroup = "timestamp_group_over_page"
@@ -119,7 +127,9 @@ func (w *Worker) planRanges(ctx context.Context, accts []account, now time.Time)
 }
 
 // fetchRange makes one attempt at a range under its own raw.fetch. It does nothing when the
-// deadline has already passed.
+// deadline has already passed. An attempt is a new root span, monzo.fetch_range, linked to the
+// run's sync.run span: a full-history fetch makes tens of thousands of spans, so each range gets
+// a trace of its own.
 func (w *Worker) fetchRange(ctx context.Context, runID int64, job rangeJob, deadline time.Time, tally *runTally) error {
 	if !w.now().Before(deadline) {
 		if !job.refetch {
@@ -127,6 +137,19 @@ func (w *Worker) fetchRange(ctx context.Context, runID int64, job rangeJob, dead
 		}
 		return nil
 	}
+	ctx, span := telemetry.StartRange(ctx, w.opts.Tracer, semconv.SpanMonzoFetchRange,
+		attribute.String(semconv.SpanSource, Source),
+		attribute.String(semconv.SpanRangeStart, job.win.PeriodStart.UTC().Format(time.DateOnly)),
+		attribute.String(semconv.SpanRangeEnd, job.before.UTC().Format(time.DateOnly)))
+	defer span.End()
+	err := w.fetchRangeAttempt(ctx, runID, job, deadline, tally, span)
+	if err != nil {
+		telemetry.Fail(span, category(err))
+	}
+	return err
+}
+
+func (w *Worker) fetchRangeAttempt(ctx context.Context, runID int64, job rangeJob, deadline time.Time, tally *runTally, span trace.Span) error {
 	q := w.st.DB()
 	win := job.win
 	acct, before := win.AccountKey, job.before
@@ -163,6 +186,7 @@ func (w *Worker) fetchRange(ctx context.Context, runID int64, job rangeJob, dead
 		}
 		// forbidden_verification_required (the window has closed) and any other failure end the
 		// range as unfinished.
+		telemetry.Fail(span, category(err))
 		if !job.refetch {
 			tally.fail(category(err))
 		}
@@ -172,6 +196,7 @@ func (w *Worker) fetchRange(ctx context.Context, runID int64, job rangeJob, dead
 	case res.complete && (res.idStep || fromID):
 		// Every page arrived, but rows of a timestamp group larger than a page were skipped: the
 		// range stays unfinished, which is the truth.
+		telemetry.Fail(span, categoryTimestampGroup)
 		tally.fail(categoryTimestampGroup)
 		return nil
 	case res.complete:
@@ -182,6 +207,7 @@ func (w *Worker) fetchRange(ctx context.Context, runID int64, job rangeJob, dead
 		}
 		return store.CompleteBackfillWindow(ctx, q, win.ID, res.completedAt)
 	default:
+		telemetry.Fail(span, categoryWindowClosed)
 		if !job.refetch {
 			tally.fail(categoryWindowClosed)
 		}
@@ -210,9 +236,19 @@ func (w *Worker) runBackfill(ctx context.Context, consentID int64) error {
 		return nil
 	}
 	deadline := cons.TokenIssuedAt.Add(w.opts.Window)
-	return w.st.HoldWriterLock(ctx, store.HolderMonzoBackfill, func(ctx context.Context, conn *pgx.Conn) error {
+	// The run's span starts before the lock, so the wait for it is inside the run's trace. The run
+	// row does not exist until the lock is held; backfillLocked adds its id.
+	ctx, span := w.metrics.StartRun(ctx, w.opts.Tracer, Source, kindBackfill, 0)
+	defer span.End()
+	err = w.st.HoldWriterLock(ctx, store.HolderMonzoBackfill, func(ctx context.Context, conn *pgx.Conn) error {
 		return w.backfillLocked(ctx, conn, cons, deadline)
 	})
+	if err != nil {
+		// A run that never started (no lock, or its row could not be written) has no outcome yet:
+		// the span says so. A run that finished has already recorded its own.
+		span.Abandon(category(err))
+	}
+	return err
 }
 
 func (w *Worker) backfillLocked(ctx context.Context, conn *pgx.Conn, cons store.Consent, deadline time.Time) error {
@@ -221,6 +257,7 @@ func (w *Worker) backfillLocked(ctx context.Context, conn *pgx.Conn, cons store.
 	if err != nil {
 		return err
 	}
+	telemetry.RunFromContext(ctx).SetRunID(runID)
 	tally := &runTally{}
 	runErr := w.backfillSteps(withTally(ctx, tally), runID, deadline, tally)
 	outcome := outcomeOK
@@ -358,14 +395,24 @@ feed:
 
 // finishRun records the end of a run and counts it.
 func (w *Worker) finishRun(ctx context.Context, runID int64, kind, outcome string, tally *runTally) error {
+	category := tally.category
+	// A run that did not end ok on a context that was cancelled (serve stopping) is cancelled,
+	// whatever the interrupted call reported first (a cut-off attempt reads network): the state
+	// gauges skip such a run, so a deploy never reads as a failure.
+	if outcome != outcomeOK && errors.Is(ctx.Err(), context.Canceled) {
+		category = categoryCancelled
+	}
 	var cat *string
-	if tally.category != "" {
-		c := tally.category
+	if category != "" {
+		c := category
 		cat = &c
 	}
 	err := store.FinishRun(context.WithoutCancel(ctx), w.st.DB(), runID, store.RunResult{
 		FinishedAt: w.now(), Outcome: outcome, Requests: int(tally.requests.Load()), RowsSeen: tally.rows, ErrorCategory: cat,
 	})
-	w.metrics.SyncRun(ctx, Source, kind, outcome)
+	// Monzo runs carry their error category on the counter, as TrueLayer's do, so one alert covers
+	// both.
+	w.metrics.SyncRunWithCategory(ctx, Source, kind, outcome, category)
+	telemetry.RunFromContext(ctx).Finish(ctx, outcome, category, tally.pages, tally.rows)
 	return err
 }

@@ -566,7 +566,13 @@ metric value, a label or a log field; the log handler drops any field that is no
 | Metric | Attributes | Meaning |
 |---|---|---|
 | `finstore.sync.last_success.time` | `source` | Unix time of the last successful scheduled sync |
-| `finstore.sync.runs` (counter) | `source`, `kind`, `outcome` | Runs finished |
+| `finstore.sync.runs` (counter) | `source`, `kind`, `outcome`, and `error_category` on a run that recorded one | Runs finished. `error_category` is the fixed word the run's `sync.run` row carries (`rate_limited`, `timeout`, `history_failed` and so on), on Monzo runs as well as TrueLayer's, so one rule can count runs that ended for one reason |
+| `finstore.sync.run.duration` (histogram, seconds) | `source`, `kind`, `outcome` | How long a run took, with buckets from 1 s to 1 hour. A connect run that a restart ended (the process stopped before its fetch) was not timed and has no point |
+| `finstore.sync.last_run.ok` | `source`, `kind` | 1 when the newest finished run of that source and kind ended `ok`, 0 when it ended `partial` or `failed`. Kinds `hourly`, `nightly`, `sync`, `connect` and `backfill` only: an `import` or `capture` run is never published, failed or not. A run recorded with `error_category` `cancelled` is skipped, so a deploy never reads as a failure and the run before it stands. `cancelled` means the run's context was cancelled: `serve` stopping under it (whatever call it was in when it stopped), or a newer connect replacing a Monzo full-history fetch. A run that passed its own deadline is `timeout` and is a failure like any other: it reads 0 here. Published by the `status` job from the database, so it follows the next minute's run |
+| `finstore.sync.last_run.time` | `source`, `kind` | Unix time that run finished |
+| `finstore.sync.last_rate_limited.time` | `source` | Unix time the source's newest run that ended with `error_category` `rate_limited` finished. A source that never had one publishes nothing |
+| `finstore.consent.history_ok` | `source` | For a source whose current consent is `active`: 1 when a `connect` run (TrueLayer) or `backfill` run (Monzo) ended `ok` at or after the consent's approval, 0 when none has, so older rows may be missing. It stays 0 after a `partial` fetch until a reconnect fetches the history. Nothing for a source with no active consent |
+| `finstore.connect.unanswered` | `source` | Connect attempts of that source that started in the last 24 hours and expired unused (the browser never reached the callback, or you abandoned the connect). A source that has had an attempt reads 0 once they are all older, or answered |
 | `finstore.bank.requests` (counter) | `source`, `endpoint`, `status_class` | Bank requests made. `status_class` is `2xx`, `4xx` and so on, or `none` for a request with no usable response. `none` here and `no_response` on `finstore.bank.request.duration` below mean the same thing; the two names differ because the counter's value is older and its published values do not change |
 | `finstore.bank.request.duration` (histogram, seconds) | `source`, `endpoint`, `status_class` | Duration of each bank attempt, retries included, with buckets from 50 ms to 30 s. An attempt with no usable HTTP response has `status_class` `no_response`: none arrived (a transport failure or a timeout), its body could not be read (it was cut off or over the 64 MiB limit) even though a status arrived, or the status was outside 100 to 599. The call then fails with the category `network` or `timeout`, as it does for the counter's `none` |
 | `finstore.bank.retries` (counter) | `source`, `endpoint`, `reason` | Bank calls repeated, by `reason`: `rate_limited`, `server_error`, `timeout` or `network`. A token call is never repeated after a transport failure or a 5xx, so it never counts here for those |
@@ -621,6 +627,16 @@ error text: only fixed words.
 | `connect` | A connect post (`POST /connect/...`) that passed the sign-in; a request answered 404 has its server span only | `finstore.source`, `finstore.connect.outcome` |
 | `callback` | A request to a callback route that reached its handler, for Monzo's route and for the TrueLayer route they share | `finstore.source`, `finstore.connect.outcome`, and `error.type` when the outcome is `failed` |
 | `scheduler.job` | Each scheduled job run: a new root span, never a child of anything | `finstore.job` (the job's registered name: `status`, `hourly`, `nightly` and one per TrueLayer connection and time of day), `finstore.job.outcome` (`ok`, `error`, `panic` or `cancelled`; only `error` and `panic` mark the span failed) |
+| `sync.run` | One run of a source: a scheduled sync, a connect-time fetch or a Monzo full-history fetch. Under a scheduled job it is a child of that job's span; background work a callback or a restart started is a new root (see below) | `finstore.source`, `finstore.run.kind` (`hourly`, `nightly`, `sync`, `connect`, `backfill`), `finstore.run.id` (the `sync.run` row), `finstore.run.outcome` (`ok`, `partial` or `failed`), `error.type` (the run's error category), `finstore.run.rows` and, for Monzo, `finstore.run.pages`. A run that did not end `ok` is marked failed with its category. Its bank calls and queries are its children |
+| `monzo.fetch_range` | Each range of a Monzo full-history fetch that was attempted: a new root span in its own trace, linked to the `sync.run` span, because a fetch of years of history makes tens of thousands of spans | `finstore.source`, `finstore.range.start` and `finstore.range.end` (dates) |
+| `resume` | Each worker's start-up recovery (`serve` runs it for Monzo and for each TrueLayer connection before it listens): a new root span | `finstore.source`, `finstore.run.outcome` (`ok`, or `failed` with `error.type`, such as `consent_lost` for a consent whose token is missing) |
+
+**Links.** Work that outlives the span that started it gets its own trace with a link back, never a
+child span. The history fetch (Monzo) or connect-time fetch (TrueLayer) that a callback starts is a
+`sync.run` root linked to that `callback` span; the same work that `resume` starts after a restart
+links to the `resume` span. The link is one way, from the run to what started it. TrueLayer's start-up approval of a consent that was awaiting it has no run span to carry a link, so its queries, lock and bank call are their own traces and `resume` links to nothing. The wait for the
+writer lock is inside the run's trace for these runs. A Monzo approval wait has no span of its own: each poll is its own trace
+until the approval arrives, and the history fetch that follows carries the link.
 
 `finstore.connect.outcome` says how the request ended:
 
@@ -695,6 +711,14 @@ Logs go to OTLP and to stderr, from `serve` and from every command that sets tel
 written inside a span carries that span's `trace_id` and `span_id`: OTLP records as their trace
 fields, and the JSON lines on stderr (what `docker logs` shows) as `trace_id` and `span_id` keys.
 
+The run gauges exist for alerts. The newest run of each scheduled kind not `ok`
+(`finstore.sync.last_run.ok` below 1 for `hourly`, `nightly` or `sync`); a source rate limited in the
+last 6 hours (`time()` minus `finstore.sync.last_rate_limited.time`); a current consent with no
+complete history (`finstore.consent.history_ok` below 1); a connect that never came back
+(`finstore.connect.unanswered` above 0); and a scheduled job whose last run failed
+(`finstore.scheduler.job.last_ok` below 1). All of them except the last come from the `status` job,
+so if that job is failing they all go stale.
+
 Alerts worth having: no successful sync for 3 hours (13 hours for a `truelayer:` source, which syncs
 twice a day); consent ending within 14 days; consent `lost`
 or `expired`; a reconciliation mismatch lasting 90 minutes; newest import older than 35 days; dump
@@ -707,6 +731,8 @@ means the release stuck, and a command holder is just a long command).
 | Symptom | Cause | What to do |
 |---|---|---|
 | Consent `lost` | Monzo ended the consent, a token refresh was rejected, or nobody approved within a day; for a TrueLayer source, TrueLayer refused a refresh or a data call, or the token was missing at start (`token_missing`, after a database restore) | Reconnect from the status page |
+| `finstore.consent.history_ok` is 0 | The `connect` (TrueLayer) or `backfill` (Monzo) run after the approval did not end `ok`, so older rows are missing. The history is only offered just after approval | Reconnect from the status page |
+| `finstore.connect.unanswered` is above 0 | A connect attempt expired unused in the last 24 hours | Nothing if you abandoned it; it clears after 24 hours. Otherwise try again and watch the browser console: it never reached the callback |
 | A TrueLayer run ends `partial` with `rate_limited` | A fifth call of the day to one endpoint for one account was skipped, or TrueLayer answered 429 | Nothing: the next day's syncs catch up. Do not reconnect and sync by hand several times in a day |
 | A Lloyds connect run ends `partial` with `history_failed` | The full-history call of an account or a card failed (a refusal of a card read is `cards_refused` instead), the card list failed, or the service stopped before it ran | Reconnect from the status page |
 | A run ends `partial` with `cards_refused` | The bank refused a card read although `/me` lists `cards`. The consent is kept and the run made no further card call | Nothing breaks: accounts sync as usual. Check whether the bank offers cards on this consent; reconnecting may help. Cards simply stay as they were |
