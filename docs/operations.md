@@ -36,8 +36,8 @@ Tailscale sidecar for that; a reverse proxy with single sign-on works too.
 ### The front door: a Tailscale sidecar
 
 The example gives the service its own tailnet node. `finstore-ts` runs Tailscale in userspace mode
-with no capabilities, and `tailscale serve` terminates HTTPS for `<TS_HOSTNAME>.<tailnet>.ts.net`
-and proxies to `finstore:8080`. Nothing else reaches the service: it publishes no port and shares
+with no capabilities, and `tailscale serve` terminates HTTPS for the node's MagicDNS name
+(`TS_HOSTNAME` plus your tailnet's DNS suffix) and proxies to `finstore:8080`. Nothing else reaches the service: it publishes no port and shares
 no network.
 
 - **Who it is.** For a request from a user's device, `tailscale serve` adds `Tailscale-User-Login`
