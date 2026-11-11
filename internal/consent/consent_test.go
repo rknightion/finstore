@@ -192,6 +192,8 @@ func TestEachLossReasonFromItsLegalState(t *testing.T) {
 		{consent.ReasonRefreshRejected, false},
 		{consent.ReasonRefreshRejected, true},
 		{consent.ReasonInsufficientPermissions, true},
+		{consent.ReasonTokenMissing, false},
+		{consent.ReasonTokenMissing, true},
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.reason), func(t *testing.T) {

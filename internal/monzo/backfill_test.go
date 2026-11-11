@@ -66,8 +66,12 @@ func storedTxIDs(t *testing.T, h *harness) map[string]bool {
 // windowOf finds the stored range a /transactions request was for.
 func windowOf(t *testing.T, ws []store.BackfillWindow, r monzotest.Request) store.BackfillWindow {
 	t.Helper()
+	before, err := time.Parse(time.RFC3339Nano, r.Query.Get("before"))
+	if err != nil {
+		t.Fatalf("request has no valid before: %q", r.Query.Get("before"))
+	}
 	for _, w := range ws {
-		if w.AccountKey == r.Query.Get("account_id") && formatTime(w.PeriodEnd) == r.Query.Get("before") {
+		if w.AccountKey == r.Query.Get("account_id") && before.After(w.PeriodStart) && !before.After(w.PeriodEnd) {
 			return w
 		}
 	}
@@ -166,7 +170,7 @@ func TestBackfillNeverRequestsMoreThan365DaysAndStoresEveryRowOfTimestampGroupsA
 	}
 }
 
-func TestBackfillCompletesWhenMoreThan100RowsShareOneTimestamp(t *testing.T) {
+func TestTimestampGroupLargerThanAPageLeavesTheRangeUnfinishedWithoutAFetchComplete(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, nil, nil)
 	now := h.fake.Now()
@@ -176,34 +180,61 @@ func TestBackfillCompletesWhenMoreThan100RowsShareOneTimestamp(t *testing.T) {
 
 	h.connect(nil)
 
-	for _, w := range h.windows("acc_test_1") {
-		if w.CompletedAt == nil {
-			t.Fatalf("range %v..%v did not complete", w.PeriodStart, w.PeriodEnd)
-		}
-	}
 	if n := len(h.txRequests(0)); n > 10 {
 		t.Fatalf("%d page requests for 250 rows: paging did not move past the shared timestamp", n)
 	}
-	got := storedTxIDs(t, h)
 	// The API cannot page inside a group larger than a page: since=<id> skips the rest of the
-	// group. The first 100 of the large group and the whole second group are stored.
+	// group. What can be listed is stored, but the range holding the group is not complete.
+	got := storedTxIDs(t, h)
 	for _, tx := range rows[150:] {
 		if !got[tx.ID] {
 			t.Fatalf("row %s of the second group was not stored", tx.ID)
 		}
 	}
-	if len(got) < 200 {
-		t.Fatalf("stored %d rows, want at least 200", len(got))
+	var unfinished int
+	for _, w := range h.windows("acc_test_1") {
+		if w.CompletedAt == nil {
+			unfinished++
+		}
 	}
+	if unfinished != 1 {
+		t.Fatalf("%d unfinished ranges, want exactly the one holding the large group", unfinished)
+	}
+	done := completionSeqs(h.rawRows())
+	for _, r := range h.rawRows() {
+		if r.Kind != store.RawFetch || r.Fetch.PeriodStart == nil {
+			continue
+		}
+		resp, err := store.APIResponsesForFetch(context.Background(), h.st.DB(), r.Fetch.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stepped := slices.ContainsFunc(resp, func(a store.APIResponse) bool {
+			var p map[string]any
+			_ = json.Unmarshal(a.Params, &p)
+			s, _ := p["since"].(string)
+			_, isTime := parseTime(s)
+			return a.Endpoint == pathTransactions && !isTime
+		})
+		if _, ok := done[r.Fetch.ID]; ok && stepped {
+			t.Fatal("a fetch that stepped by id was completed although it skipped rows")
+		}
+	}
+	run := h.lastRun(kindBackfill)
+	if run.Outcome == nil || *run.Outcome != outcomePartial || run.ErrorCategory == nil || *run.ErrorCategory != categoryTimestampGroup {
+		t.Fatalf("run = %v %v, want partial %s", run.Outcome, run.ErrorCategory, categoryTimestampGroup)
+	}
+	// Nothing the bank still holds was marked disappeared.
+	h.requireAllLive("acc_test_1", rows[150:])
 }
 
 // slowHistory adds an account with enough history that fetching it takes several minutes of
 // fake time when every request advances the clock.
-func slowHistory(h *harness) {
+func slowHistory(h *harness) []monzotest.Transaction {
 	now := h.fake.Now()
 	created := time.Date(2023, 6, 1, 9, 0, 0, 0, time.UTC)
 	h.fake.AddAccount(monzotest.Account{ID: "acc_test_slow", Type: "uk_retail", Created: created})
-	generate(h, "acc_test_slow", 5000, created, now.Add(-time.Hour), 1)
+	return generate(h, "acc_test_slow", 5000, created, now.Add(-time.Hour), 1)
 }
 
 func TestPageArrivingAfterDeadlineIsDiscardedAndRangeStaysUnfinishedAtItsCursor(t *testing.T) {

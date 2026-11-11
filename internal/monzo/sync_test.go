@@ -2,6 +2,7 @@ package monzo
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"testing"
@@ -88,8 +89,35 @@ func TestScheduledRunFetchesItsPeriodForOpenAccountsAndCompletesTheFetch(t *test
 		for _, r := range responses {
 			order = append(order, r.Endpoint)
 		}
-		if order[0] != pathBalance || order[len(order)-2] != pathBalance || order[len(order)-1] != pathPots {
-			t.Fatalf("%s fetch responses in order %v, want balance, transactions, balance, pots", tc.kind, order)
+		if order[0] != pathTransactions || order[len(order)-2] != pathBalance || order[len(order)-1] != pathPots {
+			t.Fatalf("%s period fetch responses in order %v, want transactions, balance, pots", tc.kind, order)
+		}
+		// The period is exactly what was listed: since of the first page, before of every page.
+		for i, r := range responses {
+			if r.Endpoint != pathTransactions {
+				continue
+			}
+			var p map[string]any
+			if err := json.Unmarshal(r.Params, &p); err != nil {
+				t.Fatal(err)
+			}
+			if i == 0 && p["since"] != formatTime(*fetch.PeriodStart) {
+				t.Fatalf("%s first page since %v, fetch period starts %v", tc.kind, p["since"], *fetch.PeriodStart)
+			}
+			if p["before"] != formatTime(*fetch.PeriodEnd) {
+				t.Fatalf("%s page before %v, fetch period ends %v", tc.kind, p["before"], *fetch.PeriodEnd)
+			}
+		}
+		// The opening balance is under the run's period-less fetch for the account, read first.
+		var opening *store.Fetch
+		for _, r := range h.rawRows() {
+			if r.Kind == store.RawFetch && r.Fetch.Kind == tc.kind && r.Fetch.RunID == fetch.RunID &&
+				r.Fetch.AccountKey != nil && r.Fetch.PeriodStart == nil {
+				opening = r.Fetch
+			}
+		}
+		if opening == nil || opening.ID > fetch.ID {
+			t.Fatalf("%s: no opening balance fetch before the period fetch", tc.kind)
 		}
 	}
 	for _, r := range h.fake.Requests()[from:] {
@@ -348,12 +376,13 @@ func TestFetchCompleteIsWrittenBeforeTheClosingBalanceSoTheCheckSeesDisappearanc
 			}
 		case pathBalance:
 			balances++
-			if balances == 2 && r.Seq < seq {
+			if r.Seq < seq {
 				t.Fatalf("closing balance seq %d before the completion %d: the check would run before disappearances", r.Seq, seq)
 			}
 		}
 	}
-	if pages < 2 || balances != 2 {
-		t.Fatalf("%d pages and %d balances in the nightly fetch", pages, balances)
+	if pages < 2 || balances != 1 {
+		t.Fatalf("%d pages and %d closing balances in the nightly period fetch", pages, balances)
 	}
+	h.requireReconciled("acc_test_1")
 }

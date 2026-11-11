@@ -174,7 +174,9 @@ func (w *Worker) AuthoriseURL(ctx context.Context) (string, error) {
 
 // HandleCallback consumes the attempt that state belongs to, exchanges code for a token pair and,
 // in one transaction, stores the pair and records the new consent awaiting approval (replacing
-// the previous one). It then starts the approval wait and the full-history fetch in the
+// the previous one). The exchange and the store hold the token mutex, so they never interleave
+// with a refresh, and run detached from ctx's cancellation (60 s timeout): once the bank has
+// issued the pair the previous token is dead, so it must be stored. It then starts the approval wait and the full-history fetch in the
 // background and returns. An unusable state returns ErrCallbackRefused without exchanging the
 // code. A failed exchange gives the attempt the outcome refused and leaves the current consent in
 // place.
@@ -184,24 +186,9 @@ func (w *Worker) HandleCallback(ctx context.Context, state, code string) error {
 	if err != nil {
 		return err
 	}
-	pair, err := w.oauth.exchange(ctx, code)
+	cons, err := w.tokens.exchange(ctx, code, att.ID)
 	if err != nil {
 		w.log.WarnContext(ctx, "monzo code exchange failed", semconv.LogErrorCategory, category(err))
-		return errors.Join(err, w.consents.AttemptRefused(context.WithoutCancel(ctx), q, att.ID))
-	}
-	var cons store.Consent
-	err = pgx.BeginFunc(ctx, q, func(tx pgx.Tx) error {
-		if err := store.PutOAuthToken(ctx, tx, store.OAuthToken{
-			Source: Source, AccessToken: pair.access, RefreshToken: pair.refresh,
-			IssuedAt: pair.issuedAt, ExpiresAt: pair.expiresAt, UpdatedAt: w.now(),
-		}); err != nil {
-			return err
-		}
-		var err error
-		cons, err = w.consents.Exchanged(ctx, tx, att.ID, pair.issuedAt)
-		return err
-	})
-	if err != nil {
 		return err
 	}
 	w.recordConsent(ctx, cons)
@@ -222,6 +209,9 @@ func (w *Worker) Resume(ctx context.Context) error {
 		return err
 	}
 	w.recordConsent(ctx, cur.Consent)
+	if lost, err := w.loseIfTokenMissing(ctx, cur.Consent); err != nil || lost {
+		return err
+	}
 	switch {
 	case cur.State == store.ConsentAwaitingApproval:
 		w.goApproval(cur.ID)
@@ -352,4 +342,26 @@ func (w *Worker) recordConsent(ctx context.Context, c store.Consent) {
 	if c.ExpectedExpiryAt != nil {
 		w.metrics.ConsentExpiry(ctx, Source, *c.ExpectedExpiryAt)
 	}
+}
+
+// loseIfTokenMissing ends consent c as lost (token_missing) when it is awaiting approval or
+// active and no token is stored, which only a database restore produces: a code exchange stores
+// the pair and creates the consent in one transaction, under the token mutex. It reports whether
+// it ended the consent, with ErrConsentLost.
+func (w *Worker) loseIfTokenMissing(ctx context.Context, c store.Consent) (bool, error) {
+	if c.State != store.ConsentAwaitingApproval && c.State != store.ConsentActive {
+		return false, nil
+	}
+	_, err := store.GetOAuthToken(ctx, w.st.DB(), Source)
+	if err == nil || !errors.Is(err, store.ErrNotFound) {
+		return false, err
+	}
+	lost, err := w.consents.Lost(ctx, w.st.DB(), c.ID, consent.ReasonTokenMissing)
+	if err != nil {
+		return false, err
+	}
+	w.recordConsent(ctx, lost)
+	w.log.WarnContext(ctx, "monzo consent lost", semconv.LogState, lost.State,
+		semconv.LogErrorCategory, string(consent.ReasonTokenMissing))
+	return true, ErrConsentLost
 }

@@ -31,11 +31,17 @@ const (
 	outcomeFailed  = "failed"
 
 	categoryWindowClosed = "window_closed"
+	// categoryTimestampGroup marks a listing that stepped past a full page of rows sharing one
+	// timestamp: the bank skipped the rest of that group, so the listing is incomplete.
+	categoryTimestampGroup = "timestamp_group_over_page"
 )
 
 // rangeJob is one range to fetch in a full-history run.
 type rangeJob struct {
 	win store.BackfillWindow
+	// before is the end the attempt asks up to: the slot's end, or the run's now for the last
+	// slot, whose end lies in the future.
+	before time.Time
 	// refetch is set for a range that was already complete: it is fetched again from its start.
 	refetch bool
 }
@@ -67,37 +73,38 @@ func (t *runTally) fail(category string) {
 	t.mu.Unlock()
 }
 
-// planRanges records every account's ranges, from one day before it was created to now, in
-// pieces of at most RangeLength, and returns the order to fetch them in: unfinished ranges
-// (including any left by an earlier run) oldest first, then ranges already complete newest
-// first, to be fetched again.
+// planRanges records every account's ranges on a fixed grid, so every run finds the same rows
+// again: slot k of an account is [start + k*RangeLength, start + (k+1)*RangeLength), where start
+// is one day before the account was created, for every slot that starts before now. The last
+// slot ends in the future and is fetched up to now. It returns the order to fetch them in:
+// unfinished ranges (including any left by an earlier run) oldest first, then ranges already
+// complete newest first, to be fetched again.
 func (w *Worker) planRanges(ctx context.Context, accts []account, now time.Time) ([]rangeJob, error) {
 	q := w.st.DB()
 	var all []store.BackfillWindow
 	for _, a := range accts {
-		start := a.Created.Add(-rangeLead).UTC()
-		for s := start; s.Before(now); {
-			e := s.Add(RangeLength)
-			if e.After(now) {
-				e = now
-			}
-			if _, err := store.UpsertBackfillWindow(ctx, q, a.ID, s, e); err != nil {
+		start := a.Created.Add(-rangeLead).UTC().Truncate(time.Microsecond)
+		for s := start; s.Before(now); s = s.Add(RangeLength) {
+			if _, err := store.UpsertBackfillWindow(ctx, q, a.ID, s, s.Add(RangeLength)); err != nil {
 				return nil, err
 			}
-			s = e
 		}
 		ws, err := store.ListBackfillWindows(ctx, q, a.ID)
 		if err != nil {
 			return nil, err
 		}
-		all = append(all, ws...)
+		for _, win := range ws {
+			if win.PeriodStart.Before(now) {
+				all = append(all, win)
+			}
+		}
 	}
 	var unfinished, done []rangeJob
 	for _, win := range all {
 		if win.CompletedAt == nil {
-			unfinished = append(unfinished, rangeJob{win: win})
+			unfinished = append(unfinished, rangeJob{win: win, before: earliest(win.PeriodEnd, now)})
 		} else {
-			done = append(done, rangeJob{win: win, refetch: true})
+			done = append(done, rangeJob{win: win, refetch: true, before: earliest(win.PeriodEnd, now)})
 		}
 	}
 	slices.SortStableFunc(unfinished, func(a, b rangeJob) int {
@@ -122,22 +129,31 @@ func (w *Worker) fetchRange(ctx context.Context, runID int64, job rangeJob, dead
 	}
 	q := w.st.DB()
 	win := job.win
-	acct, start, end := win.AccountKey, win.PeriodStart, win.PeriodEnd
+	acct, before := win.AccountKey, job.before
+	listFrom, cursor, cursorTime := win.PeriodStart, formatTime(win.PeriodStart), win.PeriodStart
+	fromID := false
+	if !job.refetch && win.Cursor != nil && *win.Cursor != "" {
+		cursor = *win.Cursor
+		if t, ok := parseTime(cursor); ok {
+			listFrom, cursorTime = t, t
+		} else {
+			// An id cursor was left by an id step, which skipped rows of its timestamp group.
+			fromID, cursorTime = true, time.Time{}
+		}
+	}
+	// Invariant: a fetch that gets a raw.fetch_complete covers exactly what it listed.
+	// PeriodStart is the first instant asked for (the range start, or the time cursor it resumes
+	// from, inclusive) and PeriodEnd the before it used. The ledger treats a completed fetch as
+	// the full listing of its period and marks anything else in it disappeared. A fetch that
+	// starts from an id cursor or steps by id is never completed.
 	fetchID, err := store.InsertFetch(ctx, q, store.Fetch{
-		Source: Source, Kind: kindBackfill, AccountKey: &acct, PeriodStart: &start, PeriodEnd: &end,
+		Source: Source, Kind: kindBackfill, AccountKey: &acct, PeriodStart: &listFrom, PeriodEnd: &before,
 		RunID: runID, StartedAt: w.now(),
 	})
 	if err != nil {
 		return err
 	}
-	cursor, cursorTime := formatTime(start), start
-	if !job.refetch && win.Cursor != nil && *win.Cursor != "" {
-		cursor, cursorTime = *win.Cursor, time.Time{}
-		if t, ok := parseTime(cursor); ok {
-			cursorTime = t
-		}
-	}
-	res, err := w.pageTransactions(ctx, fetchID, acct, cursor, cursorTime, end, deadline,
+	res, err := w.pageTransactions(ctx, fetchID, acct, cursor, cursorTime, before, deadline,
 		func(ctx context.Context, next string) error { return store.SetBackfillCursor(ctx, q, win.ID, next) })
 	tally.add(res.pages, res.rows)
 	switch {
@@ -153,6 +169,11 @@ func (w *Worker) fetchRange(ctx context.Context, runID int64, job rangeJob, dead
 		w.log.WarnContext(ctx, "monzo range ended unfinished", semconv.LogFetchID, fetchID,
 			semconv.LogErrorCategory, category(err), semconv.LogPages, res.pages)
 		return nil
+	case res.complete && (res.idStep || fromID):
+		// Every page arrived, but rows of a timestamp group larger than a page were skipped: the
+		// range stays unfinished, which is the truth.
+		tally.fail(categoryTimestampGroup)
+		return nil
 	case res.complete:
 		if _, err := store.InsertFetchComplete(ctx, q, store.FetchComplete{
 			FetchID: fetchID, CompletedAt: res.completedAt, Pages: res.pages,
@@ -166,6 +187,13 @@ func (w *Worker) fetchRange(ctx context.Context, runID int64, job rangeJob, dead
 		}
 		return nil
 	}
+}
+
+func earliest(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
 }
 
 // runBackfill runs the full-history fetch for consent id: it holds the writer lock for the whole
@@ -226,7 +254,6 @@ func (w *Worker) backfillSteps(ctx context.Context, runID int64, deadline time.T
 	if err != nil {
 		return err
 	}
-	now := w.now().UTC()
 
 	// One fetch per account for its balance, pot and webhook reads, so the two balance readings
 	// share a run and an account for the reconciliation check.
@@ -246,6 +273,9 @@ func (w *Worker) backfillSteps(ctx context.Context, runID int64, deadline time.T
 		}
 	}
 
+	// The ranges' end is taken after the opening balances, so a transaction the opening balance
+	// already includes is inside the fetched period.
+	now := w.now().UTC().Truncate(time.Microsecond)
 	jobs, err := w.planRanges(ctx, accts, now)
 	if err != nil {
 		return err

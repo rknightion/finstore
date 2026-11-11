@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/rknightion/finstore/internal/bankhttp"
 	"github.com/rknightion/finstore/internal/consent"
 	"github.com/rknightion/finstore/internal/store"
@@ -112,9 +114,30 @@ func redirectURI(publicURL string) string {
 	return strings.TrimRight(publicURL, "/") + "/callback/monzo"
 }
 
+// tokenCallTimeout bounds a token call and the store of its result. They run detached from the
+// caller's context: once the bank has issued a pair the old one is dead, so a cancellation between
+// the two would lose the only working pair.
+const tokenCallTimeout = 60 * time.Second
+
+func detached(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), tokenCallTimeout)
+}
+
+// isRejection reports whether a failed token call means the bank refused the grant itself (400
+// invalid_grant, 401 invalid_client). A 429 or any other failure leaves the grant unspent.
+func isRejection(err error) bool {
+	var be *bankhttp.Error
+	return errors.As(err, &be) && (be.Status == http.StatusBadRequest || be.Status == http.StatusUnauthorized)
+}
+
+// errTokenReplaced is returned when a refreshed pair arrives after the stored pair has been
+// replaced by another writer; the refreshed pair is dropped.
+var errTokenReplaced = errors.New("monzo: stored token was replaced during a refresh")
+
 // tokens hands out a usable access token, refreshing it when under RefreshMargin of its life
-// remains. Only one goroutine refreshes at a time, and a refreshed pair is committed on the pool
-// before its access token is returned.
+// remains. One mutex serialises every token call with the store of its result, refreshes and
+// code exchanges alike, so a reconnect never interleaves with a refresh. A refreshed pair is
+// committed on the pool before its access token is returned.
 type tokens struct {
 	mu       sync.Mutex
 	st       *store.Store
@@ -128,7 +151,8 @@ type tokens struct {
 func (t *tokens) access(ctx context.Context) (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	tok, err := store.GetOAuthToken(ctx, t.st.DB(), Source)
+	q := t.st.DB()
+	tok, err := store.GetOAuthToken(ctx, q, Source)
 	if errors.Is(err, store.ErrNotFound) {
 		return "", ErrNoToken
 	}
@@ -138,18 +162,37 @@ func (t *tokens) access(ctx context.Context) (string, error) {
 	if tok.ExpiresAt.Sub(t.now()) >= RefreshMargin {
 		return tok.AccessToken, nil
 	}
-	pair, err := t.oauth.refresh(ctx, tok.RefreshToken)
-	if err != nil {
-		var be *bankhttp.Error
-		if errors.As(err, &be) && be.Status >= 400 && be.Status < 500 {
-			return "", t.rejected(ctx, err)
-		}
-		// A network failure or a server error: the refresh token may or may not have been spent.
-		// It is not retried here; the next caller tries again and a rejection then ends the consent.
+	// The consent this pair belongs to: the pair and the consent are written together, under
+	// this mutex, by exchange.
+	var consentID int64
+	if cur, err := t.consents.Current(ctx, q); err == nil {
+		consentID = cur.ID
+	} else if !errors.Is(err, consent.ErrNoConsent) {
 		return "", err
 	}
+
+	tctx, cancel := detached(ctx)
+	defer cancel()
+	pair, err := t.oauth.refresh(tctx, tok.RefreshToken)
+	if err != nil {
+		if isRejection(err) {
+			return "", t.rejected(tctx, consentID, err)
+		}
+		// A network failure, a server error or a rate limit: the refresh token may or may not
+		// have been spent. It is not retried here; the next caller tries again and a rejection
+		// then ends the consent.
+		return "", err
+	}
+	// Store only over the pair that was used: another writer may have replaced it.
+	again, err := store.GetOAuthToken(tctx, q, Source)
+	if err != nil {
+		return "", err
+	}
+	if again.RefreshToken != tok.RefreshToken {
+		return "", errTokenReplaced
+	}
 	// Durable before use: Monzo has already invalidated the old pair.
-	if err := store.PutOAuthToken(ctx, t.st.DB(), store.OAuthToken{
+	if err := store.PutOAuthToken(tctx, q, store.OAuthToken{
 		Source: Source, AccessToken: pair.access, RefreshToken: pair.refresh,
 		IssuedAt: pair.issuedAt, ExpiresAt: pair.expiresAt, UpdatedAt: t.now(),
 	}); err != nil {
@@ -158,16 +201,21 @@ func (t *tokens) access(ctx context.Context) (string, error) {
 	return pair.access, nil
 }
 
-// rejected ends the current consent after a refresh the bank refused.
-func (t *tokens) rejected(ctx context.Context, cause error) error {
+// rejected ends consent id after a refresh of its pair was refused, when it is still the current
+// consent and in a state that can be lost.
+func (t *tokens) rejected(ctx context.Context, id int64, cause error) error {
+	if id == 0 {
+		return errors.Join(ErrConsentLost, cause)
+	}
 	cur, err := t.consents.Current(ctx, t.st.DB())
-	if err != nil {
-		if errors.Is(err, consent.ErrNoConsent) {
-			return errors.Join(ErrConsentLost, cause)
-		}
+	if err != nil && !errors.Is(err, consent.ErrNoConsent) {
 		return err
 	}
-	c, err := t.consents.Lost(ctx, t.st.DB(), cur.ID, consent.ReasonRefreshRejected)
+	if err != nil || cur.ID != id {
+		// A newer consent has its own pair; this rejection says nothing about it.
+		return cause
+	}
+	c, err := t.consents.Lost(ctx, t.st.DB(), id, consent.ReasonRefreshRejected)
 	if err != nil && !errors.Is(err, consent.ErrIllegalTransition) {
 		return err
 	}
@@ -175,4 +223,32 @@ func (t *tokens) rejected(ctx context.Context, cause error) error {
 		t.onLost(ctx, c)
 	}
 	return errors.Join(ErrConsentLost, cause)
+}
+
+// exchange trades code for a pair and, in one transaction, stores the pair and records the new
+// consent for attempt attemptID, all under the token mutex and detached from ctx's cancellation.
+// A failed exchange gives the attempt the outcome refused.
+func (t *tokens) exchange(ctx context.Context, code string, attemptID int64) (store.Consent, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	tctx, cancel := detached(ctx)
+	defer cancel()
+	q := t.st.DB()
+	pair, err := t.oauth.exchange(tctx, code)
+	if err != nil {
+		return store.Consent{}, errors.Join(err, t.consents.AttemptRefused(tctx, q, attemptID))
+	}
+	var cons store.Consent
+	err = pgx.BeginFunc(tctx, q, func(tx pgx.Tx) error {
+		if err := store.PutOAuthToken(tctx, tx, store.OAuthToken{
+			Source: Source, AccessToken: pair.access, RefreshToken: pair.refresh,
+			IssuedAt: pair.issuedAt, ExpiresAt: pair.expiresAt, UpdatedAt: t.now(),
+		}); err != nil {
+			return err
+		}
+		var err error
+		cons, err = t.consents.Exchanged(tctx, tx, attemptID, pair.issuedAt)
+		return err
+	})
+	return cons, err
 }

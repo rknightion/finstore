@@ -2,6 +2,8 @@ package monzo
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -22,17 +24,19 @@ import (
 	"github.com/rknightion/finstore/internal/testpg"
 )
 
-// stubProjector records CatchUp calls; the real ledger is tested in its own package.
+// stubProjector records CatchUp calls and runs the real ledger, so every scenario also checks
+// what the projection makes of the raw rows written.
 type stubProjector struct {
 	mu      sync.Mutex
 	schemas []string
+	real    *ledger.Ledger
 }
 
-func (p *stubProjector) CatchUp(_ context.Context, _ store.DBTX, schema string) (ledger.Stats, error) {
+func (p *stubProjector) CatchUp(ctx context.Context, q store.DBTX, schema string) (ledger.Stats, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.schemas = append(p.schemas, schema)
-	return ledger.Stats{}, nil
+	p.mu.Unlock()
+	return p.real.CatchUp(ctx, q, schema)
 }
 
 func (p *stubProjector) calls() []string {
@@ -59,6 +63,8 @@ type harness struct {
 	onSleep func(ctx context.Context, n int, d time.Duration) error
 	// onRequest, when set, runs before the fake handles each request.
 	onRequest func(r *http.Request)
+	// around, when set, handles each request in place of the fake; serve is the fake.
+	around func(w http.ResponseWriter, r *http.Request, serve http.Handler)
 }
 
 func newHarness(t *testing.T, fakeOpts []monzotest.Option, mod func(*Options)) *harness {
@@ -77,13 +83,22 @@ func newHarness(t *testing.T, fakeOpts []monzotest.Option, mod func(*Options)) *
 	}
 	t.Cleanup(st.Close)
 
-	h := &harness{t: t, fake: monzotest.New(fakeOpts...), st: st, proj: &stubProjector{}}
+	loc, err := time.LoadLocation("Europe/London")
+	if err != nil {
+		t.Fatal(err)
+	}
+	real := ledger.New(map[string]ledger.SourceNormaliser{Source: Normaliser{}}, nil, loc, nil)
+	h := &harness{t: t, fake: monzotest.New(fakeOpts...), st: st, proj: &stubProjector{real: real}}
 	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
-		hook := h.onRequest
+		hook, around := h.onRequest, h.around
 		h.mu.Unlock()
 		if hook != nil {
 			hook(r)
+		}
+		if around != nil {
+			around(w, r, h.fake)
+			return
 		}
 		h.fake.ServeHTTP(w, r)
 	}))
@@ -99,6 +114,7 @@ func newHarness(t *testing.T, fakeOpts []monzotest.Option, mod func(*Options)) *
 		if v := h.fake.Violations(); len(v) != 0 {
 			t.Errorf("the fake saw %d requests that were not a GET or a token POST: %+v", len(v), v)
 		}
+		h.checkCompletedFetchPeriods()
 	})
 	return h
 }
@@ -294,4 +310,107 @@ func (h *harness) lastRun(kind string) store.Run {
 		h.t.Fatalf("no fetch of kind %s", kind)
 	}
 	return mustRun(h.t, h.st, id)
+}
+
+// coreTxn returns the core row of a fake transaction, and false when the ledger has none.
+func (h *harness) coreTxn(account, id string) (store.Transaction, bool) {
+	h.t.Helper()
+	c, err := store.NewCore(h.st.DB(), "core")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	tx, err := c.GetTransaction(context.Background(), ledger.TransactionID(ledger.AccountID(Source, account), Source, id))
+	if errors.Is(err, store.ErrNotFound) {
+		return store.Transaction{}, false
+	}
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return tx, true
+}
+
+// requireAllLive fails unless every given transaction is in core and none has disappeared.
+func (h *harness) requireAllLive(account string, txs []monzotest.Transaction) {
+	h.t.Helper()
+	for _, x := range txs {
+		tx, ok := h.coreTxn(account, x.ID)
+		if !ok {
+			h.t.Fatalf("transaction %s is not in core", x.ID)
+		}
+		if tx.DisappearedAt != nil {
+			h.t.Fatalf("transaction %s was marked disappeared although the bank still holds it", x.ID)
+		}
+	}
+}
+
+// reconciliation returns an account's reconciliation row.
+func (h *harness) reconciliation(account string) store.Reconciliation {
+	h.t.Helper()
+	c, err := store.NewCore(h.st.DB(), "core")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	r, err := c.GetReconciliation(context.Background(), ledger.AccountID(Source, account))
+	if err != nil {
+		h.t.Fatalf("reconciliation of %s: %v", account, err)
+	}
+	return r
+}
+
+// requireReconciled fails unless the account's last check passed with no difference.
+func (h *harness) requireReconciled(account string) {
+	h.t.Helper()
+	r := h.reconciliation(account)
+	if r.LastCheckOK == nil || !*r.LastCheckOK || r.LastDiffMinor == nil || *r.LastDiffMinor != 0 {
+		h.t.Fatalf("%s not reconciled: ok %v diff %v", account, r.LastCheckOK, r.LastDiffMinor)
+	}
+}
+
+// checkCompletedFetchPeriods enforces, after every scenario, the invariant the ledger relies on:
+// a fetch with a raw.fetch_complete covers exactly what it listed. Its PeriodStart is the since of
+// its first page and its PeriodEnd the before of every page, and no page went by id.
+func (h *harness) checkCompletedFetchPeriods() {
+	h.t.Helper()
+	ctx := context.Background()
+	for _, r := range h.rawRows() {
+		if r.Kind != store.RawFetchComplete {
+			continue
+		}
+		f, err := store.GetFetch(ctx, h.st.DB(), r.FetchComplete.FetchID)
+		if err != nil {
+			h.t.Errorf("completed fetch: %v", err)
+			return
+		}
+		if f.PeriodStart == nil || f.PeriodEnd == nil {
+			h.t.Errorf("completed fetch %d has no period", f.ID)
+			continue
+		}
+		resps, err := store.APIResponsesForFetch(ctx, h.st.DB(), f.ID)
+		if err != nil {
+			h.t.Errorf("responses: %v", err)
+			return
+		}
+		first := true
+		for _, a := range resps {
+			if a.Endpoint != pathTransactions || a.Seq > r.Seq {
+				continue
+			}
+			var p map[string]any
+			if err := json.Unmarshal(a.Params, &p); err != nil {
+				h.t.Errorf("params: %v", err)
+				return
+			}
+			since, _ := p["since"].(string)
+			if _, isTime := parseTime(since); !isTime {
+				h.t.Errorf("completed fetch %d stepped by id", f.ID)
+			}
+			if first && since != formatTime(*f.PeriodStart) {
+				h.t.Errorf("completed fetch %d starts %v but first listed since %s", f.ID, *f.PeriodStart, since)
+			}
+			if p["before"] != formatTime(*f.PeriodEnd) {
+				h.t.Errorf("completed fetch %d ends %v but listed before %v", f.ID, *f.PeriodEnd, p["before"])
+			}
+			first = false
+		}
+	}
 }

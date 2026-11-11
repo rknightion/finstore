@@ -41,6 +41,9 @@ const (
 	ReasonInsufficientPermissions Reason = "insufficient_permissions"
 	ReasonRefreshRejected         Reason = "refresh_rejected"
 	ReasonApprovalTimeout         Reason = "approval_timeout"
+	// ReasonTokenMissing ends a consent that has no stored token, as after a database restore:
+	// the dump holds the consent but never the token.
+	ReasonTokenMissing Reason = "token_missing"
 )
 
 // End reasons stored for the two other ending states.
@@ -182,7 +185,8 @@ func (m *Manager) Approved(ctx context.Context, q store.DBTX, id int64) (store.C
 }
 
 // Lost ends consent id as lost for reason. An approval timeout ends only a consent awaiting
-// approval; missing permissions end only an active one; a rejected refresh ends either.
+// approval; missing permissions end only an active one; a rejected refresh or a missing token
+// ends either.
 func (m *Manager) Lost(ctx context.Context, q store.DBTX, id int64, reason Reason) (store.Consent, error) {
 	var from []string
 	switch reason {
@@ -190,7 +194,7 @@ func (m *Manager) Lost(ctx context.Context, q store.DBTX, id int64, reason Reaso
 		from = []string{store.ConsentAwaitingApproval}
 	case ReasonInsufficientPermissions:
 		from = []string{store.ConsentActive}
-	case ReasonRefreshRejected:
+	case ReasonRefreshRejected, ReasonTokenMissing:
 		from = []string{store.ConsentAwaitingApproval, store.ConsentActive}
 	default:
 		return store.Consent{}, fmt.Errorf("consent: unknown loss reason %q", reason)

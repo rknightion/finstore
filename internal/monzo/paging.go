@@ -16,6 +16,10 @@ type pageResult struct {
 	// late is true when a page arrived at or after the deadline and was discarded, or when the
 	// deadline had passed before the next page was asked for.
 	late bool
+	// idStep is true when paging stepped past a full page of one timestamp by id. The bank skips
+	// the rest of that timestamp's rows on such a step, so the listing is known to be incomplete
+	// and must not be completed.
+	idStep bool
 }
 
 // pageTransactions pages through accountID's transactions from cursor to before, recording every
@@ -69,6 +73,7 @@ func (w *Worker) pageTransactions(ctx context.Context, fetchID int64, accountID,
 			// Every row of a full page shares the cursor's timestamp: asking from it again would
 			// return the same page.
 			next = last.ID
+			res.idStep = true
 		}
 		if _, ok := used[next]; ok {
 			// The cursor would go back to where it has been: the bank is not paging as expected.

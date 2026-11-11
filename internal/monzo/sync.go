@@ -27,9 +27,8 @@ const (
 var errBackfillStarted = errors.New("monzo: a full-history fetch started")
 
 // RunScheduled runs one scheduled sync of kind KindHourly or KindNightly: for each open account
-// it reads the balance, fetches the period's transactions, reads the balance again and reads the
-// pots, all under one raw.fetch, with a raw.fetch_complete written straight after the last page
-// and only when every page arrived. It then
+// it reads the balance, fetches the period ending just after that reading, reads the balance
+// again and reads the pots (see syncAccount for the fetches written). It then
 // catches the projection up. It does nothing and returns nil when there is no active consent or a
 // full-history fetch is running. Lost permissions end the consent and return ErrConsentLost.
 func (w *Worker) RunScheduled(ctx context.Context, kind string) error {
@@ -60,6 +59,9 @@ func (w *Worker) RunScheduled(ctx context.Context, kind string) error {
 	w.recordConsent(ctx, c)
 	if expired || c.State != store.ConsentActive {
 		return nil
+	}
+	if lost, err := w.loseIfTokenMissing(ctx, c); err != nil || lost {
+		return err
 	}
 	return w.st.HoldWriterLock(ctx, func(ctx context.Context, conn *pgx.Conn) error {
 		// A full-history fetch may have started while this run waited for the lock.
@@ -120,8 +122,6 @@ func (w *Worker) scheduledSteps(ctx context.Context, runID int64, kind string, p
 	if err != nil {
 		return err
 	}
-	end := w.now().UTC()
-	start := end.Add(-period)
 	for _, a := range accts {
 		if a.Closed {
 			continue
@@ -129,24 +129,39 @@ func (w *Worker) scheduledSteps(ctx context.Context, runID int64, kind string, p
 		if w.backfilling.Load() > 0 {
 			return errBackfillStarted
 		}
-		if err := w.syncAccount(ctx, runID, kind, a.ID, start, end, tally); err != nil {
+		if err := w.syncAccount(ctx, runID, kind, a.ID, period, tally); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// syncAccount fetches one account's period under one raw.fetch.
-func (w *Worker) syncAccount(ctx context.Context, runID int64, kind, id string, start, end time.Time, tally *runTally) error {
+// syncAccount reads one account's opening balance, then fetches its period, ending at the moment
+// after that reading so that every transaction the opening balance includes is inside it.
+//
+// The opening balance is recorded under a fetch with the account and no period; the period's
+// pages, completion, closing balance and pots under a second fetch with the period. The ledger
+// pairs the two balance readings by run and account, not by fetch.
+//
+// Invariant: the period fetch covers exactly what it lists. PeriodStart is the since of its
+// first page and PeriodEnd the before of every page; it pages once from the start, never
+// resuming, and bankhttp's retries repeat the same request. It gets a raw.fetch_complete only
+// when every page arrived and no step went by id.
+func (w *Worker) syncAccount(ctx context.Context, runID int64, kind, id string, period time.Duration, tally *runTally) error {
 	q := w.st.DB()
+	openID, err := store.InsertFetch(ctx, q, store.Fetch{Source: Source, Kind: kind, AccountKey: &id, RunID: runID, StartedAt: w.now()})
+	if err != nil {
+		return err
+	}
+	if err := w.readStep(withFetch(ctx, openID), tally, func(ctx context.Context) error { return w.api.balance(ctx, id) }); err != nil {
+		return err
+	}
+	end := w.now().UTC().Truncate(time.Microsecond)
+	start := end.Add(-period)
 	fetchID, err := store.InsertFetch(ctx, q, store.Fetch{
 		Source: Source, Kind: kind, AccountKey: &id, PeriodStart: &start, PeriodEnd: &end, RunID: runID, StartedAt: w.now(),
 	})
 	if err != nil {
-		return err
-	}
-	fctx := withFetch(ctx, fetchID)
-	if err := w.readStep(fctx, tally, func(ctx context.Context) error { return w.api.balance(ctx, id) }); err != nil {
 		return err
 	}
 	res, err := w.pageTransactions(ctx, fetchID, id, formatTime(start), start, end, time.Time{}, nil)
@@ -157,16 +172,22 @@ func (w *Worker) syncAccount(ctx context.Context, runID int64, kind, id string, 
 		}
 		tally.fail(category(err))
 	}
-	// The completion goes straight after the last page, before the closing balance: the ledger
-	// applies disappearances at the completion row and checks the balance at the second reading,
-	// in seq order, so the check must see the period's disappearances already applied.
-	if res.complete {
+	switch {
+	case res.complete && res.idStep:
+		// Rows of a timestamp group larger than a page were skipped: the fetch proves nothing
+		// about absence.
+		tally.fail(categoryTimestampGroup)
+	case res.complete:
+		// The completion goes straight after the last page, before the closing balance: the
+		// ledger applies disappearances at the completion row and checks the balance at the
+		// second reading, in seq order, so the check must see the period's disappearances.
 		if _, err := store.InsertFetchComplete(ctx, q, store.FetchComplete{
 			FetchID: fetchID, CompletedAt: res.completedAt, Pages: res.pages,
 		}); err != nil {
 			return err
 		}
 	}
+	fctx := withFetch(ctx, fetchID)
 	for _, step := range []func(context.Context) error{
 		func(ctx context.Context) error { return w.api.balance(ctx, id) },
 		func(ctx context.Context) error { return w.api.pots(ctx, id) },
