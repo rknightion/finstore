@@ -583,7 +583,11 @@ metric value, a label or a log field; the log handler drops any field that is no
 | `finstore.scheduler.job.duration` (histogram) | `job` | Seconds one job run took, with buckets from 1 s to 1 hour |
 | `finstore.scheduler.job.last_ok` | `job` | 1 when the job's last run ended `ok`, 0 for `error` or `panic`. A `cancelled` run does not change it. It is held in the `serve` process, not read from the database, so after a restart it is absent until each job has run once. The `status` job runs every minute, so a failing `status` shows within a minute and every other finstore gauge is stale until it recovers |
 | `finstore.telemetry.export.failures` (counter) | `signal` | Exports that failed, by `traces`, `metrics` or `logs` |
-| `finstore.telemetry.span_attributes.dropped` (counter) | `key` | Span attributes the exporter allow-list removed, by key. A key here is a library that added an attribute; nothing leaked |
+| `finstore.telemetry.span_attributes.dropped` (counter) | `key` | Span attributes the exporter allow-list removed, by key. A key here is a library that added an attribute; nothing leaked. The Postgres driver's own attributes (`pgx.rows_affected`, a count, and `pgx.prepare_stmt.name`, a hash of constant SQL) are on the list, so a plain query drops nothing: any key here is new |
+| `finstore.store.writer_lock.held` (gauge) | `holder` | Seconds the writer lock has been held so far, by who holds it (`monzo.sync`, `monzo.backfill`, `monzo.approval`, `truelayer.sync`, `truelayer.connect`, `truelayer.approve`, `renormalise`, `load-capture`, `account`, `import`). Absent while the lock is free. Every process that can hold the lock reports it: `serve` and the commands that write |
+| `db.client.operation.duration` (histogram) | `db.operation.name`, `pgx.operation.type` | Duration of each database operation, in seconds, by the statement's first word (`SELECT`, `INSERT`) and the kind of operation (`query`, `prepare`, `connect`, `acquire`, `batch`, `copy`), with buckets from 1 ms to 10 s |
+| `db.client.operation.errors` (counter) | `db.operation.name`, `pgx.operation.type` | Database operations that failed |
+| `pgxpool.acquired_connections`, `pgxpool.idle_connections`, `pgxpool.total_connections`, `pgxpool.max_connections` and the other `pgxpool.*` gauges and counters | `db.system.name`, `db.client.connection.pool.name` | The connection pool's statistics. The pool name is the host, port and database of the connection, never the user or a password |
 | `http.server.request.duration` | OpenTelemetry HTTP server attributes, including `http.route` | Duration of every request except `GET /healthz`, in seconds, with buckets from 5 ms to 90 s |
 | `go.goroutine.count`, `go.memory.used`, `go.memory.allocated`, `go.memory.gc.goal`, `go.processor.limit`, `go.config.gogc` | none | Go runtime metrics |
 
@@ -651,6 +655,33 @@ id from a bank response, so it never appears in a span, and neither does a query
 body. finstore sends no trace header to a bank, and a bank sees the same request with telemetry on
 or off.
 
+**Postgres.** `serve` and the commands that read or write through the app role (`account add`,
+`account list`, `account accept-difference`, `account end`, `import`, `coverage`) and `migrate` open
+their database connection with tracing. A query, a prepare, a connect or a pool acquire made while a
+span is recording becomes a client span beneath it, named for the statement's first word (`SELECT`)
+and carrying `db.query.text` with placeholders only (`$1`), `db.operation.name`, `db.namespace`,
+`server.address`, `server.port` and `user.name`. The parameter values are never recorded, and the
+database URL, password included, is never a span attribute. `migrate` traces goose's statements too,
+since goose connects with the same settings. Queries outside any span make no span. A failed
+statement's span carries its SQLSTATE (`pgx.sql_state`) and the status `error`: the error's own text
+can quote a value, and the exporter removes it. `bootstrap` never traces: it executes `CREATE ROLE`
+with a password. `renormalise` and `load-capture` open their database connection without tracing,
+because they run hundreds of thousands of statements; they export their root span and the batch
+steps below, and `finstore.store.writer_lock.held` still shows who holds the lock.
+
+**Writer lock.** Where the connection is traced, each hold of the writer lock is a
+`store.writer_lock` span from the request to the release, with `finstore.lock.holder` (who asked)
+and `finstore.lock.wait_ms` (how long the request waited for the lock). A request that gives up
+before it gets the lock, or a hold whose release fails, ends its span with the status
+`database_error` (a request that gave up also has no wait). The work done
+under the lock is not a child of this span: it stays a child of the span that asked.
+
+**Batch steps.** The ledger makes one span for a catch-up (`ledger.catch_up`, with
+`finstore.count` rows applied), one for each step of `renormalise` (`ledger.renormalise.create`,
+`.catch_up`, `.diff` with the number of differences, `.swap`) and `load-capture` makes one for each
+directory (`capture.directory`) and each transactions fetch (`capture.fetch`), each with the number
+of responses. There is never a span for a row. A failed step reads `error`.
+
 One allow-list at the exporter is the only redaction layer for spans. A span attribute whose key is
 not on it is dropped and counted (`finstore.telemetry.span_attributes.dropped`); `url.full` is kept
 only without a query, fragment or credentials; no span event leaves the process, so an exception
@@ -667,7 +698,9 @@ fields, and the JSON lines on stderr (what `docker logs` shows) as `trace_id` an
 Alerts worth having: no successful sync for 3 hours (13 hours for a `truelayer:` source, which syncs
 twice a day); consent ending within 14 days; consent `lost`
 or `expired`; a reconciliation mismatch lasting 90 minutes; newest import older than 35 days; dump
-older than 14 hours; `finstore.up` absent for an hour.
+older than 14 hours; `finstore.up` absent for an hour; `finstore.store.writer_lock.held` above an
+hour for any holder (every scheduled sync waits behind it; a `serve` holder past its run deadline
+means the release stuck, and a command holder is just a long command).
 
 ## When something goes wrong
 

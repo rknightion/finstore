@@ -26,7 +26,7 @@ func TestReplacePendingSnapshot(t *testing.T) {
 	ctx := context.Background()
 	app := openStore(t, c.app)
 	t1 := time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
-	err := app.WithWriterLock(ctx, func(ctx context.Context, tx pgx.Tx) error {
+	err := app.WithWriterLock(ctx, store.HolderTest, func(ctx context.Context, tx pgx.Tx) error {
 		core := mustCore(t, tx, store.SchemaCore)
 		a, b := testAccount("lloyds-joint", "joint", "api"), testAccount("lloyds-current", "current", "api")
 		for _, acc := range []store.Account{a, b} {
@@ -106,7 +106,7 @@ func TestUnendedCardKeys(t *testing.T) {
 	c := newCluster(t)
 	ctx := context.Background()
 	app := openStore(t, c.app)
-	err := app.WithWriterLock(ctx, func(ctx context.Context, tx pgx.Tx) error {
+	err := app.WithWriterLock(ctx, store.HolderTest, func(ctx context.Context, tx pgx.Tx) error {
 		core := mustCore(t, tx, store.SchemaCore)
 		mk := func(slug, key, source, typ string, ended bool) error {
 			a := testAccount(slug, typ, "api")

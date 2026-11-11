@@ -82,7 +82,7 @@ func TestReplayFromEmptyGivesTheIncrementalCore(t *testing.T) {
 	ctx := context.Background()
 	scenario(e)
 
-	err := e.owner.HoldWriterLock(ctx, func(ctx context.Context, conn *pgx.Conn) error {
+	err := e.owner.HoldWriterLock(ctx, store.HolderTest, func(ctx context.Context, conn *pgx.Conn) error {
 		if err := store.CreateCoreNext(ctx, conn, ledger.NormaliserRev); err != nil {
 			return err
 		}

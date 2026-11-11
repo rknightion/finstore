@@ -260,7 +260,7 @@ func (w *Worker) connect(ctx context.Context, consentID int64, pair tokenPair, r
 		w.afterApprove(ctx)
 	}
 	started := false
-	err = w.st.HoldWriterLock(ctx, func(ctx context.Context, conn *pgx.Conn) error {
+	err = w.st.HoldWriterLock(ctx, store.HolderTrueLayerConnect, func(ctx context.Context, conn *pgx.Conn) error {
 		c, err := store.GetConsent(ctx, w.st.DB(), consentID)
 		if err != nil {
 			return err
@@ -322,7 +322,7 @@ func (w *Worker) abandonConnect(ctx context.Context, runID, consentID int64, cau
 func (w *Worker) approve(ctx context.Context, id int64, token string) (store.Consent, meInfo, error) {
 	expiry := w.now().Add(consent.Lifetime)
 	var read meInfo
-	err := w.st.HoldWriterLock(ctx, func(ctx context.Context, _ *pgx.Conn) error {
+	err := w.st.HoldWriterLock(ctx, store.HolderTrueLayerApprove, func(ctx context.Context, _ *pgx.Conn) error {
 		fid, err := store.InsertFetch(ctx, w.st.DB(), store.Fetch{Source: w.source, Kind: kindMeta, StartedAt: w.now()})
 		if err != nil {
 			return err

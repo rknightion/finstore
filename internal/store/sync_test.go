@@ -213,7 +213,7 @@ func TestWriterLockExcludesOtherWriters(t *testing.T) {
 	release := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		done <- a.WithWriterLock(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		done <- a.WithWriterLock(ctx, store.HolderTest, func(ctx context.Context, tx pgx.Tx) error {
 			close(held)
 			<-release
 			return nil
@@ -233,7 +233,7 @@ func TestWriterLockExcludesOtherWriters(t *testing.T) {
 	second := make(chan error, 1)
 	entered := make(chan struct{})
 	go func() {
-		second <- b.WithWriterLock(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		second <- b.WithWriterLock(ctx, store.HolderTest, func(ctx context.Context, tx pgx.Tx) error {
 			close(entered)
 			return nil
 		})

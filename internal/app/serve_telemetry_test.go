@@ -124,6 +124,10 @@ func TestServeExportsConnectCallbackAndSchedulerTelemetry(t *testing.T) {
 	spans := sink.Spans()
 	byName := map[string][]telemetrytest.Span{}
 	for _, s := range spans {
+		// The database driver's own CLIENT spans (its "connect" among them) are not finstore's.
+		if s.Attrs[semconv.SpanDBSystemName] != "" {
+			continue
+		}
 		byName[s.Name] = append(byName[s.Name], s)
 	}
 	connects := byName[semconv.SpanConnect]

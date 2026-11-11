@@ -14,7 +14,7 @@ func TestIsSpanAttributeAllowsTheDeclaredKeys(t *testing.T) {
 	for _, k := range []string{
 		SpanHTTPRoute, SpanURLTemplate, SpanDBQueryText, SpanProcessExitCode, SpanSource,
 		SpanConnectOutcome, SpanJobOutcome, SpanRunPages, SpanLockWaitMS, SpanCount, SpanCommand,
-		"finstore.command",
+		"finstore.command", SpanPgxRowsAffected, SpanPgxPrepareStmtName,
 	} {
 		if !IsSpanAttribute(k) {
 			t.Errorf("%q is not allowed", k)

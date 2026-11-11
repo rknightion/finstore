@@ -132,7 +132,7 @@ func (h *harness) holdWriterLock() func() {
 	held, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = h.st.HoldWriterLock(context.Background(), func(context.Context, *pgx.Conn) error {
+		_ = h.st.HoldWriterLock(context.Background(), store.HolderTest, func(context.Context, *pgx.Conn) error {
 			close(held)
 			<-release
 			return nil
@@ -190,7 +190,7 @@ func newHarness(t *testing.T, fakeOpts ...truelayertest.Option) *harness {
 	h.ledger = ledger.New(map[string]ledger.SourceNormaliser{
 		Source(ConnLloyds): Normaliser{Connection: ConnLloyds},
 		Source(ConnMonzo):  Normaliser{Connection: ConnMonzo},
-	}, nil, loc, slog.New(h.logs))
+	}, nil, loc, slog.New(h.logs), nil)
 	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if d := h.tokenDelay.Load(); d > 0 && r.URL.Path == truelayertest.TokenPath {
 			time.Sleep(time.Duration(d))

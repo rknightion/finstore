@@ -27,9 +27,14 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/rknightion/finstore/internal/ledger"
+	"github.com/rknightion/finstore/internal/semconv"
 	"github.com/rknightion/finstore/internal/store"
+	"github.com/rknightion/finstore/internal/telemetry"
 )
 
 const (
@@ -122,14 +127,22 @@ type fetchGroup struct {
 // happen in one transaction under the writer lock, so a failure leaves raw as it was. A response
 // already stored (same endpoint, fetch time and body hash) is skipped, so loading the same
 // directories twice loads once. now supplies the run's start and finish times.
-func Load(ctx context.Context, st *store.Store, proj Projector, dirs []string, now func() time.Time) (Result, error) {
+//
+// tr makes a capture.directory span for each directory read and a capture.fetch span for each
+// transactions fetch written, each with the number of responses it covers; nil makes none.
+func Load(ctx context.Context, st *store.Store, proj Projector, dirs []string, now func() time.Time, tr trace.Tracer) (Result, error) {
 	if len(dirs) == 0 {
 		return Result{}, errors.New("capture: no directories given")
+	}
+	if tr == nil {
+		tr = tracenoop.NewTracerProvider().Tracer(semconv.ServiceName)
 	}
 	var all []*response
 	complete := make(map[fetchKey]bool)
 	for i, dir := range dirs {
+		_, span := tr.Start(ctx, semconv.SpanCaptureDirectory, trace.WithSpanKind(trace.SpanKindInternal))
 		rs, done, err := readDir(dir, i)
+		endBatch(span, len(rs), err)
 		if err != nil {
 			return Result{}, err
 		}
@@ -140,9 +153,9 @@ func Load(ctx context.Context, st *store.Store, proj Projector, dirs []string, n
 	}
 	res := Result{Directories: len(dirs), ResponsesRead: len(all)}
 
-	err := st.HoldWriterLock(ctx, func(ctx context.Context, conn *pgx.Conn) error {
+	err := st.HoldWriterLock(ctx, store.HolderCapture, func(ctx context.Context, conn *pgx.Conn) error {
 		err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-			return write(ctx, tx, all, complete, now, &res)
+			return write(ctx, tx, tr, all, complete, now, &res)
 		})
 		if err != nil {
 			return err
@@ -160,8 +173,18 @@ func Load(ctx context.Context, st *store.Store, proj Projector, dirs []string, n
 	return res, nil
 }
 
+// endBatch ends the span of a batch step with the number of responses it covered. A failure marks
+// the span with a fixed category, never the error: its text names a directory and a line.
+func endBatch(span trace.Span, count int, err error) {
+	span.SetAttributes(attribute.Int(semconv.SpanCount, count))
+	if err != nil {
+		telemetry.Fail(span, "error")
+	}
+	span.End()
+}
+
 // write stores every response in the order the balance check needs.
-func write(ctx context.Context, q store.DBTX, all []*response, complete map[fetchKey]bool, now func() time.Time, res *Result) error {
+func write(ctx context.Context, q store.DBTX, tr trace.Tracer, all []*response, complete map[fetchKey]bool, now func() time.Time, res *Result) error {
 	var accounts, others []*response
 	groups := make(map[fetchKey]*fetchGroup)
 	var order []*fetchGroup
@@ -248,7 +271,10 @@ func write(ctx context.Context, q store.DBTX, all []*response, complete map[fetc
 		}
 	}
 	for _, g := range order {
-		if err := writeFetch(ctx, q, runID, g, res); err != nil {
+		fctx, span := tr.Start(ctx, semconv.SpanCaptureFetch, trace.WithSpanKind(trace.SpanKindInternal))
+		err := writeFetch(fctx, q, runID, g, res)
+		endBatch(span, len(g.pages), err)
+		if err != nil {
 			return err
 		}
 	}

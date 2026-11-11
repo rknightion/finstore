@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/rknightion/finstore/internal/importer"
 	"github.com/rknightion/finstore/internal/ledger"
@@ -288,6 +289,10 @@ type env struct {
 	l     *ledger.Ledger
 	logs  *bytes.Buffer
 	clock time.Time
+	// tracer, when set, is the tracer of the ledgers built from here on.
+	tracer trace.Tracer
+	// loc, when set, is the zone of the ledgers built from here on (UTC otherwise).
+	loc *time.Location
 }
 
 func newEnv(t *testing.T) *env {
@@ -321,7 +326,14 @@ func (e *env) ledger(withOther bool) *ledger.Ledger {
 	if withOther {
 		sources[otherSource] = fakeNormaliser{}
 	}
-	return ledger.New(sources, files, time.UTC, slog.New(slog.NewJSONHandler(e.logs, nil)))
+	return ledger.New(sources, files, e.zone(), slog.New(slog.NewJSONHandler(e.logs, nil)), e.tracer)
+}
+
+func (e *env) zone() *time.Location {
+	if e.loc != nil {
+		return e.loc
+	}
+	return time.UTC
 }
 
 func openStore(t *testing.T, url string) *store.Store {
@@ -352,7 +364,7 @@ func (e *env) core() store.Core {
 func (e *env) catchUp() ledger.Stats {
 	e.t.Helper()
 	var stats ledger.Stats
-	err := e.app.WithWriterLock(context.Background(), func(ctx context.Context, tx pgx.Tx) error {
+	err := e.app.WithWriterLock(context.Background(), store.HolderTest, func(ctx context.Context, tx pgx.Tx) error {
 		var err error
 		stats, err = e.l.CatchUp(ctx, tx, store.SchemaCore)
 		return err
@@ -367,7 +379,7 @@ func (e *env) catchUp() ledger.Stats {
 func (e *env) renormalise(verify bool) []store.CoreDiff {
 	e.t.Helper()
 	var diffs []store.CoreDiff
-	err := e.owner.HoldWriterLock(context.Background(), func(ctx context.Context, conn *pgx.Conn) error {
+	err := e.owner.HoldWriterLock(context.Background(), store.HolderTest, func(ctx context.Context, conn *pgx.Conn) error {
 		var err error
 		diffs, err = e.l.Renormalise(ctx, conn, verify)
 		return err

@@ -63,7 +63,7 @@ func (w *Worker) RunScheduled(ctx context.Context, kind string) error {
 	if lost, err := w.loseIfTokenMissing(ctx, c); err != nil || lost {
 		return err
 	}
-	return w.st.HoldWriterLock(ctx, func(ctx context.Context, conn *pgx.Conn) error {
+	return w.st.HoldWriterLock(ctx, store.HolderMonzoSync, func(ctx context.Context, conn *pgx.Conn) error {
 		// A full-history fetch may have started while this run waited for the lock.
 		if w.backfilling.Load() > 0 {
 			return nil

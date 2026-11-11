@@ -194,7 +194,7 @@ func fixedNow() time.Time { return time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC
 
 func loadAll(t *testing.T, st *store.Store, p capture.Projector, dirs ...string) (capture.Result, error) {
 	t.Helper()
-	return capture.Load(context.Background(), st, p, dirs, fixedNow)
+	return capture.Load(context.Background(), st, p, dirs, fixedNow, nil)
 }
 
 func rawRows(t *testing.T, st *store.Store) []store.RawRow {

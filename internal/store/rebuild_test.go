@@ -106,7 +106,7 @@ func TestSwapCoreKeepsViewsAndGrants(t *testing.T) {
 	fillCore(t, mustCore(t, app.DB(), store.SchemaCore))
 
 	const newRev = testRev + 1
-	err := owner.WithWriterLock(ctx, func(ctx context.Context, tx pgx.Tx) error {
+	err := owner.WithWriterLock(ctx, store.HolderTest, func(ctx context.Context, tx pgx.Tx) error {
 		if err := store.CreateCoreNext(ctx, tx, newRev); err != nil {
 			return err
 		}
