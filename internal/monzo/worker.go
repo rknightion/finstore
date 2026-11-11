@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/rknightion/finstore/internal/bankhttp"
 	"github.com/rknightion/finstore/internal/consent"
@@ -57,6 +58,8 @@ type Options struct {
 	// Sleep pauses for d or until ctx ends, returning ctx.Err() then. It is used for the approval
 	// poll and the bank client's retry pauses. Nil means a real timer.
 	Sleep func(ctx context.Context, d time.Duration) error
+	// Tracer makes the spans of bank calls; nil means none.
+	Tracer trace.Tracer
 }
 
 // ErrCallbackRefused is returned by HandleCallback for a state value that is unknown, expired or
@@ -128,7 +131,8 @@ func New(opts Options, st *store.Store, proj Projector, m *telemetry.Metrics, lo
 	}
 	bank, err := bankhttp.New(opts.APIURL, bankhttp.MonzoRules(),
 		bankhttp.WithRecorder(recorder{q: st.DB(), metrics: m}),
-		bankhttp.WithClock(opts.Now), bankhttp.WithSleep(opts.Sleep))
+		bankhttp.WithClock(opts.Now), bankhttp.WithSleep(opts.Sleep),
+		bankhttp.WithTelemetry(opts.Tracer, Source, m.BankObserver(Source)))
 	if err != nil {
 		return nil, err
 	}

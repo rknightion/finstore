@@ -15,8 +15,16 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/rknightion/finstore/internal/semconv"
 )
 
 // Category classifies a failed request. Nothing else about a failure leaves
@@ -218,6 +226,27 @@ func WithSleep(sleep func(ctx context.Context, d time.Duration) error) Option {
 	return func(c *Client) { c.sleep = sleep }
 }
 
+// Observer measures bank attempts. The client calls it once for every attempt that ended and once
+// for every retry it makes, and gives it the rule's template as the endpoint, never a concrete
+// path.
+type Observer interface {
+	// Attempt reports one attempt: statusClass is "2xx", "4xx" and so on, or "no_response" when
+	// the attempt got no HTTP response; d is how long it took.
+	Attempt(ctx context.Context, endpoint, statusClass string, d time.Duration)
+	// Retry reports that the call is being repeated: reason is rate_limited, server_error,
+	// timeout or network.
+	Retry(ctx context.Context, endpoint, reason string)
+}
+
+// WithTelemetry makes the client start a span for each call and for each attempt on tr, naming
+// source on the call's span, and report every attempt and retry to obs. A nil tr or obs turns that
+// part off. The spans and the observer see the rule's template and fixed words only: never a
+// query, a concrete path, a header or a body. The client sends no trace propagation header to the
+// bank, with or without this option.
+func WithTelemetry(tr trace.Tracer, source string, obs Observer) Option {
+	return func(c *Client) { c.tracer, c.source, c.obs = tr, source, obs }
+}
+
 // Client sends allow-listed requests to one bank.
 type Client struct {
 	base           *url.URL
@@ -231,6 +260,9 @@ type Client struct {
 	now            func() time.Time
 	sleep          func(ctx context.Context, d time.Duration) error
 	http           *http.Client
+	tracer         trace.Tracer
+	source         string
+	obs            Observer
 }
 
 // New returns a Client for baseURL that allows exactly rules.
@@ -258,6 +290,9 @@ func New(baseURL string, rules []Rule, opts ...Option) (*Client, error) {
 	}
 	for _, o := range opts {
 		o(c)
+	}
+	if c.tracer == nil {
+		c.tracer = tracenoop.NewTracerProvider().Tracer("")
 	}
 	c.http = &http.Client{
 		Timeout: c.requestTimeout,
@@ -310,27 +345,56 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 	if rule.Record && c.recorder == nil {
 		return nil, ErrNoRecorder
 	}
+	// The call's span names the rule's template and the fixed words only: a concrete path holds an
+	// id from a bank response, a query holds anything.
+	ctx, span := c.tracer.Start(ctx, semconv.SpanBankCallPrefix+req.Method+" "+rule.Path,
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			attribute.String(semconv.SpanSource, c.source),
+			attribute.String(semconv.SpanURLTemplate, rule.Path),
+			attribute.String(semconv.SpanHTTPRequestMethod, req.Method)))
+	defer span.End()
+	resp, err := c.do(ctx, req, rule)
+	if err != nil {
+		var be *Error
+		if errors.As(err, &be) {
+			span.SetAttributes(attribute.String(semconv.SpanErrorType, string(be.Category)))
+			if be.BankCode != "" {
+				span.SetAttributes(attribute.String(semconv.SpanBankCode, be.BankCode))
+			}
+			span.SetStatus(codes.Error, string(be.Category))
+		} else {
+			// The response could not be recorded: not the bank's doing, and the error text is not
+			// for a span.
+			span.SetAttributes(attribute.String(semconv.SpanErrorType, "internal"))
+			span.SetStatus(codes.Error, "internal")
+		}
+	}
+	return resp, err
+}
+
+// do is Do's retry loop for a request the allow-list accepted.
+func (c *Client) do(ctx context.Context, req Request, rule Rule) (*Response, error) {
 	isToken := req.Method == tokenMethod && req.Path == c.tokenPath
 	// What leaves the package names the rule's path: a template's concrete path
 	// holds an id from a bank response.
-	named := req
-	named.Path = rule.Path
 	params := requestParams(ctx)
 
 	var n429, n5xx, nNet int
 	for {
-		resp, err := c.attempt(ctx, req)
+		resp, e, err := c.attempt(ctx, req, rule, n429+n5xx+nNet)
 		if err != nil {
 			cat := networkCategory(ctx, err)
-			e := &Error{Method: req.Method, Path: rule.Path, Category: cat}
+			ne := &Error{Method: req.Method, Path: rule.Path, Category: cat}
 			// A token request may have been processed and a refresh token is
 			// single-use, so it is never repeated after a transport failure.
 			if isToken || !c.retries || ctx.Err() != nil || nNet >= maxRetryNetwork {
-				return nil, e
+				return nil, ne
 			}
 			if c.sleep(ctx, backoff(nNet)) != nil {
-				return nil, e
+				return nil, ne
 			}
+			c.retried(ctx, rule.Path, string(cat))
 			nNet++
 			continue
 		}
@@ -351,7 +415,6 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 		if resp.Status >= 200 && resp.Status < 300 {
 			return resp, nil
 		}
-		e := classify(named, resp)
 		switch {
 		case !c.retries:
 			return resp, e
@@ -359,11 +422,13 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 			if c.sleep(ctx, backoff(n429)) != nil {
 				return resp, e
 			}
+			c.retried(ctx, rule.Path, semconv.RetryReasonRateLimited)
 			n429++
 		case resp.Status >= 500 && !isToken && n5xx < maxRetries5xx:
 			if c.sleep(ctx, backoff(n5xx)) != nil {
 				return resp, e
 			}
+			c.retried(ctx, rule.Path, semconv.RetryReasonServerError)
 			n5xx++
 		default:
 			return resp, e
@@ -382,7 +447,84 @@ func backoff(retry int) time.Duration {
 	return d
 }
 
-func (c *Client) attempt(ctx context.Context, req Request) (*Response, error) {
+// retried tells the observer that the call is being repeated.
+func (c *Client) retried(ctx context.Context, endpoint, reason string) {
+	if c.obs != nil {
+		c.obs.Retry(ctx, endpoint, reason)
+	}
+}
+
+// attempt is one request, wrapped in its span and reported to the observer. resend is how many
+// attempts of this call came before it. The span's url.full is the base URL's scheme, host and
+// path plus the rule's template: no query, no userinfo, no concrete path. A response that is not
+// 2xx comes back with its classification, worked out once here, for the caller to return or retry
+// on; it is nil for a 2xx response and when err is set.
+func (c *Client) attempt(ctx context.Context, req Request, rule Rule, resend int) (*Response, *Error, error) {
+	port := c.base.Port()
+	if port == "" {
+		port = "80"
+		if c.base.Scheme == "https" {
+			port = "443"
+		}
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String(semconv.SpanHTTPRequestMethod, req.Method),
+		attribute.String(semconv.SpanServerAddress, c.base.Hostname()),
+		attribute.String(semconv.SpanURLTemplate, rule.Path),
+		attribute.String(semconv.SpanURLFull, c.base.Scheme+"://"+c.base.Host+strings.TrimRight(c.base.Path, "/")+rule.Path),
+	}
+	if n, err := strconv.Atoi(port); err == nil {
+		attrs = append(attrs, attribute.Int(semconv.SpanServerPort, n))
+	}
+	if resend > 0 {
+		attrs = append(attrs, attribute.Int(semconv.SpanHTTPRequestResendCount, resend))
+	}
+	actx, span := c.tracer.Start(ctx, req.Method+" "+rule.Path,
+		trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
+	defer span.End()
+
+	// The wall clock, not c.now: the client clock is injectable and a test counts its calls.
+	began := time.Now()
+	resp, err := c.send(actx, req)
+	took := time.Since(began)
+
+	// No usable HTTP response is no_response: none arrived, or its body could not be read.
+	class := semconv.StatusClassNoResponse
+	var classified *Error
+	switch {
+	case err != nil:
+		cat := networkCategory(ctx, err)
+		span.SetAttributes(attribute.String(semconv.SpanErrorType, string(cat)))
+		span.SetStatus(codes.Error, string(cat))
+	default:
+		class = statusClass(resp.Status)
+		span.SetAttributes(attribute.Int(semconv.SpanHTTPResponseStatusCode, resp.Status))
+		if resp.Status < 200 || resp.Status >= 300 {
+			// What leaves the package names the rule's path: a template's concrete path
+			// holds an id from a bank response.
+			named := req
+			named.Path = rule.Path
+			classified = classify(named, resp)
+			span.SetAttributes(attribute.String(semconv.SpanErrorType, string(classified.Category)))
+			span.SetStatus(codes.Error, string(classified.Category))
+		}
+	}
+	if c.obs != nil {
+		c.obs.Attempt(actx, rule.Path, class, took)
+	}
+	return resp, classified, err
+}
+
+// statusClass is "2xx", "4xx" and so on. A status outside 100 to 599 is not a usable response and
+// takes the no_response class.
+func statusClass(status int) string {
+	if status < 100 || status > 599 {
+		return semconv.StatusClassNoResponse
+	}
+	return strconv.Itoa(status/100) + "xx"
+}
+
+func (c *Client) send(ctx context.Context, req Request) (*Response, error) {
 	u := *c.base
 	u.Path = strings.TrimRight(c.base.Path, "/") + req.Path
 	u.RawPath = ""

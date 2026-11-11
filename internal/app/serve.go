@@ -158,6 +158,7 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 		APIURL: cfg.MonzoAPIURL, AuthURL: cfg.MonzoAuthURL, PublicURL: cfg.PublicURL,
 		Window: cfg.MonzoWindow, Concurrency: cfg.MonzoBackfillConc,
 		Location: cfg.Timezone, Now: e.Now,
+		Tracer: providers.Tracer(semconv.ServiceName),
 	}
 	if hooks.MonzoOptions != nil {
 		hooks.MonzoOptions(&opts)
@@ -187,6 +188,7 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 				Connection: conn, ClientID: cfg.TrueLayerClientID, ClientSecret: cfg.TrueLayerClientSecret,
 				AuthURL: cfg.TrueLayerAuthURL, APIURL: cfg.TrueLayerAPIURL, PublicURL: cfg.PublicURL,
 				Location: cfg.Timezone, Now: e.Now,
+				Tracer: providers.Tracer(semconv.ServiceName),
 			}
 			if hooks.TrueLayerOptions != nil {
 				hooks.TrueLayerOptions(&o)

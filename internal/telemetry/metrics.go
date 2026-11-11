@@ -34,6 +34,7 @@ type Metrics struct {
 	jobRuns         metric.Int64Counter
 	jobDuration     metric.Float64Histogram
 	jobLastOK       metric.Int64Gauge
+	bank            bankInstruments
 }
 
 // NewMetrics creates every instrument on meter.
@@ -79,6 +80,9 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 		if err != nil {
 			err = fmt.Errorf("create %s: %w", semconv.MetricSchedulerJobDuration, err)
 		}
+	}
+	if err == nil {
+		m.bank, err = newBankInstruments(meter)
 	}
 	if err != nil {
 		return nil, err
