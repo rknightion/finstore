@@ -21,6 +21,7 @@ const (
 	EnvSuperuserDatabaseURL  = "FINSTORE_SUPERUSER_DATABASE_URL"
 	EnvAppPassword           = "FINSTORE_APP_PASSWORD"
 	EnvOwnerPassword         = "FINSTORE_OWNER_PASSWORD"
+	EnvMCPPassword           = "FINSTORE_MCP_PASSWORD"
 	EnvListenAddr            = "FINSTORE_LISTEN_ADDR"
 	EnvPublicURL             = "FINSTORE_PUBLIC_URL"
 	EnvAllowedEmails         = "FINSTORE_ALLOWED_EMAILS"
@@ -59,6 +60,9 @@ type Config struct {
 	SuperuserDatabaseURL string
 	AppPassword          string
 	OwnerPassword        string
+	// MCPPassword is the password bootstrap sets on the finstore_mcp login; empty leaves the role
+	// NOLOGIN. No command requires it.
+	MCPPassword string
 
 	ListenAddr    string
 	PublicURL     string
@@ -112,6 +116,7 @@ func Load(getenv func(string) string) (Config, error) {
 		SuperuserDatabaseURL:  get(EnvSuperuserDatabaseURL, ""),
 		AppPassword:           get(EnvAppPassword, ""),
 		OwnerPassword:         get(EnvOwnerPassword, ""),
+		MCPPassword:           get(EnvMCPPassword, ""),
 		ListenAddr:            get(EnvListenAddr, ":8080"),
 		PublicURL:             get(EnvPublicURL, ""),
 		AuthHeader:            get(EnvAuthHeader, "X-Auth-Request-Email"),
@@ -271,10 +276,10 @@ func (c Config) String() string {
 	}
 	return fmt.Sprintf("Config{listen=%q environment=%q log_level=%s sync_interval=%s nightly_at=%02d:%02d "+
 		"backfill_concurrency=%d window=%s otlp_export=%t database_url=%s owner_database_url=%s "+
-		"superuser_database_url=%s app_password=%s owner_password=%s monzo_client_secret=%s truelayer_client_secret=%s otlp_token=%s allowed_emails=%d}",
+		"superuser_database_url=%s app_password=%s owner_password=%s mcp_password=%s monzo_client_secret=%s truelayer_client_secret=%s otlp_token=%s allowed_emails=%d}",
 		c.ListenAddr, c.Environment, c.LogLevel, c.MonzoSyncInterval, c.MonzoNightlyAt.Hour, c.MonzoNightlyAt.Minute,
 		c.MonzoBackfillConc, c.MonzoWindow, c.OTLPEndpoint != "", set(c.DatabaseURL), set(c.OwnerDatabaseURL),
-		set(c.SuperuserDatabaseURL), set(c.AppPassword), set(c.OwnerPassword), set(c.MonzoClientSecret), set(c.TrueLayerClientSecret), set(c.OTLPToken),
+		set(c.SuperuserDatabaseURL), set(c.AppPassword), set(c.OwnerPassword), set(c.MCPPassword), set(c.MonzoClientSecret), set(c.TrueLayerClientSecret), set(c.OTLPToken),
 		len(c.AllowedEmails))
 }
 

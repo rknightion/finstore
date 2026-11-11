@@ -459,7 +459,8 @@ func TestTrueLayerEndToEnd(t *testing.T) {
 
 	// The card is a credit_card account: its purchase is negative, its repayment positive, its balance
 	// minus what is owed, and its detail the card object. The pending purchase is in
-	// agent.pending_transactions and not in the transactions, and identity data is in no agent view.
+	// agent.pending_transactions and not in the transactions, and identity data is in no agent view
+	// but agent.identity (the loop below is over the others).
 	if n := w.queryInt(`SELECT count(*) FROM agent.accounts WHERE slug = 'lloyds-card-4321' AND type = 'credit_card'
 		AND bank_ref IS NULL AND detail ->> 'display_name' = $1`, tlCardMarker); n != 1 {
 		t.Fatalf("the card is not a credit_card account with its object as detail: %d", n)
@@ -487,6 +488,14 @@ func TestTrueLayerEndToEnd(t *testing.T) {
 	}
 	if n := w.queryInt(`SELECT count(*) FROM raw.api_response WHERE source = $1 AND endpoint = '/data/v1/info' AND status = 200`, srcLloyds); n != 1 {
 		t.Fatalf("%d /info answers stored for Lloyds, want 1", n)
+	}
+	// The identity /info served is in agent.identity alone: one row for the source, holding the
+	// fake's record.
+	if got := w.queryText(`SELECT info -> 'results' -> 0 ->> 'full_name' FROM agent.identity WHERE source = $1`, srcLloyds); got != tlIdentity {
+		t.Fatalf("agent.identity holds %q for Lloyds, want the fake's record %q", got, tlIdentity)
+	}
+	if n := w.queryInt(`SELECT count(*) FROM agent.identity`); n != 1 {
+		t.Fatalf("%d rows in agent.identity, want 1 (one source has been read)", n)
 	}
 
 	// The ended statement account and Lloyds overlap on 2024-08-22 and 2024-08-27: the agent views

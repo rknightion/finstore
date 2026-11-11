@@ -19,11 +19,14 @@ Tailscale sidecar for that; a reverse proxy with single sign-on works too.
    `deploy/finstore.env.example` (as `finstore.env`), `deploy/owner.env.example` (as `owner.env`)
    and `deploy/ts.env.example` (as `ts.env`). Set every `CHANGE-ME` value. The TrueLayer pair
    (`FINSTORE_TRUELAYER_CLIENT_ID` and `FINSTORE_TRUELAYER_CLIENT_SECRET`) ships empty and may stay
-   empty: set both only to enable TrueLayer. Keep the env files at mode 600.
+   empty: set both only to enable TrueLayer. `FINSTORE_MCP_PASSWORD` in `owner.env` also ships
+   empty: set it only to give the read-only `finstore_mcp` role a login. Keep the env files at mode 600.
 2. Register an OAuth client at <https://developers.monzo.com>: confidential, with the redirect URL
    `<FINSTORE_PUBLIC_URL>/callback/monzo`. Put its id and secret in `finstore.env`. For the
    optional TrueLayer connections, see [Connecting through TrueLayer](#connecting-through-truelayer).
-3. Start the database, create the roles and the schemas, then start the service:
+3. Start the database, create the roles and the schemas, then start the service. `bootstrap` runs
+   before `migrate`, always: the grants `migrate` applies name every role, `finstore_mcp` included,
+   and fail with "role does not exist" until `bootstrap` has created it:
 
    ```sh
    docker compose up -d finstore-db
@@ -113,8 +116,9 @@ TrueLayer's Data API adds two connections, each its own source with its own cons
 
 Both connections also read `/data/v1/info` once a local day when the consent allows it. That is the
 account holder's identity as each bank holds it: name, addresses, date of birth, emails and phones.
-It is stored in `raw` and nothing reads it: no view shows it, and `finstore_agent` cannot read
-`raw`. It is personal data, and it sits in the nightly dump and the backups like every other bank
+It is stored in `raw` and `agent.identity` shows it (see [Reading the data](#reading-the-data)):
+the newest readable answer for each TrueLayer source, so `finstore_agent` and the other readers can
+read it. It is personal data, and it sits in the nightly dump and the backups like every other bank
 body.
 
 **Scopes and the cards reconnect.** A run takes the scopes from the `/me` answer of the consent it
@@ -291,7 +295,7 @@ current balances.
 
 | Command | Database role | Behaviour |
 |---|---|---|
-| `finstore bootstrap` | superuser | Creates the roles `finstore_owner`, `finstore_app` and `finstore_agent`, sets the two passwords, creates the schemas. Safe to run again |
+| `finstore bootstrap` | superuser | Creates the four roles (`finstore_owner` and `finstore_app` with their passwords, and `finstore_agent` and `finstore_mcp`, which start with no login), sets the settings of `finstore_mcp`, gives `finstore_mcp` its login and password when `FINSTORE_MCP_PASSWORD` is set (and takes them away when it is not), and creates the schemas. Safe to run again. Run it before `migrate` |
 | `finstore migrate` | owner | Applies the migrations and the grants. Says so when a `renormalise` is required |
 | `finstore serve` | app | The HTTP server, the scheduler, the Monzo worker and, when TrueLayer is configured, the two TrueLayer workers |
 | `finstore account add`, `finstore account list` | app | Create and list file-fed accounts |
@@ -317,6 +321,7 @@ Environment variables only.
 | `FINSTORE_OWNER_DATABASE_URL` | `migrate`, `renormalise` | none | Connection string for `finstore_owner` |
 | `FINSTORE_SUPERUSER_DATABASE_URL` | `bootstrap` | none | Connection string for the Postgres superuser |
 | `FINSTORE_APP_PASSWORD`, `FINSTORE_OWNER_PASSWORD` | `bootstrap` | none | Passwords `bootstrap` sets on the two login roles |
+| `FINSTORE_MCP_PASSWORD` | `bootstrap` | empty | Password `bootstrap` sets on the read-only `finstore_mcp` login. Empty leaves the role without a login (and takes one away if it had one). Letters and digits only, like the other passwords. No command requires it |
 | `FINSTORE_LISTEN_ADDR` | `serve`, `healthcheck` | `:8080` | Address the HTTP server binds |
 | `FINSTORE_PUBLIC_URL` | `serve` | none | Base URL users reach the service at |
 | `FINSTORE_ALLOWED_EMAILS` | `serve` | none | Comma-separated addresses allowed to use the pages |
@@ -362,6 +367,10 @@ not deleted.
 
 ### Reading the data
 
+There are four database roles. Three can log in: `finstore_owner` (migrations and `renormalise`),
+`finstore_app` (the service and the other commands) and `finstore_mcp` (read only, below, and only
+once `FINSTORE_MCP_PASSWORD` is set). `finstore_agent` has no login.
+
 Give a reader the role `finstore_agent`. It has no login and no password of its own: grant it to a
 login role you create. It can read the `agent` schema and nothing else, so it cannot see raw
 payloads, tokens or the sync tables.
@@ -369,6 +378,30 @@ payloads, tokens or the sync tables.
 ```sql
 CREATE ROLE reporting LOGIN PASSWORD '...' IN ROLE finstore_agent;
 ```
+
+For a reader that needs more than the views, there is `finstore_mcp`: a login with SELECT on every
+table and view in `agent`, `core`, `raw` and `sync`, and no right on `secret` (the bank tokens),
+none to write and none to create anything in those schemas or in `secret` or `public`, in any
+session. Its settings are defaults, not locks: a login as the role can change them for itself
+(`SET`, and `ALTER ROLE finstore_mcp ...`, which any role may run on itself), so a direct login is
+trusted with the role's reads and not with its limits. What it cannot change is `temp_file_limit`
+(1 GB, superuser only). The defaults are every transaction read only, `statement_timeout` 15 s,
+`lock_timeout` 2 s, `idle_in_transaction_session_timeout` 30 s, and at most four connections. A
+direct login can still create temporary tables, which the database grants to every role. The
+endpoint's own reader does not rely on the defaults: it sends the four timeouts and read-only mode
+as startup parameters of each connection, and runs each statement in an explicitly read-only
+transaction. Running `bootstrap` again resets anything the role changed for itself, role-wide or
+per database.
+`bootstrap` creates the role and applies the settings, and gives it a login when
+`FINSTORE_MCP_PASSWORD` is set; `migrate` grants it its reads, again after every `renormalise` swap,
+so `bootstrap` must have run first. No view or function in those schemas depends on `secret`, and
+none is `SECURITY DEFINER`; a test fails if one does. It can read `raw.api_response` bodies, which
+are account data, and `agent.identity`, which is personal data: give the role only to a reader you
+would trust with all of it.
+
+Every view in `agent` carries a comment that states its rules (pence, what is not additive with the
+ledger, pot transfers, ended accounts). `psql`'s `\d+ agent.transactions` shows it, and so does any
+tool that lists a schema.
 
 Start with `agent.coverage`: one row per account with the earliest and latest dates held, the
 transaction count, whether the stored transactions agree with the bank's balance, and every known
@@ -391,6 +424,12 @@ leave out:
   account missing from the newest listing keeps the one it was last seen with. A TrueLayer account
   object holds the account number, sort code and IBAN, and a card object the card's partial number
   and the name on it, so the same warning applies.
+- `agent.identity` is the account holder's identity as each TrueLayer source holds it: one row per
+  source (`source`, `fetched_at`, and `info`, the whole `/data/v1/info` response body as JSON,
+  which holds the name, date of birth, addresses, phone numbers and email addresses) from the
+  newest successful answer whose body is readable as JSON. A newer answer that is not readable is
+  skipped. It is the only view that shows identity data, and it is personal data: a reader of
+  `agent` can read it.
 - `agent.transactions.detail` is the latest version of the transaction's source record: the whole
   Monzo transaction object, or the parsed statement row for an imported one. Earlier versions are
   in `agent.transaction_history`.
@@ -542,6 +581,12 @@ with the new image. It rebuilds `core` from the real `raw` rows with the new cod
 difference without changing anything. No difference means the new code reads your history exactly
 as the old code did. A difference is either a fix you were expecting or a regression: read it before
 you go on. Then `migrate`, and `renormalise` if `migrate` asks for it.
+
+Run `bootstrap` before `migrate` whenever you update: the grants name every role, so a release that
+adds one (the release that added `finstore_mcp` did) fails `migrate` and `renormalise` with
+"role ... does not exist" until `bootstrap` has created it. `bootstrap` is safe to run again, and
+with `FINSTORE_MCP_PASSWORD` unset it leaves the new role without a login, which changes nothing
+anyone can see.
 
 Stop the service (`docker compose stop finstore`) before either `renormalise`, so that nothing is
 written while the record is rebuilt.
