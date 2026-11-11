@@ -15,6 +15,10 @@ const (
 	lineTolerance = 0.5
 	// colTolerance absorbs float noise when comparing x to a header's left edge.
 	colTolerance = 0.05
+	// maxContinuationGap is how far, in points, a continuation line may sit
+	// below the line before it in its row. Rows are 25 points apart and a
+	// continuation line is 12 points below its row in the real layout.
+	maxContinuationGap = 16
 
 	longDate  = "02 January 2006"
 	shortDate = "02 Jan 06"
@@ -35,9 +39,11 @@ const (
 
 var headerTexts = [numCols]string{"Date", "Description", "Type", "Money In (£)", "Money Out (£)", "Balance (£)"}
 
-// line is the texts of one page that share a y coordinate, left to right.
+// line is the texts of one page that share a y coordinate, left to right. y is
+// the coordinate of its topmost text.
 type line struct {
 	page  int
+	y     float64
 	items []pdftext.Text
 }
 
@@ -88,7 +94,7 @@ func groupLines(texts []pdftext.Text) []line {
 	for _, t := range ts {
 		n := len(lines)
 		if n == 0 || lines[n-1].page != t.Page || top-t.Y > lineTolerance {
-			lines = append(lines, line{page: t.Page})
+			lines = append(lines, line{page: t.Page, y: t.Y})
 			top = t.Y
 			n++
 		}
@@ -200,6 +206,13 @@ func parsePeriod(s string) (start, end time.Time, ok bool) {
 // page ends, the "Transaction types" line appears, or a line that does not
 // belong to the table (such as a page footer) is met; a repeated header on a
 // later page opens it again. A row dropped by that rule breaks the checks.
+//
+// A line with text only in the description column continues the current row
+// when it is on the same page as that row's last line and no more than
+// maxContinuationGap points below it. Any other description-only line inside
+// the table is an error, not furniture to skip: it may be a continuation in a
+// changed layout, and dropping or misattaching it would silently change a
+// row's description and so its key.
 func parseTable(lines []line) ([]Row, error) {
 	var (
 		rows    []Row
@@ -207,6 +220,9 @@ func parseTable(lines []line) ([]Row, error) {
 		open    bool
 		page    int
 		current *Row
+		// lastPage and lastY locate the current row's last line.
+		lastPage int
+		lastY    float64
 	)
 	for _, l := range lines {
 		if l.page != page {
@@ -235,7 +251,11 @@ func parseTable(lines []line) ([]Row, error) {
 			if current == nil {
 				return nil, fmt.Errorf("%w: text before the first row", ErrFormat)
 			}
+			if gap := lastY - l.y; l.page != lastPage || gap <= 0 || gap > maxContinuationGap {
+				return nil, fmt.Errorf("%w: description line apart from any row (after row %d)", ErrFormat, len(rows))
+			}
 			current.Description += " " + cells[colDescription]
+			lastY = l.y
 			continue
 		}
 		date, err := time.Parse(shortDate, cells[colDate])
@@ -249,6 +269,7 @@ func parseTable(lines []line) ([]Row, error) {
 		}
 		rows = append(rows, row)
 		current = &rows[len(rows)-1]
+		lastPage, lastY = l.page, l.y
 	}
 	return rows, nil
 }

@@ -19,6 +19,11 @@ const (
 	CheckRunningBalance CheckName = "running-balance"
 	// CheckClosingBalance: the last row's balance is the header's closing balance.
 	CheckClosingBalance CheckName = "closing-balance"
+	// CheckDateOrder: each row's date is on or after the previous row's.
+	CheckDateOrder CheckName = "date-order"
+	// CheckPeriod: each row's date lies within the printed period, both days
+	// included. Halifax PDF only: the manual CSV has no printed period.
+	CheckPeriod CheckName = "period"
 )
 
 // CheckError reports a failed check. It names the check and the 1-based row
@@ -37,9 +42,10 @@ func (e *CheckError) Error() string {
 }
 
 // Check runs the statement's own checks. A halifax-pdf statement must pass
-// all three, in the order totals, running balance, closing balance; a
-// manual-csv statement has only the running-balance check. The first failure
-// is returned as a *CheckError.
+// all five, in the order totals, running balance, closing balance, date
+// order, period; a manual-csv statement has the running-balance and
+// date-order checks, in that order. The first failure is returned as a
+// *CheckError.
 func Check(st *Statement) error {
 	switch st.Format {
 	case FormatHalifaxPDF:
@@ -52,9 +58,15 @@ func Check(st *Statement) error {
 		if n := len(st.Rows); n > 0 && st.Rows[n-1].Balance != st.ClosingBalance {
 			return &CheckError{Check: CheckClosingBalance, Row: n}
 		}
-		return nil
+		if err := checkDateOrder(st); err != nil {
+			return err
+		}
+		return checkPeriod(st)
 	case FormatManualCSV:
-		return checkRunning(st)
+		if err := checkRunning(st); err != nil {
+			return err
+		}
+		return checkDateOrder(st)
 	}
 	return fmt.Errorf("%w: unknown format", ErrFormat)
 }
@@ -76,6 +88,28 @@ func checkRunning(st *Statement) error {
 		prev, r := st.Rows[i-1], st.Rows[i]
 		if r.Balance != prev.Balance+r.MoneyIn-r.MoneyOut {
 			return &CheckError{Check: CheckRunningBalance, Row: i + 1}
+		}
+	}
+	return nil
+}
+
+// checkDateOrder fails at the first row dated before the row above it: both
+// formats list rows oldest first, and same-day rows are allowed.
+func checkDateOrder(st *Statement) error {
+	for i := 1; i < len(st.Rows); i++ {
+		if st.Rows[i].Date.Before(st.Rows[i-1].Date) {
+			return &CheckError{Check: CheckDateOrder, Row: i + 1}
+		}
+	}
+	return nil
+}
+
+// checkPeriod fails at the first row dated before PeriodStart or after
+// PeriodEnd.
+func checkPeriod(st *Statement) error {
+	for i, r := range st.Rows {
+		if r.Date.Before(st.PeriodStart) || r.Date.After(st.PeriodEnd) {
+			return &CheckError{Check: CheckPeriod, Row: i + 1}
 		}
 	}
 	return nil

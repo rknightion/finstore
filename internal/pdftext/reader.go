@@ -1,8 +1,33 @@
 // Package pdftext reads the visible text, with positions, from the simple PDF
 // documents that bank statements are: unencrypted, no object or cross-reference
-// streams, Flate-compressed page content in which every piece of text is drawn
-// by Tj at an absolute position. Anything else is rejected, so a changed
-// layout stops an import instead of producing wrong rows.
+// streams, Flate-compressed page content in which every visible string is drawn
+// by one Tj with a literal or hex string, placed by its own absolute Tm (a Td
+// after that Tm is honoured), sized by Tf, in text rendering mode 0, with no
+// coordinate transformation (cm) in effect. Anything else is rejected, so a
+// changed layout stops an import instead of producing wrong rows. In particular:
+//
+//   - a visible TJ, ' or " is refused;
+//   - a visible Tj with no Tm since the previous visible Tj (or since BT) is
+//     refused, as is one after T*, or after a Td that follows a Tm that scales
+//     or rotates. Invisible text (under 1 point) is exempt: it is not returned,
+//     and statements draw hidden labels straight after a visible string;
+//   - any Tr operand other than 0 is refused;
+//   - a visible Tj while a non-identity cm is in effect is refused. The graphics state
+//     stack is tracked (q pushes, Q pops), so a cm wrapped in q/Q around an
+//     image or form Do, with no text drawn inside, is accepted.
+//
+// Accepted limits, deliberately not checked: fonts and their encodings are
+// never inspected (every string is decoded as WinAnsi), the scale and rotation
+// parts of Tm are ignored (only its translation is used, and Size is the Tf
+// operand), and form XObjects drawn by Do are skipped, not entered. A file
+// that relies on any of those to place or spell its text is misread, but a
+// misread statement fails the importer's required header fields and its
+// numeric checks (totals, running balance, closing balance) rather than
+// producing rows.
+//
+// Size is bounded: the inflated content of all pages, the number of pages and
+// the number of visible texts are capped, and passing any cap returns
+// ErrTooLarge as soon as it happens.
 //
 // Errors never carry file content.
 package pdftext
@@ -26,6 +51,13 @@ const (
 	minVisibleSize = 1.0
 	// maxOperands bounds the content-stream operand stack.
 	maxOperands = 256
+	// maxTexts bounds the number of visible texts a file may yield; a small
+	// stream of short strings would otherwise expand to millions of them.
+	maxTexts = 200_000
+	// maxPages bounds the number of page objects a file may have.
+	maxPages = 2000
+	// maxGraphicsDepth bounds the q/Q nesting of a content stream.
+	maxGraphicsDepth = 64
 )
 
 // Errors returned by Read, to be tested with errors.Is.
@@ -34,7 +66,7 @@ var (
 	ErrEncrypted   = errors.New("pdftext: encrypted PDF")
 	ErrUnsupported = errors.New("pdftext: unsupported PDF structure")
 	ErrNoText      = errors.New("pdftext: no text found")
-	ErrTooLarge    = errors.New("pdftext: content stream too large")
+	ErrTooLarge    = errors.New("pdftext: PDF too large")
 )
 
 // Text is one string drawn by a Tj operator.
@@ -67,15 +99,19 @@ func Read(data []byte) ([]Text, error) {
 		return nil, fmt.Errorf("%w: no objects", ErrMalformed)
 	}
 
+	pages := pageObjects(objs, order)
+	if len(pages) > maxPages {
+		return nil, fmt.Errorf("%w: too many pages", ErrTooLarge)
+	}
 	budget := maxInflated
 	var out []Text
 	pageNo := 0
-	for _, pg := range pageObjects(objs, order) {
+	for _, pg := range pages {
 		content, err := pageContent(objs, pg, &budget)
 		if err != nil {
 			return nil, err
 		}
-		texts, err := extractText(content)
+		texts, err := extractText(content, maxTexts-len(out))
 		if err != nil {
 			return nil, err
 		}
@@ -184,7 +220,7 @@ func decodeStream(o *object, budget *int) ([]byte, error) {
 	switch filters {
 	case nil:
 		if len(o.stream) > *budget {
-			return nil, ErrTooLarge
+			return nil, fmt.Errorf("%w: content streams", ErrTooLarge)
 		}
 		*budget -= len(o.stream)
 		return o.stream, nil
@@ -199,7 +235,7 @@ func decodeStream(o *object, budget *int) ([]byte, error) {
 	defer zr.Close()
 	body, err := io.ReadAll(io.LimitReader(zr, int64(*budget)+1))
 	if len(body) > *budget {
-		return nil, ErrTooLarge
+		return nil, fmt.Errorf("%w: content streams", ErrTooLarge)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: bad compressed stream", ErrMalformed)
@@ -209,7 +245,8 @@ func decodeStream(o *object, budget *int) ([]byte, error) {
 }
 
 // extractText runs the content-stream operators that position and draw text.
-func extractText(content []byte) ([]Text, error) {
+// It returns ErrTooLarge as soon as the page yields more than limit texts.
+func extractText(content []byte, limit int) ([]Text, error) {
 	lx := &lexer{data: content}
 	var (
 		ops          []token
@@ -217,6 +254,14 @@ func extractText(content []byte) ([]Text, error) {
 		size         float64
 		x, y         float64 // text matrix translation
 		lineX, lineY float64
+		// placed is true from a Tm until the next Tj: each Tj needs its own Tm.
+		placed bool
+		// scaled is true when the last Tm scales or rotates, so a Td in it
+		// would move by more or less than its operands say.
+		scaled bool
+		// transformed is the graphics state stack: whether a non-identity cm
+		// is in effect at each q level, the current level last.
+		transformed = []bool{false}
 	)
 	for {
 		t, err := lx.next()
@@ -237,8 +282,35 @@ func extractText(content []byte) ([]Text, error) {
 			ops = push(ops, t)
 		case kKeyword:
 			switch t.str {
+			case "q":
+				if len(transformed) >= maxGraphicsDepth {
+					return nil, fmt.Errorf("%w: graphics state nesting", ErrUnsupported)
+				}
+				transformed = append(transformed, transformed[len(transformed)-1])
+			case "Q":
+				// An unmatched Q keeps the current state, the cautious choice.
+				if len(transformed) > 1 {
+					transformed = transformed[:len(transformed)-1]
+				}
+			case "cm":
+				n, ok := numbers(ops, 6)
+				if !ok {
+					return nil, fmt.Errorf("%w: bad cm", ErrMalformed)
+				}
+				if [6]float64(n) != [6]float64{1, 0, 0, 1, 0, 0} {
+					transformed[len(transformed)-1] = true
+				}
+			case "Tr":
+				n, ok := numbers(ops, 1)
+				if !ok {
+					return nil, fmt.Errorf("%w: bad Tr", ErrMalformed)
+				}
+				if n[0] != 0 {
+					return nil, fmt.Errorf("%w: text rendering mode", ErrUnsupported)
+				}
 			case "BT":
 				x, y, lineX, lineY = 0, 0, 0, 0
+				placed, scaled = false, false
 			case "Tm":
 				n, ok := numbers(ops, 6)
 				if !ok {
@@ -246,6 +318,7 @@ func extractText(content []byte) ([]Text, error) {
 				}
 				x, y = n[4], n[5]
 				lineX, lineY = x, y
+				placed, scaled = true, n[0] != 1 || n[1] != 0 || n[2] != 0 || n[3] != 1
 			case "Td", "TD":
 				n, ok := numbers(ops, 2)
 				if !ok {
@@ -253,6 +326,11 @@ func extractText(content []byte) ([]Text, error) {
 				}
 				lineX, lineY = lineX+n[0], lineY+n[1]
 				x, y = lineX, lineY
+				if scaled {
+					placed = false
+				}
+			case "T*":
+				placed = false
 			case "Tf":
 				if len(ops) < 2 || ops[len(ops)-1].kind != kNumber || ops[len(ops)-2].kind != kName {
 					return nil, fmt.Errorf("%w: bad Tf", ErrMalformed)
@@ -262,9 +340,24 @@ func extractText(content []byte) ([]Text, error) {
 				if len(ops) < 1 || ops[len(ops)-1].kind != kString {
 					return nil, fmt.Errorf("%w: bad Tj", ErrMalformed)
 				}
-				if size >= minVisibleSize {
-					out = append(out, Text{X: x, Y: y, Size: size, S: decodeWinAnsi(ops[len(ops)-1].raw)})
+				// Invisible text is not returned, so where it lands does not matter: it neither
+				// needs a Tm nor uses one up. Statements draw a hidden label straight after a
+				// visible string, with no Tm between them. A hidden string drawn before a
+				// visible one moves it by less than a point, which no column edge is near.
+				if size < minVisibleSize {
+					break
 				}
+				if !placed {
+					return nil, fmt.Errorf("%w: Tj without its own Tm", ErrUnsupported)
+				}
+				if transformed[len(transformed)-1] {
+					return nil, fmt.Errorf("%w: text under a cm", ErrUnsupported)
+				}
+				placed = false
+				if len(out) >= limit {
+					return nil, fmt.Errorf("%w: too many texts", ErrTooLarge)
+				}
+				out = append(out, Text{X: x, Y: y, Size: size, S: decodeWinAnsi(ops[len(ops)-1].raw)})
 			case "TJ", "'", "\"":
 				if size >= minVisibleSize {
 					return nil, fmt.Errorf("%w: text operator %s", ErrUnsupported, t.str)

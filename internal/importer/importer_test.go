@@ -319,3 +319,141 @@ func FuzzParsers(f *testing.F) {
 		}
 	})
 }
+
+func wantCheck(t *testing.T, st *importer.Statement, check importer.CheckName, row int) {
+	t.Helper()
+	var ce *importer.CheckError
+	if err := importer.Check(st); !errors.As(err, &ce) || ce.Check != check || ce.Row != row {
+		t.Fatalf("got %v, want %s check failed at row %d", err, check, row)
+	}
+}
+
+// A row dated outside the printed period would be stored with that date while
+// everything downstream treats the statement as covering only its period.
+func TestCheckHalifaxRowDateOutsidePeriod(t *testing.T) {
+	t.Run("after the end", func(t *testing.T) {
+		g := newGen(50000, baseRows())
+		g.End = d(8) // the last row is dated 09 Jan
+		wantCheck(t, parseGen(t, g), importer.CheckPeriod, 4)
+	})
+	t.Run("before the start", func(t *testing.T) {
+		g := newGen(50000, baseRows())
+		g.Start = d(4) // the first row is dated 03 Jan
+		wantCheck(t, parseGen(t, g), importer.CheckPeriod, 1)
+	})
+	t.Run("on both edges", func(t *testing.T) {
+		g := newGen(50000, baseRows())
+		g.Start, g.End = d(3), d(9)
+		if err := importer.Check(parseGen(t, g)); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// Both formats are oldest first, so a row dated before the row above it is
+// misread or misordered.
+func TestCheckHalifaxRowDatesGoBackwards(t *testing.T) {
+	rows := baseRows()
+	rows[2].Date = "04 Jan 30" // same day as the row before: allowed
+	if err := importer.Check(parseGen(t, newGen(50000, rows))); err != nil {
+		t.Fatalf("same-day rows: %v", err)
+	}
+	rows[2].Date = "03 Jan 30"
+	wantCheck(t, parseGen(t, newGen(50000, rows)), importer.CheckDateOrder, 3)
+}
+
+func TestCheckManualCSVRowDatesGoBackwards(t *testing.T) {
+	const h = "date,type,amount,balance_after,description\n"
+	for name, tc := range map[string]struct {
+		csv string
+		row int
+	}{
+		// A stray middle date later than both neighbours: the row after it goes back.
+		"middle date too late": {h + "2030-01-03,PAY,1.00,1.00,A\n2030-01-20,PAY,1.00,2.00,B\n2030-01-05,PAY,1.00,3.00,C\n", 3},
+		// A stray middle date earlier than both neighbours: it goes back itself.
+		"middle date too early": {h + "2030-01-10,PAY,1.00,1.00,A\n2030-01-02,PAY,1.00,2.00,B\n2030-01-12,PAY,1.00,3.00,C\n", 2},
+	} {
+		st, err := importer.ParseManualCSV([]byte(tc.csv))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		t.Run(name, func(t *testing.T) { wantCheck(t, st, importer.CheckDateOrder, tc.row) })
+	}
+}
+
+// A description-only line well below the last row of a page is not part of
+// that row: merging it would give the row a different key from the same row in
+// an overlapping statement without the line.
+func TestParseHalifaxPDFStrayDescriptionLineIsNotAContinuation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(rows []genRow)
+	}{
+		{"below the last row of a page", func(r []genRow) { r[1].PageEnds = true; r[1].Stray = "MADE-UP FURNITURE" }},
+		{"below a continuation, last row of a page", func(r []genRow) {
+			r[1].PageEnds, r[1].Cont, r[1].Stray = true, "REAL CONTINUATION", "MADE-UP FURNITURE"
+		}},
+		{"below the last row of the statement", func(r []genRow) { r[3].Stray = "MADE-UP FURNITURE" }},
+		{"below a continuation, last row of the statement", func(r []genRow) {
+			r[3].Cont, r[3].Stray = "REAL CONTINUATION", "MADE-UP FURNITURE"
+		}},
+		{"between rows", func(r []genRow) { r[1].Stray = "MADE-UP FURNITURE" }},
+		{"just past the limit", func(r []genRow) { r[1].Stray, r[1].StrayGap = "MADE-UP FURNITURE", 16.5 }},
+		{"continuation just past the limit", func(r []genRow) { r[1].Cont, r[1].ContGap = "TOO FAR", 16.5 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := baseRows()
+			tc.edit(rows)
+			st, err := importer.ParseHalifaxPDF(newGen(50000, rows).PDF())
+			if !errors.Is(err, importer.ErrFormat) {
+				t.Fatalf("got %v (statement parsed: %v), want ErrFormat", err, st != nil)
+			}
+			if strings.Contains(err.Error(), "FURNITURE") || strings.Contains(err.Error(), "FAR") {
+				t.Errorf("error %q carries statement content", err)
+			}
+		})
+	}
+}
+
+// A continuation line up to 16 points below the line before it in the same
+// row belongs to the row; a second continuation chains from the first.
+func TestParseHalifaxPDFContinuationWithinLimit(t *testing.T) {
+	rows := baseRows()
+	rows[1].Cont, rows[1].ContGap = "AT THE LIMIT", 16
+	rows[2].Cont, rows[2].Stray, rows[2].StrayGap = "FIRST", "SECOND", 12
+	st := parseGen(t, newGen(50000, rows))
+	if got := st.Rows[1].Description; got != "EXAMPLE SHOP (TOWN) £5 OFF AT THE LIMIT" {
+		t.Errorf("row 2 description %q", got)
+	}
+	if got := st.Rows[2].Description; got != "FIXTURE UTILITY FIRST SECOND" {
+		t.Errorf("row 3 description %q", got)
+	}
+	if err := importer.Check(st); err != nil {
+		t.Error(err)
+	}
+}
+
+// NUL bytes and invalid UTF-8 in a description do not break parsing. The PDF
+// reader decodes every byte as WinAnsi, so its descriptions are always valid
+// UTF-8 (NUL stays U+0000); the CSV parser passes the bytes through.
+func TestParseDescriptionsWithNULAndInvalidUTF8(t *testing.T) {
+	rows := baseRows()
+	rows[0].Desc = "MADE\x00UP"
+	st := parseGen(t, newGen(50000, rows))
+	if got := st.Rows[0].Description; got != "MADE\x00UP" {
+		t.Errorf("pdf description %q", got)
+	}
+	csv := "date,type,amount,balance_after,description\n" +
+		"2030-01-03,PAY,1.00,1.00,A\x00B\n" +
+		"2030-01-04,PAY,1.00,2.00,C\xffD\n"
+	cst, err := importer.ParseManualCSV([]byte(csv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cst.Rows[0].Description != "A\x00B" || cst.Rows[1].Description != "C\xffD" {
+		t.Errorf("csv descriptions %q %q", cst.Rows[0].Description, cst.Rows[1].Description)
+	}
+	if err := importer.Check(cst); err != nil {
+		t.Error(err)
+	}
+}

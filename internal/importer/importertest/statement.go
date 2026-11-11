@@ -12,9 +12,18 @@ import (
 
 // Row is one made-up statement row. Bal is the balance printed after it.
 type Row struct {
-	Date     string // DD Mon YY
-	Desc     string
-	Cont     string // optional continuation line under the description
+	Date string // DD Mon YY
+	Desc string
+	Cont string // optional continuation line under the description
+	// ContGap is how far, in points, the continuation line sits below the row
+	// line. Zero means 12, as in the real layout.
+	ContGap float64
+	// Stray is an optional line of page furniture in the description column,
+	// StrayGap points below the row's last line (the continuation line if
+	// there is one, else the row line), on the same page. It belongs to no row.
+	Stray string
+	// StrayGap is the distance of Stray below the row's last line. Zero means 20.
+	StrayGap float64
 	Type     string
 	In, Out  int64
 	Bal      int64
@@ -84,11 +93,21 @@ func (g *Statement) PDF() []byte {
 	)
 	var pages [][]string
 	var cur []string
-	add := func(x, y, size float64, s string) { cur = append(cur, pdftexttest.Text(x, y, size, s)) }
+	// Every visible string is followed by a hidden label with no Tm of its own, as in the real
+	// layout; a reader that needs a Tm for the label, or returns it, fails on every statement.
+	add := func(x, y, size float64, s string) {
+		if size < 1 {
+			cur = append(cur, pdftexttest.Text(x, y, size, s))
+			return
+		}
+		cur = append(cur, pdftexttest.LabelledText(x, y, size, s, "hidden label"))
+	}
 	furniture := func() {
 		add(305.5, 809, 9, "01 February 2030")
 		add(60, 790, 0.05, "decoy label")
 		cur = append(cur, "/Xf1 Do\n")
+		// The logo: an image placed by a cm inside q/Q, with no text inside.
+		cur = append(cur, "q\n120 0 0 40 57 770 cm\n/Im1 Do\nQ\n")
 		add(57, 73, 6.2, "Made-up footer line one")
 		add(209.3, 73, 6.2, " 000 000 0000")
 		add(57, 45.8, 6.2, "Made-up footer line two")
@@ -136,11 +155,27 @@ func (g *Statement) PDF() []byte {
 			amount(4, y, pounds(r.Out))
 		}
 		amount(5, y, pounds(r.Bal))
+		// The next row sits rowGap below this one, and never closer than
+		// rowGap-contGap below this row's last line.
+		next := y - rowGap
+		last := y
 		if r.Cont != "" {
-			y -= contGap
-			add(headerX[1], y, 9, r.Cont)
+			gap := contGap
+			if r.ContGap != 0 {
+				gap = r.ContGap
+			}
+			last = y - gap
+			add(headerX[1], last, 9, r.Cont)
 		}
-		y -= rowGap
+		if r.Stray != "" {
+			gap := 20.0
+			if r.StrayGap != 0 {
+				gap = r.StrayGap
+			}
+			last -= gap
+			add(headerX[1], last, 9, r.Stray)
+		}
+		y = min(next, last-(rowGap-contGap))
 		if r.PageEnds {
 			pages = append(pages, cur)
 			cur = nil

@@ -74,6 +74,14 @@ func Text(x, y, size float64, s string) string {
 	return fmt.Sprintf("BT\n/F1 %g Tf\n1 0 0 1 %g %g Tm\n(%s)Tj\nET\n", size, x, y, Escape(s))
 }
 
+// LabelledText returns the operators that draw s at (x, y) in the given size and then, with no
+// Tm between them, a hidden label: white, in a 0.05-point font. That is how statements attach
+// their invisible labels to visible text.
+func LabelledText(x, y, size float64, s, label string) string {
+	return fmt.Sprintf("BT\n1 0 0 1 %g %g Tm\n/F1 %g Tf\n(%s)Tj\n/F1 0.05 Tf\n1 1 1 rg\n(%s)Tj\n0 g\nET\n",
+		x, y, size, Escape(s), Escape(label))
+}
+
 // Escape writes s as the body of a PDF literal string in WinAnsiEncoding:
 // parentheses and backslashes are escaped and the pound sign is an octal escape.
 func Escape(s string) string {
