@@ -691,7 +691,7 @@ func (f *Fake) handle(r *http.Request) reply {
 	case "/data/v1/info":
 		return results(map[string]any{
 			"full_name": "Made Up Person", "date_of_birth": "1990-01-01",
-			"emails": []string{"made.up@example.test"}, "phones": []string{"+440000000000"},
+			"emails": []string{"made.up@example.com"}, "phones": []string{"+440000000000"},
 			"addresses":        []map[string]any{{"address": "1 Made Up Street", "city": "Madeup", "zip": "ZZ1 1ZZ", "country": "GB"}},
 			"update_timestamp": ts(now),
 		})

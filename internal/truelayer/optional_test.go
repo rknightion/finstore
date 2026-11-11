@@ -289,7 +289,7 @@ func TestNothingFromInfoReachesCore(t *testing.T) {
 	}
 	rows.Close()
 	for _, tbl := range tables {
-		for _, needle := range []string{"Made Up Person", "made.up@example.test", "Made Up Street", "ZZ1 1ZZ", "1990-01-01"} {
+		for _, needle := range []string{"Made Up Person", "made.up@example.com", "Made Up Street", "ZZ1 1ZZ", "1990-01-01"} {
 			var n int
 			q := fmt.Sprintf(`SELECT count(*) FROM core.%s x WHERE x::text LIKE '%%' || $1 || '%%'`, tbl)
 			if err := h.st.DB().QueryRow(ctx, q, needle).Scan(&n); err != nil || n != 0 {
