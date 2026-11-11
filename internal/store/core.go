@@ -69,6 +69,7 @@ type Account struct {
 	ExpectsImports bool
 	OpenedOn       *time.Time // a date
 	Closed         bool
+	FileRef        *string // a file-fed account's statement identifier; nil until an import sets it
 }
 
 // Transaction is a core.transaction row. It always mirrors the latest version.
@@ -170,6 +171,8 @@ type Reconciliation struct {
 	ReconciledThrough *time.Time // a date
 	BreakCount        int
 	KnownException    *string
+	// AcceptedDiffMinor is the difference the operator accepted with KnownException.
+	AcceptedDiffMinor *int64
 }
 
 // FileGap is a core.file_gap row: two imported files that do not join up.
@@ -187,25 +190,25 @@ type ProjectionState struct {
 	NormaliserRev int
 }
 
-const accountColumns = `id, source, source_key, slug, type, feed, currency, name, parent_id, expects_imports, opened_on, closed`
+const accountColumns = `id, source, source_key, slug, type, feed, currency, name, parent_id, expects_imports, opened_on, closed, file_ref`
 
 func scanAccount(r pgx.CollectableRow) (Account, error) {
 	var a Account
 	err := r.Scan(&a.ID, &a.Source, &a.SourceKey, &a.Slug, &a.Type, &a.Feed, &a.Currency, &a.Name,
-		&a.ParentID, &a.ExpectsImports, &a.OpenedOn, &a.Closed)
+		&a.ParentID, &a.ExpectsImports, &a.OpenedOn, &a.Closed, &a.FileRef)
 	return a, err
 }
 
 // UpsertAccount inserts a, or replaces every column of the row with a's id.
 func (c Core) UpsertAccount(ctx context.Context, a Account) error {
 	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.account (`+accountColumns+`)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT (id) DO UPDATE SET source = EXCLUDED.source, source_key = EXCLUDED.source_key,
 		  slug = EXCLUDED.slug, type = EXCLUDED.type, feed = EXCLUDED.feed, currency = EXCLUDED.currency,
 		  name = EXCLUDED.name, parent_id = EXCLUDED.parent_id, expects_imports = EXCLUDED.expects_imports,
-		  opened_on = EXCLUDED.opened_on, closed = EXCLUDED.closed`),
+		  opened_on = EXCLUDED.opened_on, closed = EXCLUDED.closed, file_ref = EXCLUDED.file_ref`),
 		a.ID, a.Source, a.SourceKey, a.Slug, a.Type, a.Feed, a.Currency, a.Name, a.ParentID,
-		a.ExpectsImports, a.OpenedOn, a.Closed)
+		a.ExpectsImports, a.OpenedOn, a.Closed, a.FileRef)
 	if err != nil {
 		return fmt.Errorf("store: upsert account: %w", err)
 	}
@@ -511,14 +514,14 @@ func (c Core) LatestBalanceSnapshot(ctx context.Context, accountID uuid.UUID) (B
 }
 
 const reconciliationColumns = `account_id, method, running_sum_minor, last_check_at, last_check_ok, last_diff_minor,
-	last_pass_at, reconciled_through, break_count, known_exception`
+	last_pass_at, reconciled_through, break_count, known_exception, accepted_diff_minor`
 
 // GetReconciliation returns the account's reconciliation row, or ErrNotFound.
 func (c Core) GetReconciliation(ctx context.Context, accountID uuid.UUID) (Reconciliation, error) {
 	var r Reconciliation
 	err := c.q.QueryRow(ctx, c.sql(`SELECT `+reconciliationColumns+` FROM core.reconciliation WHERE account_id = $1`), accountID).
 		Scan(&r.AccountID, &r.Method, &r.RunningSumMinor, &r.LastCheckAt, &r.LastCheckOK, &r.LastDiffMinor,
-			&r.LastPassAt, &r.ReconciledThrough, &r.BreakCount, &r.KnownException)
+			&r.LastPassAt, &r.ReconciledThrough, &r.BreakCount, &r.KnownException, &r.AcceptedDiffMinor)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Reconciliation{}, ErrNotFound
 	}
@@ -531,14 +534,15 @@ func (c Core) GetReconciliation(ctx context.Context, accountID uuid.UUID) (Recon
 // PutReconciliation inserts r or replaces every column of the account's row.
 func (c Core) PutReconciliation(ctx context.Context, r Reconciliation) error {
 	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.reconciliation (`+reconciliationColumns+`)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (account_id) DO UPDATE SET method = EXCLUDED.method,
 		  running_sum_minor = EXCLUDED.running_sum_minor, last_check_at = EXCLUDED.last_check_at,
 		  last_check_ok = EXCLUDED.last_check_ok, last_diff_minor = EXCLUDED.last_diff_minor,
 		  last_pass_at = EXCLUDED.last_pass_at, reconciled_through = EXCLUDED.reconciled_through,
-		  break_count = EXCLUDED.break_count, known_exception = EXCLUDED.known_exception`),
+		  break_count = EXCLUDED.break_count, known_exception = EXCLUDED.known_exception,
+		  accepted_diff_minor = EXCLUDED.accepted_diff_minor`),
 		r.AccountID, r.Method, r.RunningSumMinor, r.LastCheckAt, r.LastCheckOK, r.LastDiffMinor,
-		r.LastPassAt, r.ReconciledThrough, r.BreakCount, r.KnownException)
+		r.LastPassAt, r.ReconciledThrough, r.BreakCount, r.KnownException, r.AcceptedDiffMinor)
 	if err != nil {
 		return fmt.Errorf("store: put reconciliation: %w", err)
 	}
@@ -579,6 +583,66 @@ func (c Core) InsertFileGap(ctx context.Context, g FileGap) error {
 		return fmt.Errorf("store: insert file gap: %w", err)
 	}
 	return nil
+}
+
+// ReplaceFileGaps deletes every file gap of the account and inserts gaps in its place, in one
+// transaction (a savepoint when c is bound to a transaction).
+func (c Core) ReplaceFileGaps(ctx context.Context, accountID uuid.UUID, gaps []FileGap) error {
+	return pgx.BeginFunc(ctx, c.q, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, c.sql(`DELETE FROM core.file_gap WHERE account_id = $1`), accountID); err != nil {
+			return fmt.Errorf("store: delete file gaps: %w", err)
+		}
+		inner := Core{q: tx, schema: c.schema}
+		for _, g := range gaps {
+			if g.AccountID != accountID {
+				return errors.New("store: replace file gaps: gap for another account")
+			}
+			if err := inner.InsertFileGap(ctx, g); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// Statement is a core.statement row: one accepted imported statement.
+type Statement struct {
+	AccountID    uuid.UUID
+	RawSeq       int64     // the raw.import_file seq
+	FirstDate    time.Time // a date
+	LastDate     time.Time // a date
+	OpeningMinor int64
+	ClosingMinor int64
+}
+
+// InsertStatement inserts s.
+func (c Core) InsertStatement(ctx context.Context, s Statement) error {
+	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.statement
+		(account_id, raw_seq, first_date, last_date, opening_minor, closing_minor) VALUES ($1, $2, $3, $4, $5, $6)`),
+		s.AccountID, s.RawSeq, s.FirstDate, s.LastDate, s.OpeningMinor, s.ClosingMinor)
+	if err != nil {
+		return fmt.Errorf("store: insert statement: %w", err)
+	}
+	return nil
+}
+
+// ListStatements returns the account's statements ordered by first_date, then last_date
+// descending, then raw_seq: the order the continuity walk reads them in.
+func (c Core) ListStatements(ctx context.Context, accountID uuid.UUID) ([]Statement, error) {
+	rows, err := c.q.Query(ctx, c.sql(`SELECT account_id, raw_seq, first_date, last_date, opening_minor, closing_minor
+		FROM core.statement WHERE account_id = $1 ORDER BY first_date, last_date DESC, raw_seq`), accountID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list statements: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Statement, error) {
+		var s Statement
+		err := r.Scan(&s.AccountID, &s.RawSeq, &s.FirstDate, &s.LastDate, &s.OpeningMinor, &s.ClosingMinor)
+		return s, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: list statements: %w", err)
+	}
+	return out, nil
 }
 
 // ListFileGaps returns the account's file gaps in raw_seq order.

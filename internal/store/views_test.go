@@ -70,12 +70,13 @@ func TestCoverageGaps(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// File accounts: a current account last imported 36 days ago (with a break between two
-	// earlier files), one last imported 35 days ago, and a mortgage last imported long ago.
-	fileAcc := func(slug, typ string, lastDay int) store.Account {
+	// File accounts: one expecting imports and last imported 36 days ago (with a break between
+	// two earlier files), one last imported 35 days ago, a joint account 40 days ago (the account
+	// type does not matter, only the flag), and a mortgage that expects none, imported long ago.
+	fileAcc := func(slug, typ string, lastDay int, expects bool) store.Account {
 		t.Helper()
 		a := testAccount(slug, typ, "file")
-		a.ExpectsImports = true
+		a.ExpectsImports = expects
 		if err := core.UpsertAccount(ctx, a); err != nil {
 			t.Fatal(err)
 		}
@@ -85,9 +86,10 @@ func TestCoverageGaps(t *testing.T) {
 		}
 		return a
 	}
-	joint := fileAcc("joint", "current", -36)
-	fileAcc("joint-recent", "current", -35)
-	fileAcc("mortgage", "mortgage", -100)
+	joint := fileAcc("joint", "current", -36, true)
+	fileAcc("joint-recent", "current", -35, true)
+	fileAcc("shared", "joint", -40, true)
+	fileAcc("mortgage", "mortgage", -100, false)
 	if err := core.InsertFileGap(ctx, store.FileGap{AccountID: joint.ID, AfterDate: day(today, -60),
 		BeforeDate: day(today, -50), DiffMinor: 1234, RawSeq: 99}); err != nil {
 		t.Fatal(err)
@@ -101,7 +103,7 @@ func TestCoverageGaps(t *testing.T) {
 	for _, r := range rows {
 		bySlug[r.AccountSlug] = r
 	}
-	if len(bySlug) != 5 {
+	if len(bySlug) != 6 {
 		t.Fatalf("coverage has %d rows, want one per account: %+v", len(bySlug), rows)
 	}
 
@@ -131,6 +133,7 @@ func TestCoverageGaps(t *testing.T) {
 		t.Errorf("file gap difference = %v, want 1234", d)
 	}
 	checkGaps("joint-recent", nil)
+	checkGaps("shared", []wantGap{{day(today, -39), today, store.GapImportDue}})
 	checkGaps("mortgage", nil)
 	checkGaps("monzo-pot", nil)
 

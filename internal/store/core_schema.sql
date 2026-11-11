@@ -11,6 +11,9 @@ CREATE TABLE {{schema}}.account (
   currency text NOT NULL, name text NOT NULL, parent_id uuid,
   expects_imports boolean NOT NULL DEFAULT false,
   opened_on date, closed boolean NOT NULL DEFAULT false,
+  -- a file-fed account's statement identifier (sort code and account number, digits only),
+  -- set by its first import that carries one; a statement naming another is rejected.
+  file_ref text,
   UNIQUE (source, source_key));
 
 CREATE TABLE {{schema}}.transaction (
@@ -48,9 +51,20 @@ CREATE TABLE {{schema}}.reconciliation (
   running_sum_minor bigint NOT NULL DEFAULT 0,
   last_check_at timestamptz, last_check_ok boolean, last_diff_minor bigint,
   last_pass_at timestamptz, reconciled_through date, break_count int NOT NULL DEFAULT 0,
-  known_exception text);
+  known_exception text,
+  -- the difference (balance minus running sum) the operator accepted; a check whose difference
+  -- equals it passes. Set only by an accept_difference operator entry, with known_exception.
+  accepted_diff_minor bigint);
 
 CREATE TABLE {{schema}}.file_gap (
   account_id uuid NOT NULL REFERENCES {{schema}}.account(id), after_date date NOT NULL,
   before_date date NOT NULL, diff_minor bigint NOT NULL, raw_seq bigint NOT NULL,
+  PRIMARY KEY (account_id, raw_seq));
+
+-- One row per accepted imported statement. File continuity is computed from the whole set, so
+-- it does not depend on the order statements were imported in.
+CREATE TABLE {{schema}}.statement (
+  account_id uuid NOT NULL REFERENCES {{schema}}.account(id), raw_seq bigint NOT NULL,
+  first_date date NOT NULL, last_date date NOT NULL,
+  opening_minor bigint NOT NULL, closing_minor bigint NOT NULL,
   PRIMARY KEY (account_id, raw_seq));

@@ -33,9 +33,9 @@ JOIN core.account a ON a.id = b.account_id;
 -- an open account, or to the last covered day for a closed one. Today is never a gap, so the time
 -- between the last hourly fetch and now is not reported. Pots and balances-only accounts have no
 -- transaction gaps. For a file account the gaps are core.file_gap (from is the last date of the
--- earlier file, to the first date of the later one) plus "import due" for a current account that
--- expects imports and whose latest statement date (its newest transaction date or balance
--- snapshot date) is more than 35 days old.
+-- earlier file, to the first date of the later one) plus "import due" for an account that expects
+-- imports, whatever its type, and whose latest statement date (its newest transaction date or
+-- balance snapshot date) is more than 35 days old.
 CREATE VIEW agent.coverage AS
 WITH today AS (
   SELECT (now() AT TIME ZONE 'Europe/London')::date AS d
@@ -99,7 +99,7 @@ latest_statement AS (
                    WHERE t.account_id = a.id AND t.disappeared_at IS NULL),
                   (SELECT max(b.on_date) FROM core.balance_snapshot b WHERE b.account_id = a.id)) AS d
   FROM core.account a
-  WHERE a.feed = 'file' AND a.type = 'current' AND a.expects_imports
+  WHERE a.feed = 'file' AND a.expects_imports
 ),
 gap_rows AS (
   SELECT u.account_id, lower(g) AS from_date,
