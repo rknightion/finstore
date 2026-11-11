@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -288,12 +289,24 @@ func TestNewConnectReplacesTheConsentAndStopsTheOldApprovalWait(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, nil, nil)
 	h.fake.AddAccount(monzotest.Account{ID: "acc_test_1", Type: "uk_retail", Created: h.fake.Now().AddDate(0, -1, 0)})
+	parked := make(chan struct{})
+	var parkOnce sync.Once
 	h.setOnSleep(func(ctx context.Context, _ int, _ time.Duration) error {
+		parkOnce.Do(func() { close(parked) })
 		<-ctx.Done()
 		return ctx.Err()
 	})
 	h.callback(h.w)
 	first := h.consent()
+	// The first wait must be parked in its pause before the hook changes. A first wait that
+	// reached its first pause only after connect installed its hook would take connect's approval
+	// for the first token, which the second exchange then withdraws, and the second consent would
+	// wait unapproved until its give-up time.
+	select {
+	case <-parked:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the first approval wait never paused")
+	}
 	h.setOnSleep(nil)
 	h.connect(nil)
 	old, err := store.GetConsent(context.Background(), h.st.DB(), first.ID)
