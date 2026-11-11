@@ -402,7 +402,8 @@ func (f *Fake) GenerateTransactions(accountID string, n int, from, to time.Time,
 		g := i / k
 		created := from
 		if groups > 1 {
-			created = from.Add(span * time.Duration(g) / time.Duration(groups))
+			// Divide before multiplying: span times the group index overflows for long histories.
+			created = from.Add(time.Duration(float64(span) * float64(g) / float64(groups)))
 		}
 		out = append(out, f.addTx(Transaction{
 			AccountID:   accountID,
