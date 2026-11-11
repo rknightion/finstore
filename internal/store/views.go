@@ -57,6 +57,9 @@ type CoverageRow struct {
 	// FailedOn is, for a running_balance account, the earliest day whose rows do not add up to
 	// their running balances; nil otherwise.
 	FailedOn *time.Time `json:"failed_on"`
+	// Source is the account's source: "monzo" for Monzo's own API, "truelayer:<provider>" for an
+	// account TrueLayer feeds, "manual" for one fed by statement files.
+	Source string `json:"source"`
 }
 
 // SyncStatusRow is a row of agent.sync_status.
@@ -74,7 +77,7 @@ type SyncStatusRow struct {
 // Coverage reads agent.coverage, ordered by account slug.
 func Coverage(ctx context.Context, q DBTX) ([]CoverageRow, error) {
 	rows, err := q.Query(ctx, `SELECT account_slug, feed, earliest_date, latest_date, transaction_count,
-		reconciliation_state, reconciled_through, last_diff_minor, gaps, latest_statement_date, failed_on
+		reconciliation_state, reconciled_through, last_diff_minor, gaps, latest_statement_date, failed_on, source
 		FROM agent.coverage ORDER BY account_slug`)
 	if err != nil {
 		return nil, fmt.Errorf("store: read coverage: %w", err)
@@ -83,7 +86,7 @@ func Coverage(ctx context.Context, q DBTX) ([]CoverageRow, error) {
 		var c CoverageRow
 		var gaps []byte
 		if err := r.Scan(&c.AccountSlug, &c.Feed, &c.EarliestDate, &c.LatestDate, &c.TransactionCount,
-			&c.ReconciliationState, &c.ReconciledThrough, &c.LastDiffMinor, &gaps, &c.LatestStatementDate, &c.FailedOn); err != nil {
+			&c.ReconciliationState, &c.ReconciledThrough, &c.LastDiffMinor, &gaps, &c.LatestStatementDate, &c.FailedOn, &c.Source); err != nil {
 			return c, err
 		}
 		var err error

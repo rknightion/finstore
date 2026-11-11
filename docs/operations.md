@@ -305,7 +305,10 @@ CREATE ROLE reporting LOGIN PASSWORD '...' IN ROLE finstore_agent;
 
 Start with `agent.coverage`: one row per account with the earliest and latest dates held, the
 transaction count, whether the stored transactions agree with the bank's balance, and every known
-gap with its reason. A reader should check it before trusting a total.
+gap with its reason. A reader should check it before trusting a total. Its `source` column says where the
+account's data comes from: `monzo` for Monzo's own API, `truelayer:<provider>` for an account
+TrueLayer feeds, and the file source for a statement-fed account. The status page shows the same
+as its Feed column.
 
 Each account and transaction also carries the source's own record, for anything the named columns
 leave out:
