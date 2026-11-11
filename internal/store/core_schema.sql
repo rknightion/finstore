@@ -2,7 +2,10 @@
 -- inside a schema that already exists and has no tables. Nothing here may name another schema.
 CREATE TABLE {{schema}}.projection_state (
   only_row boolean PRIMARY KEY DEFAULT true CHECK (only_row),
-  last_seq bigint NOT NULL, normaliser_rev int NOT NULL);
+  last_seq bigint NOT NULL, normaliser_rev int NOT NULL,
+  -- the time zone the projection turned instants into days with (FINSTORE_TIMEZONE); set by the
+  -- first CatchUp. A projection run with another zone is refused until renormalise.
+  zone text);
 
 CREATE TABLE {{schema}}.account (
   id uuid PRIMARY KEY, source text NOT NULL, source_key text NOT NULL, slug text NOT NULL UNIQUE,
@@ -67,4 +70,6 @@ CREATE TABLE {{schema}}.statement (
   account_id uuid NOT NULL REFERENCES {{schema}}.account(id), raw_seq bigint NOT NULL,
   first_date date NOT NULL, last_date date NOT NULL,
   opening_minor bigint NOT NULL, closing_minor bigint NOT NULL,
+  -- first_date and last_date are the printed period (true) or only the row dates (false)
+  exact_period boolean NOT NULL DEFAULT false,
   PRIMARY KEY (account_id, raw_seq));

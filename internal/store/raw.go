@@ -135,7 +135,8 @@ func InsertFetchComplete(ctx context.Context, q DBTX, c FetchComplete) (int64, e
 }
 
 // InsertImportFile stores f with its SHA-256 and size. When the same bytes were already imported
-// for the same account it stores nothing and returns the existing row's seq with existed true.
+// for the same account in the same format it stores nothing and returns the existing row's seq
+// with existed true. The same bytes under another format are a new row.
 func InsertImportFile(ctx context.Context, q DBTX, f ImportFile) (seq int64, existed bool, err error) {
 	sum := sha256.Sum256(f.Body)
 	body := f.Body
@@ -145,7 +146,7 @@ func InsertImportFile(ctx context.Context, q DBTX, f ImportFile) (seq int64, exi
 	err = q.QueryRow(ctx, `INSERT INTO raw.import_file
 		(account_slug, format, file_name, sha256, size_bytes, imported_at, body)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (account_slug, sha256) DO NOTHING RETURNING seq`,
+		ON CONFLICT (account_slug, format, sha256) DO NOTHING RETURNING seq`,
 		f.AccountSlug, f.Format, f.FileName, sum[:], len(body), f.ImportedAt, body).Scan(&seq)
 	if err == nil {
 		return seq, false, nil
@@ -153,8 +154,8 @@ func InsertImportFile(ctx context.Context, q DBTX, f ImportFile) (seq int64, exi
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, fmt.Errorf("store: insert import file: %w", err)
 	}
-	if err := q.QueryRow(ctx, `SELECT seq FROM raw.import_file WHERE account_slug = $1 AND sha256 = $2`,
-		f.AccountSlug, sum[:]).Scan(&seq); err != nil {
+	if err := q.QueryRow(ctx, `SELECT seq FROM raw.import_file WHERE account_slug = $1 AND format = $2 AND sha256 = $3`,
+		f.AccountSlug, f.Format, sum[:]).Scan(&seq); err != nil {
 		return 0, false, fmt.Errorf("store: find existing import file: %w", err)
 	}
 	return seq, true, nil
@@ -171,12 +172,19 @@ func InsertOperatorEntry(ctx context.Context, q DBTX, e OperatorEntry) (int64, e
 	return seq, nil
 }
 
-// APIResponseExists reports whether a response with this endpoint, fetch time and body SHA-256 is
-// already stored, which makes loading a capture idempotent.
-func APIResponseExists(ctx context.Context, q DBTX, endpoint string, fetchedAt time.Time, bodySHA256 []byte) (bool, error) {
+// APIResponseExists reports whether a response with this endpoint, request parameters, fetch time
+// and body SHA-256 is already stored, which makes loading a capture idempotent. params is
+// compared as jsonb, so key order and spacing do not matter; nil means {}, as InsertAPIResponse
+// stores it. The parameters keep apart two accounts' responses with the same bytes at the same
+// instant.
+func APIResponseExists(ctx context.Context, q DBTX, endpoint string, params json.RawMessage, fetchedAt time.Time, bodySHA256 []byte) (bool, error) {
+	if params == nil {
+		params = json.RawMessage(`{}`)
+	}
 	var ok bool
 	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM raw.api_response
-		WHERE endpoint = $1 AND fetched_at = $2 AND body_sha256 = $3)`, endpoint, fetchedAt, bodySHA256).Scan(&ok)
+		WHERE endpoint = $1 AND fetched_at = $2 AND body_sha256 = $3 AND params = $4::jsonb)`,
+		endpoint, fetchedAt, bodySHA256, string(params)).Scan(&ok)
 	if err != nil {
 		return false, fmt.Errorf("store: look up api response: %w", err)
 	}

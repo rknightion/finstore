@@ -40,7 +40,9 @@ CREATE TABLE raw.import_file (
   size_bytes    int NOT NULL,
   imported_at   timestamptz NOT NULL,
   body          bytea NOT NULL,
-  UNIQUE (account_slug, sha256));
+  -- The format is part of the key, so a file refused under the wrong --format can still be
+  -- imported under the right one.
+  UNIQUE (account_slug, format, sha256));
 
 CREATE TABLE raw.operator_entry (
   seq           bigint PRIMARY KEY DEFAULT nextval('raw.seq'),

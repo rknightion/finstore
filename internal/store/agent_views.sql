@@ -28,8 +28,8 @@ JOIN core.account a ON a.id = b.account_id;
 
 -- coverage: one row per account. A gap is a run of days (from and to inclusive) that nothing
 -- covers. For an API account the days are its lifetime minus the days touched by the periods of
--- its completed fetches; the part of that inside an unfinished backfill window is reported as the
--- window closing. The lifetime runs from opened_on (else the first covered day) to yesterday for
+-- its completed fetches and of its completed backfill windows; the part of that inside an
+-- unfinished backfill window is reported as the window closing. The lifetime runs from opened_on (else the first covered day) to yesterday for
 -- an open account, or to the last covered day for a closed one. Today is never a gap, so the time
 -- between the last hourly fetch and now is not reported. Pots and balances-only accounts have no
 -- transaction gaps. For a file account the gaps are core.file_gap (from is the last date of the
@@ -54,6 +54,16 @@ fetch_days AS (
   JOIN raw.fetch_complete fc ON fc.fetch_id = f.id
   JOIN core.account a ON a.source = f.source AND a.source_key = f.account_key
   WHERE f.period_start IS NOT NULL AND f.period_end > f.period_start
+  UNION ALL
+  -- A completed full-history range is covered even when it took more than one fetch to finish
+  -- (a resumed fetch completes only the part it listed). Its last slot may end in the future, so
+  -- it covers no further than the moment it was completed.
+  SELECT a.id,
+         (w.period_start AT TIME ZONE 'Europe/London')::date,
+         ((least(w.period_end, w.completed_at) - interval '1 microsecond') AT TIME ZONE 'Europe/London')::date
+  FROM sync.backfill_window w
+  JOIN core.account a ON a.feed = 'api' AND a.source_key = w.account_key
+  WHERE w.completed_at IS NOT NULL AND least(w.period_end, w.completed_at) > w.period_start
 ),
 covered AS (
   SELECT account_id,
@@ -93,13 +103,18 @@ api_uncovered AS (
          END AS uncovered
   FROM api_life
 ),
-latest_statement AS (
-  SELECT a.id AS account_id,
+-- The date the newest statement of every file account ends: its newest transaction date or
+-- balance snapshot date. latest_statement is the subset the import-due rule applies to.
+file_latest AS (
+  SELECT a.id AS account_id, a.expects_imports,
          greatest((SELECT max(t.txn_date) FROM core.transaction t
                    WHERE t.account_id = a.id AND t.disappeared_at IS NULL),
                   (SELECT max(b.on_date) FROM core.balance_snapshot b WHERE b.account_id = a.id)) AS d
   FROM core.account a
-  WHERE a.feed = 'file' AND a.expects_imports
+  WHERE a.feed = 'file'
+),
+latest_statement AS (
+  SELECT account_id, d FROM file_latest WHERE expects_imports
 ),
 gap_rows AS (
   SELECT u.account_id, lower(g) AS from_date,
@@ -140,11 +155,13 @@ SELECT a.slug AS account_slug,
        END AS reconciliation_state,
        coalesce(r.reconciled_through, (r.last_pass_at AT TIME ZONE 'Europe/London')::date) AS reconciled_through,
        r.last_diff_minor,
-       coalesce(g.gaps, '[]'::jsonb) AS gaps
+       coalesce(g.gaps, '[]'::jsonb) AS gaps,
+       fl.d AS latest_statement_date
 FROM core.account a
 LEFT JOIN txn ON txn.account_id = a.id
 LEFT JOIN core.reconciliation r ON r.account_id = a.id
-LEFT JOIN gaps g ON g.account_id = a.id;
+LEFT JOIN gaps g ON g.account_id = a.id
+LEFT JOIN file_latest fl ON fl.account_id = a.id;
 
 -- sync_status: one row per source seen in consents, runs or accounts. last_import_at is a JSON
 -- object from each file-fed account's slug to the time of its latest raw.import_file row (null

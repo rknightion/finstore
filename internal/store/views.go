@@ -47,6 +47,10 @@ type CoverageRow struct {
 	ReconciledThrough   *time.Time `json:"reconciled_through"`
 	LastDiffMinor       *int64     `json:"last_diff_minor"`
 	Gaps                []Gap      `json:"gaps"`
+	// LatestStatementDate is the date a file account's newest statement ends (its newest
+	// transaction or balance snapshot date), the date the import-due rule uses; nil for an API
+	// account and for a file account with no statement.
+	LatestStatementDate *time.Time `json:"latest_statement_date"`
 }
 
 // SyncStatusRow is a row of agent.sync_status.
@@ -64,7 +68,7 @@ type SyncStatusRow struct {
 // Coverage reads agent.coverage, ordered by account slug.
 func Coverage(ctx context.Context, q DBTX) ([]CoverageRow, error) {
 	rows, err := q.Query(ctx, `SELECT account_slug, feed, earliest_date, latest_date, transaction_count,
-		reconciliation_state, reconciled_through, last_diff_minor, gaps
+		reconciliation_state, reconciled_through, last_diff_minor, gaps, latest_statement_date
 		FROM agent.coverage ORDER BY account_slug`)
 	if err != nil {
 		return nil, fmt.Errorf("store: read coverage: %w", err)
@@ -73,7 +77,7 @@ func Coverage(ctx context.Context, q DBTX) ([]CoverageRow, error) {
 		var c CoverageRow
 		var gaps []byte
 		if err := r.Scan(&c.AccountSlug, &c.Feed, &c.EarliestDate, &c.LatestDate, &c.TransactionCount,
-			&c.ReconciliationState, &c.ReconciledThrough, &c.LastDiffMinor, &gaps); err != nil {
+			&c.ReconciliationState, &c.ReconciledThrough, &c.LastDiffMinor, &gaps, &c.LatestStatementDate); err != nil {
 			return c, err
 		}
 		var err error

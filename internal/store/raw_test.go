@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -148,6 +149,16 @@ func TestImportFileAndCaptureIdempotence(t *testing.T) {
 	if err != nil || !existed || seq2 != seq1 {
 		t.Fatalf("same bytes again: seq %d existed %v err %v; want seq %d existed", seq2, existed, err, seq1)
 	}
+	// The same bytes under another format are a new row (a file refused under the wrong format
+	// can be imported under the right one); under that format again, the same row.
+	f.Format = "manual-csv"
+	seq3, existed, err := store.InsertImportFile(ctx, q, f)
+	if err != nil || existed || seq3 == seq1 {
+		t.Fatalf("same bytes, other format: seq %d existed %v err %v", seq3, existed, err)
+	}
+	if seq4, existed, err := store.InsertImportFile(ctx, q, f); err != nil || !existed || seq4 != seq3 {
+		t.Fatalf("same bytes, same other format again: seq %d existed %v err %v; want seq %d", seq4, existed, err, seq3)
+	}
 	f.AccountSlug = "mortgage"
 	if _, existed, err := store.InsertImportFile(ctx, q, f); err != nil || existed {
 		t.Fatalf("same bytes for another account: existed %v err %v", existed, err)
@@ -159,21 +170,33 @@ func TestImportFileAndCaptureIdempotence(t *testing.T) {
 	}
 	body := []byte(`not json at all`)
 	sum := sha256.Sum256(body)
-	if ok, err := store.APIResponseExists(ctx, q, "/accounts", now, sum[:]); err != nil || ok {
+	if ok, err := store.APIResponseExists(ctx, q, "/accounts", nil, now, sum[:]); err != nil || ok {
 		t.Fatalf("before insert: exists %v err %v", ok, err)
 	}
 	if _, err := store.InsertAPIResponse(ctx, q, store.APIResponse{FetchID: fetchID, Source: "monzo", Endpoint: "/accounts",
 		Status: 502, ContentType: "text/html", FetchedAt: now, Body: body}); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := store.APIResponseExists(ctx, q, "/accounts", now, sum[:]); err != nil || !ok {
+	if ok, err := store.APIResponseExists(ctx, q, "/accounts", nil, now, sum[:]); err != nil || !ok {
 		t.Fatalf("after insert: exists %v err %v", ok, err)
 	}
-	if ok, _ := store.APIResponseExists(ctx, q, "/accounts", now.Add(time.Second), sum[:]); ok {
+	if ok, _ := store.APIResponseExists(ctx, q, "/accounts", nil, now.Add(time.Second), sum[:]); ok {
 		t.Fatal("a different fetch time matched")
 	}
+	// Two accounts' identical responses at the same instant differ only by their parameters.
+	paramsA, paramsB := json.RawMessage(`{"account_id": "acc_a"}`), json.RawMessage(`{"account_id":"acc_b"}`)
+	if _, err := store.InsertAPIResponse(ctx, q, store.APIResponse{FetchID: fetchID, Source: "monzo", Endpoint: "/balance",
+		Params: paramsA, Status: 200, ContentType: "application/json", FetchedAt: now, Body: body}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := store.APIResponseExists(ctx, q, "/balance", json.RawMessage(`{"account_id":"acc_a"}`), now, sum[:]); err != nil || !ok {
+		t.Fatalf("same params, other spacing: exists %v err %v", ok, err)
+	}
+	if ok, err := store.APIResponseExists(ctx, q, "/balance", paramsB, now, sum[:]); err != nil || ok {
+		t.Fatalf("another account's params matched: exists %v err %v", ok, err)
+	}
 	rs, err := store.APIResponsesForFetch(ctx, q, fetchID)
-	if err != nil || len(rs) != 1 || !bytes.Equal(rs[0].Body, body) || string(rs[0].Params) != "{}" {
+	if err != nil || len(rs) != 2 || !bytes.Equal(rs[0].Body, body) || string(rs[0].Params) != "{}" {
 		t.Fatalf("APIResponsesForFetch = %+v, %v", rs, err)
 	}
 }

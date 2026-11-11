@@ -62,6 +62,45 @@ func TestCoverageGaps(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A second API account whose first range took two fetches: the first was cut short and has no
+	// completion, the second resumed part-way and completed only what it listed, and the range's
+	// window is complete. Its last range ends in the future and was completed 8 days ago, so it
+	// covers no later than that; a completed fetch covers the last 3 days.
+	resumed := testAccount("monzo-resumed", "joint", "api")
+	resumed.Source, resumed.SourceKey = "monzo", "acc_2"
+	resumed.OpenedOn = ptr(day(today, -30))
+	if err := core.UpsertAccount(ctx, resumed); err != nil {
+		t.Fatal(err)
+	}
+	fetch2 := func(from, to time.Time, complete bool) {
+		t.Helper()
+		id, err := store.InsertFetch(ctx, q, store.Fetch{Source: "monzo", Kind: "backfill", AccountKey: ptr("acc_2"),
+			PeriodStart: &from, PeriodEnd: &to, RunID: runID, StartedAt: time.Now()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if complete {
+			if _, err := store.InsertFetchComplete(ctx, q, store.FetchComplete{FetchID: id, CompletedAt: time.Now(), Pages: 1}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	window := func(from, to, completedAt time.Time) {
+		t.Helper()
+		w, err := store.UpsertBackfillWindow(ctx, q, "acc_2", from, to)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.CompleteBackfillWindow(ctx, q, w.ID, completedAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fetch2(mid(-30), mid(-20), false)
+	fetch2(mid(-25), mid(-20), true)
+	window(mid(-30), mid(-20), time.Now())
+	window(mid(-20), mid(100), mid(-8))
+	fetch2(mid(-3), time.Now(), true)
+
 	// A pot, which only ever has balances.
 	pot := testAccount("monzo-pot", "pot", "api")
 	pot.Source, pot.SourceKey = "monzo", "pot_1"
@@ -103,7 +142,7 @@ func TestCoverageGaps(t *testing.T) {
 	for _, r := range rows {
 		bySlug[r.AccountSlug] = r
 	}
-	if len(bySlug) != 6 {
+	if len(bySlug) != 7 {
 		t.Fatalf("coverage has %d rows, want one per account: %+v", len(bySlug), rows)
 	}
 
@@ -124,6 +163,9 @@ func TestCoverageGaps(t *testing.T) {
 		{day(today, -20), day(today, -16), store.GapNoCompletedFetch},
 		{day(today, -15), day(today, -13), store.GapBackfillUnfinished},
 		{day(today, -12), day(today, -11), store.GapNoCompletedFetch},
+	})
+	checkGaps("monzo-resumed", []wantGap{
+		{day(today, -8), day(today, -4), store.GapNoCompletedFetch},
 	})
 	checkGaps("joint", []wantGap{
 		{day(today, -60), day(today, -50), store.GapNoFile},
@@ -149,6 +191,30 @@ func TestCoverageGaps(t *testing.T) {
 	j := bySlug["joint"]
 	if j.TransactionCount != 1 || j.LatestDate == nil || !j.LatestDate.Equal(day(today, -36)) || j.Feed != "file" {
 		t.Errorf("joint row %+v", j)
+	}
+
+	// latest_statement_date: every file account's newest statement date, whatever its type or
+	// flag, taking a balance snapshot newer than its newest transaction; null for API accounts.
+	if err := core.InsertBalanceSnapshot(ctx, store.BalanceSnapshot{AccountID: joint.ID, RawSeq: 98, Ordinal: 0,
+		OnDate: ptr(day(today, -30)), BalanceMinor: 0, Currency: "GBP"}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = store.Coverage(ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLatest := map[string]*time.Time{
+		"joint": ptr(day(today, -30)), "joint-recent": ptr(day(today, -35)), "shared": ptr(day(today, -40)),
+		"mortgage": ptr(day(today, -100)), "monzo-current": nil, "monzo-resumed": nil, "monzo-pot": nil,
+	}
+	for _, r := range rows {
+		w, ok := wantLatest[r.AccountSlug]
+		if !ok {
+			continue
+		}
+		if (w == nil) != (r.LatestStatementDate == nil) || (w != nil && !r.LatestStatementDate.Equal(*w)) {
+			t.Errorf("%s latest_statement_date = %v, want %v", r.AccountSlug, r.LatestStatementDate, w)
+		}
 	}
 }
 
