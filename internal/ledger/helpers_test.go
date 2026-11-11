@@ -16,6 +16,7 @@ import (
 
 	"github.com/rknightion/finstore/internal/importer"
 	"github.com/rknightion/finstore/internal/ledger"
+	"github.com/rknightion/finstore/internal/monzo"
 	"github.com/rknightion/finstore/internal/store"
 	"github.com/rknightion/finstore/internal/testpg"
 )
@@ -34,6 +35,15 @@ func wantTxnID(account uuid.UUID, source, key string) uuid.UUID {
 
 const fakeSource = "fake"
 
+// otherSource is a second source of the fake shape, for records one source sends about another
+// source's account. lloydsSource reads the fake shape under the TrueLayer Lloyds source name, so
+// the ledger gives its accounts the lloyds slug prefix and the running_balance method; nothing
+// here is a TrueLayer response.
+const (
+	otherSource  = "fake-other"
+	lloydsSource = "truelayer:ob-lloyds"
+)
+
 // The fake source's made-up response shape: one JSON object that may list accounts,
 // transactions and balances.
 type fAcc struct {
@@ -44,6 +54,7 @@ type fAcc struct {
 	Closed   bool   `json:"closed,omitempty"`
 	Currency string `json:"currency,omitempty"`
 	Name     string `json:"name,omitempty"`
+	BankRef  string `json:"bank_ref,omitempty"`
 }
 
 type fTxn struct {
@@ -53,6 +64,43 @@ type fTxn struct {
 	Created     string `json:"created"` // RFC 3339
 	Status      string `json:"status,omitempty"`
 	Description string `json:"description,omitempty"`
+	// RunningBalance is the balance after the row, in decimal pounds as TrueLayer gives it.
+	RunningBalance *fRunning `json:"running_balance,omitempty"`
+}
+
+type fRunning struct {
+	Amount   json.Number `json:"amount"`
+	Currency string      `json:"currency"`
+}
+
+// fSO and fDD are made-up mandates. ID stands for a bank's per-call id: it is kept in the content
+// and left out of the hash input, as a real normaliser must.
+type fSO struct {
+	ID          string `json:"id,omitempty"`
+	BankRef     string `json:"bank_ref"`
+	Key         string `json:"key"`
+	Payee       string `json:"payee"`
+	Reference   string `json:"reference,omitempty"`
+	Frequency   string `json:"frequency,omitempty"`
+	First       string `json:"first,omitempty"` // YYYY-MM-DD
+	FirstAmount int64  `json:"first_amount,omitempty"`
+	Next        string `json:"next,omitempty"`
+	NextAmount  int64  `json:"next_amount,omitempty"`
+}
+
+type fDD struct {
+	ID       string `json:"id,omitempty"`
+	BankRef  string `json:"bank_ref"`
+	Key      string `json:"key"`
+	Name     string `json:"name"`
+	Status   string `json:"status,omitempty"`
+	Previous string `json:"previous,omitempty"`
+	Amount   int64  `json:"amount,omitempty"`
+}
+
+type fList struct {
+	Kind    string `json:"kind"`
+	BankRef string `json:"bank_ref"`
 }
 
 type fBal struct {
@@ -64,6 +112,9 @@ type fBody struct {
 	Accounts     []fAcc            `json:"accounts,omitempty"`
 	Transactions []json.RawMessage `json:"transactions,omitempty"`
 	Balances     []fBal            `json:"balances,omitempty"`
+	SOs          []fSO             `json:"standing_orders,omitempty"`
+	DDs          []fDD             `json:"direct_debits,omitempty"`
+	Lists        []fList           `json:"lists,omitempty"`
 }
 
 // fakeNormaliser reads the fake shape. It ignores non-2xx responses and errors on a body that is
@@ -81,7 +132,7 @@ func (fakeNormaliser) NormaliseResponse(r ledger.Response, loc *time.Location) (
 	var res ledger.Result
 	for _, a := range b.Accounts {
 		rec := ledger.AccountRec{SourceKey: a.ID, Type: a.Type, Currency: "GBP", Name: "made-up " + a.Type,
-			ParentSourceKey: a.Parent, Closed: a.Closed}
+			ParentSourceKey: a.Parent, Closed: a.Closed, BankRef: a.BankRef}
 		if a.Currency != "" {
 			rec.Currency = a.Currency
 		}
@@ -120,6 +171,52 @@ func (fakeNormaliser) NormaliseResponse(r ledger.Response, loc *time.Location) (
 	for _, bal := range b.Balances {
 		res.Balances = append(res.Balances, ledger.BalanceRec{AccountSourceKey: bal.Account,
 			BalanceMinor: bal.Balance, Currency: "GBP", At: r.FetchedAt})
+	}
+	day := func(s string) (time.Time, error) {
+		if s == "" {
+			return time.Time{}, nil
+		}
+		return time.Parse("2006-01-02", s)
+	}
+	amount := func(n int64) *int64 {
+		if n == 0 {
+			return nil
+		}
+		return &n
+	}
+	for _, so := range b.SOs {
+		content, _ := json.Marshal(so)
+		biz := so
+		biz.ID = ""
+		hash, _ := json.Marshal(biz)
+		first, err := day(so.First)
+		if err != nil {
+			return ledger.Result{}, err
+		}
+		next, err := day(so.Next)
+		if err != nil {
+			return ledger.Result{}, err
+		}
+		res.StandingOrders = append(res.StandingOrders, ledger.StandingOrderRec{BankRef: so.BankRef, MandateKey: so.Key,
+			Payee: so.Payee, Reference: so.Reference, Frequency: so.Frequency, FirstDate: first,
+			FirstAmountMinor: amount(so.FirstAmount), NextDate: next, NextAmountMinor: amount(so.NextAmount),
+			Currency: "GBP", Content: content, HashInput: hash})
+	}
+	for _, dd := range b.DDs {
+		content, _ := json.Marshal(dd)
+		biz := dd
+		biz.ID = ""
+		hash, _ := json.Marshal(biz)
+		prev, err := day(dd.Previous)
+		if err != nil {
+			return ledger.Result{}, err
+		}
+		res.DirectDebits = append(res.DirectDebits, ledger.DirectDebitRec{BankRef: dd.BankRef, MandateKey: dd.Key,
+			Name: dd.Name, Status: dd.Status, PreviousDate: prev, PreviousAmountMinor: amount(dd.Amount),
+			Currency: "GBP", Content: content, HashInput: hash})
+	}
+	for _, l := range b.Lists {
+		res.MandateLists = append(res.MandateLists, ledger.MandateList{Kind: l.Kind, BankRef: l.BankRef})
 	}
 	return res, nil
 }
@@ -164,13 +261,23 @@ func newEnv(t *testing.T) *env {
 		clock: time.Date(2030, time.March, 1, 9, 0, 0, 0, time.UTC)}
 	e.app = openStore(t, testpg.UserURL(t, super, store.RoleApp))
 	e.owner = openStore(t, ownerURL)
+	e.l = e.ledger(true)
+	return e
+}
+
+// ledger builds the env's ledger over the fake shape (as fakeSource, lloydsSource and, when
+// withOther, otherSource), Monzo's own normaliser and both import formats.
+func (e *env) ledger(withOther bool) *ledger.Ledger {
 	files := map[string]ledger.FileNormaliser{
 		string(importer.FormatHalifaxPDF): importer.Normaliser{},
 		string(importer.FormatManualCSV):  importer.Normaliser{},
 	}
-	e.l = ledger.New(map[string]ledger.SourceNormaliser{fakeSource: fakeNormaliser{}}, files, time.UTC,
-		slog.New(slog.NewJSONHandler(e.logs, nil)))
-	return e
+	sources := map[string]ledger.SourceNormaliser{fakeSource: fakeNormaliser{}, lloydsSource: fakeNormaliser{},
+		"monzo": monzo.Normaliser{}}
+	if withOther {
+		sources[otherSource] = fakeNormaliser{}
+	}
+	return ledger.New(sources, files, time.UTC, slog.New(slog.NewJSONHandler(e.logs, nil)))
 }
 
 func openStore(t *testing.T, url string) *store.Store {
@@ -232,7 +339,13 @@ type period struct{ start, end time.Time }
 // fetch records the start of a fetch of the fake source.
 func (e *env) fetch(run int64, accountKey string, p *period) int64 {
 	e.t.Helper()
-	f := store.Fetch{Source: fakeSource, Kind: "hourly", RunID: run, StartedAt: e.tick()}
+	return e.fetchAs(fakeSource, run, accountKey, p)
+}
+
+// fetchAs records the start of a fetch of source.
+func (e *env) fetchAs(source string, run int64, accountKey string, p *period) int64 {
+	e.t.Helper()
+	f := store.Fetch{Source: source, Kind: "hourly", RunID: run, StartedAt: e.tick()}
 	if accountKey != "" {
 		f.AccountKey = &accountKey
 	}

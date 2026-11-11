@@ -43,7 +43,7 @@ monzo_object AS (
 )
 SELECT a.slug, a.source, a.type, a.feed, a.currency, a.name,
        p.slug AS parent_slug, a.opened_on, a.closed,
-       m.obj AS detail
+       m.obj AS detail, a.bank_ref, a.ended_on
 FROM core.account a
 LEFT JOIN core.account p ON p.id = a.parent_id
 LEFT JOIN monzo_object m
@@ -53,7 +53,8 @@ LEFT JOIN monzo_object m
 -- transactions: detail is the latest version's full source record (the Monzo transaction object,
 -- or a statement import's parsed row). pot_slug names the pot a Monzo pot transfer moved money to
 -- or from (the transaction's metadata.pot_id is a pot finstore holds), whatever its status, and is
--- null for every other transaction.
+-- null for every other transaction. An ended account's transactions dated after its ended_on are
+-- left out: the account that continues it holds those days.
 CREATE VIEW agent.transactions AS
 SELECT t.id, a.slug AS account_slug, t.txn_date, t.created_at, t.settled_at,
        t.amount_minor, t.currency, t.local_amount_minor, t.local_currency, t.status,
@@ -66,7 +67,7 @@ LEFT JOIN core.transaction_version v ON v.transaction_id = t.id AND v.version_no
 LEFT JOIN core.account pot
   ON t.source = 'monzo' AND pot.source = 'monzo' AND pot.type = 'pot'
  AND pot.source_key = v.content -> 'metadata' ->> 'pot_id'
-WHERE t.disappeared_at IS NULL;
+WHERE t.disappeared_at IS NULL AND (a.ended_on IS NULL OR t.txn_date <= a.ended_on);
 
 -- pot_transactions: one row per Monzo transaction that moved money into or out of a pot finstore
 -- holds, matched on the pot id in its metadata (not on the pot's parent: a joint account can pay
@@ -137,39 +138,47 @@ CREATE VIEW agent.transaction_history AS
 SELECT v.transaction_id, v.version_no, v.seen_at, v.content
 FROM core.transaction_version v;
 
+-- balances: an ended account's readings after its ended_on (by on_date, else the day of at) are
+-- left out.
 CREATE VIEW agent.balances AS
 SELECT a.slug AS account_slug, b.at, b.on_date, b.balance_minor, b.total_balance_minor, b.currency
 FROM core.balance_snapshot b
-JOIN core.account a ON a.id = b.account_id;
+JOIN core.account a ON a.id = b.account_id
+WHERE a.ended_on IS NULL
+   OR coalesce(b.on_date, (b.at AT TIME ZONE 'Europe/London')::date) <= a.ended_on;
 
 -- coverage: one row per account. A gap is a run of days (from and to inclusive) that nothing
 -- covers. For an API account the days are its lifetime minus the days touched by the periods of
--- its completed fetches and of its completed backfill windows; the part of that inside an
--- unfinished backfill window is reported as the window closing. The lifetime runs from opened_on (else the first covered day) to yesterday for
--- an open account, or to the last covered day for a closed one. Today is never a gap, so the time
--- between the last hourly fetch and now is not reported. Pots and balances-only accounts have no
--- transaction gaps. For a file account the gaps are core.file_gap (from is the last date of the
--- earlier file, to the first date of the later one) plus "import due" for an account that expects
--- imports, whatever its type, and whose latest statement date (its newest transaction date or
--- balance snapshot date) is more than 35 days old.
+-- its completed fetches (core.fetch_period, the instants each completed fetch proved complete)
+-- and of its completed backfill windows; the part of that inside an unfinished backfill window is
+-- reported as the window closing. The lifetime runs from opened_on (else the first covered day) to
+-- yesterday for an open account, or to the last covered day for a closed one, and to its
+-- ended_on at the latest. Today is never a gap, so the time between the last hourly fetch and now
+-- is not reported. Pots and balances-only accounts have no transaction gaps. For a file account
+-- the gaps are core.file_gap (from is the last date of the earlier file, to the first date of the
+-- later one) plus "import due" for an account that expects imports, whatever its type, has not
+-- ended, and whose latest statement date (its newest transaction date or balance snapshot date)
+-- is more than 35 days old. An ended account counts only its rows and readings up to ended_on.
+-- An account that shares its bank reference with an account of another source, neither ended, is
+-- a mismatch with a gap naming the other account. failed_on is a running_balance account's
+-- earliest day that does not add up.
 CREATE VIEW agent.coverage AS
 WITH today AS (
   SELECT (now() AT TIME ZONE 'Europe/London')::date AS d
 ),
 txn AS (
-  SELECT account_id, min(txn_date) AS earliest, max(txn_date) AS latest, count(*) AS n
-  FROM core.transaction
-  WHERE disappeared_at IS NULL
-  GROUP BY account_id
+  SELECT t.account_id, min(t.txn_date) AS earliest, max(t.txn_date) AS latest, count(*) AS n
+  FROM core.transaction t
+  JOIN core.account a ON a.id = t.account_id
+  WHERE t.disappeared_at IS NULL AND (a.ended_on IS NULL OR t.txn_date <= a.ended_on)
+  GROUP BY t.account_id
 ),
 fetch_days AS (
-  SELECT a.id AS account_id,
-         (f.period_start AT TIME ZONE 'Europe/London')::date AS first_day,
-         ((f.period_end - interval '1 microsecond') AT TIME ZONE 'Europe/London')::date AS last_day
-  FROM raw.fetch f
-  JOIN raw.fetch_complete fc ON fc.fetch_id = f.id
-  JOIN core.account a ON a.source = f.source AND a.source_key = f.account_key
-  WHERE f.period_start IS NOT NULL AND f.period_end > f.period_start
+  SELECT p.account_id,
+         (p.period_start AT TIME ZONE 'Europe/London')::date AS first_day,
+         ((p.period_end - interval '1 microsecond') AT TIME ZONE 'Europe/London')::date AS last_day
+  FROM core.fetch_period p
+  WHERE p.period_end > p.period_start
   UNION ALL
   -- A completed full-history range is covered even when it took more than one fetch to finish
   -- (a resumed fetch completes only the part it listed). Its last slot may end in the future, so
@@ -202,7 +211,7 @@ unfinished AS (
 api_life AS (
   SELECT a.id AS account_id,
          coalesce(a.opened_on, c.first_day) AS life_start,
-         CASE WHEN a.closed THEN c.last_day + 1 ELSE (SELECT d FROM today) END AS life_end,
+         least(CASE WHEN a.closed THEN c.last_day + 1 ELSE (SELECT d FROM today) END, a.ended_on + 1) AS life_end,
          coalesce(c.days, '{}'::datemultirange) AS covered,
          coalesce(u.days, '{}'::datemultirange) AS unfinished
   FROM core.account a
@@ -220,17 +229,27 @@ api_uncovered AS (
   FROM api_life
 ),
 -- The date the newest statement of every file account ends: its newest transaction date or
--- balance snapshot date. latest_statement is the subset the import-due rule applies to.
+-- balance snapshot date, up to its ended_on. latest_statement is the subset the import-due rule
+-- applies to.
 file_latest AS (
-  SELECT a.id AS account_id, a.expects_imports,
+  SELECT a.id AS account_id, a.expects_imports, a.ended_on,
          greatest((SELECT max(t.txn_date) FROM core.transaction t
-                   WHERE t.account_id = a.id AND t.disappeared_at IS NULL),
-                  (SELECT max(b.on_date) FROM core.balance_snapshot b WHERE b.account_id = a.id)) AS d
+                   WHERE t.account_id = a.id AND t.disappeared_at IS NULL
+                     AND (a.ended_on IS NULL OR t.txn_date <= a.ended_on)),
+                  (SELECT max(b.on_date) FROM core.balance_snapshot b
+                   WHERE b.account_id = a.id AND (a.ended_on IS NULL OR b.on_date <= a.ended_on))) AS d
   FROM core.account a
   WHERE a.feed = 'file'
 ),
 latest_statement AS (
-  SELECT account_id, d FROM file_latest WHERE expects_imports
+  SELECT account_id, d FROM file_latest WHERE expects_imports AND ended_on IS NULL
+),
+shared AS (
+  SELECT DISTINCT ON (a.id) a.id AS account_id, b.slug AS other_slug
+  FROM core.account a
+  JOIN core.account b ON b.bank_ref = a.bank_ref AND b.source <> a.source AND b.ended_on IS NULL
+  WHERE a.bank_ref IS NOT NULL AND a.ended_on IS NULL
+  ORDER BY a.id, b.slug
 ),
 gap_rows AS (
   SELECT u.account_id, lower(g) AS from_date,
@@ -252,6 +271,11 @@ gap_rows AS (
          jsonb_build_object('from', ls.d + 1, 'to', (SELECT d FROM today), 'reason', 'import due')
   FROM latest_statement ls
   WHERE ls.d IS NULL OR (SELECT d FROM today) - ls.d > 35
+  UNION ALL
+  SELECT s.account_id, NULL::date,
+         jsonb_build_object('from', NULL, 'to', (SELECT d FROM today),
+                            'reason', 'bank reference shared with ' || s.other_slug)
+  FROM shared s
 ),
 gaps AS (
   SELECT account_id, jsonb_agg(gap ORDER BY from_date NULLS FIRST) AS gaps
@@ -265,6 +289,7 @@ SELECT a.slug AS account_slug,
        coalesce(txn.n, 0) AS transaction_count,
        CASE
          WHEN a.type = 'pot' OR r.method = 'balances_only' THEN 'balances_only'
+         WHEN sh.account_id IS NOT NULL OR r.known_exception = 'shared_bank_ref' THEN 'mismatch'
          WHEN r.last_check_ok IS FALSE OR coalesce(r.break_count, 0) > 0 THEN 'mismatch'
          WHEN r.last_check_ok IS TRUE THEN 'reconciled'
          ELSE 'not_checked'
@@ -272,12 +297,14 @@ SELECT a.slug AS account_slug,
        coalesce(r.reconciled_through, (r.last_pass_at AT TIME ZONE 'Europe/London')::date) AS reconciled_through,
        r.last_diff_minor,
        coalesce(g.gaps, '[]'::jsonb) AS gaps,
-       fl.d AS latest_statement_date
+       fl.d AS latest_statement_date,
+       r.failed_on
 FROM core.account a
 LEFT JOIN txn ON txn.account_id = a.id
 LEFT JOIN core.reconciliation r ON r.account_id = a.id
 LEFT JOIN gaps g ON g.account_id = a.id
-LEFT JOIN file_latest fl ON fl.account_id = a.id;
+LEFT JOIN file_latest fl ON fl.account_id = a.id
+LEFT JOIN shared sh ON sh.account_id = a.id;
 
 -- sync_status: one row per source seen in consents, runs or accounts. last_import_at is a JSON
 -- object from each file-fed account's slug to the time of its latest raw.import_file row (null
@@ -321,3 +348,28 @@ FROM sources s
 LEFT JOIN cur c ON c.source = s.source
 LEFT JOIN last_run lr ON lr.source = s.source
 LEFT JOIN imports i ON i.source = s.source;
+
+-- standing_orders and direct_debits: one row per mandate per account, as the bank last listed it.
+-- account_slug is null while no account holds the mandate's bank reference (an unresolved
+-- mandate). disappeared_at is set when a complete list of that kind for that account left it out
+-- (a cancelled mandate), and cleared if it comes back. Dates and amounts are as the bank gives
+-- them; detail is the latest version's full source record.
+CREATE VIEW agent.standing_orders AS
+SELECT s.id, a.slug AS account_slug, s.source, s.bank_ref, s.mandate_key,
+       s.payee, s.reference, s.frequency, s.status,
+       s.first_date, s.first_amount_minor, s.next_date, s.next_amount_minor,
+       s.final_date, s.final_amount_minor, s.currency,
+       s.version_count, s.first_seen_at, s.last_seen_at, s.disappeared_at,
+       v.content AS detail
+FROM core.standing_order s
+LEFT JOIN core.account a ON a.id = s.account_id
+LEFT JOIN core.standing_order_version v ON v.standing_order_id = s.id AND v.version_no = s.version_count;
+
+CREATE VIEW agent.direct_debits AS
+SELECT d.id, a.slug AS account_slug, d.source, d.bank_ref, d.mandate_key,
+       d.name, d.status, d.previous_date, d.previous_amount_minor, d.currency,
+       d.version_count, d.first_seen_at, d.last_seen_at, d.disappeared_at,
+       v.content AS detail
+FROM core.direct_debit d
+LEFT JOIN core.account a ON a.id = d.account_id
+LEFT JOIN core.direct_debit_version v ON v.direct_debit_id = d.id AND v.version_no = d.version_count;

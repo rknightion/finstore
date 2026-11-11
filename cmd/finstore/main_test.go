@@ -52,6 +52,25 @@ func TestAStrayArgumentIsRefused(t *testing.T) {
 	}
 }
 
+func TestAccountEndNeedsASlugAndExactlyOneOfLastDateAndClear(t *testing.T) {
+	for _, args := range [][]string{
+		{"account", "end", "--last-date", "2024-08-21"},
+		{"account", "end", "--slug", "bank-joint"},
+		{"account", "end", "--slug", "bank-joint", "--last-date", "2024-08-21", "--clear"},
+		{"account", "end", "--slug", "bank-joint", "--last-date", "21/08/2024"},
+	} {
+		code, _, errOut := runWith(t, nil, args...)
+		if code != exitUsage || !strings.Contains(errOut, "finstore account end") {
+			t.Errorf("%v: code %d, stderr %q", args, code, errOut)
+		}
+	}
+	// A well-formed command goes on to need the database.
+	code, _, errOut := runWith(t, nil, "account", "end", "--slug", "bank-joint", "--clear")
+	if code != 1 || !strings.Contains(errOut, "FINSTORE_DATABASE_URL") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+}
+
 func TestImportNeedsAccountAndFormat(t *testing.T) {
 	code, _, errOut := runWith(t, nil, "import", "--account", "a")
 	if code != exitUsage || !strings.Contains(errOut, "--format") {

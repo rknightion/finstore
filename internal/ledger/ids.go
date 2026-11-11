@@ -27,3 +27,10 @@ func AccountID(source, sourceKey string) uuid.UUID {
 func TransactionID(accountID uuid.UUID, source, sourceKey string) uuid.UUID {
 	return uuid.NewSHA1(namespace, []byte(accountID.String()+sep+source+sep+sourceKey))
 }
+
+// MandateID is the core id of a standing order or direct debit: UUID version 5 of source +
+// U+001F + bank reference + U+001F + kind (MandateStandingOrder or MandateDirectDebit) + U+001F +
+// mandate key.
+func MandateID(source, bankRef, kind, mandateKey string) uuid.UUID {
+	return uuid.NewSHA1(namespace, []byte(source+sep+bankRef+sep+kind+sep+mandateKey))
+}

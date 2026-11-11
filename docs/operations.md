@@ -122,8 +122,8 @@ Every command exits 1 for any other failure, such as a database it cannot reach,
 command line it cannot understand.
 
 The first PDF statement imported into an account ties the account to that statement's sort code
-and account number. A later statement with different numbers is rejected, so a statement cannot
-land in the wrong account by a slip of `--account`.
+and account number, its bank reference. A later statement with different numbers is rejected, so a
+statement cannot land in the wrong account by a slip of `--account`.
 
 A file rejected because the reader misread it is not lost: the bytes are stored. Once the reader
 is corrected, `finstore renormalise` reads every stored file again.
@@ -150,6 +150,37 @@ shown in the coverage view until the missing statement arrives. For PDF statemen
 in the printed periods or in the balance. For `manual-csv` only the balance can show it, so a
 skipped stretch in which money in equalled money out goes unnoticed.
 
+### Ending an account
+
+When another source takes over an account from a date (for example a bank API that continues an
+account until now fed by statements), end the old account at the last day it should hold:
+
+```sh
+docker exec finstore finstore account end --slug bank-joint --last-date 2024-08-21
+```
+
+The entry is kept in `raw` like any other operator entry, so a rebuild replays it. The ended
+account's transactions and balances after that date stay stored, but `agent.transactions`,
+`agent.balances` and `agent.coverage` leave them out, so the days the new account holds are never
+shown twice. Its statements that start after the date raise no continuity gap, it is never "import
+due", and `agent.accounts.ended_on` shows the date. Statements from before the date can still be
+imported into it.
+
+Running the command again with another date replaces the date. `--clear` in place of `--last-date`
+removes the end. Record the end before the new source first fetches the account, so the overlap
+never shows.
+
+### Bank references
+
+An account's bank reference is its sort code and account number, digits only, joined by a space
+(`112233 12345678`). A statement import sets it as above; Monzo's own account list sets it for the
+accounts Monzo gives numbers for (current, joint and business accounts). `agent.accounts.bank_ref`
+shows it.
+
+Two accounts from different sources may share a bank reference only while one of them has ended.
+Any other shared reference means one bank account is held twice: both accounts are reported as a
+mismatch in `agent.coverage`, with a gap naming the other account, until one of them is ended.
+
 ## Commands
 
 | Command | Database role | Behaviour |
@@ -158,6 +189,7 @@ skipped stretch in which money in equalled money out goes unnoticed.
 | `finstore migrate` | owner | Applies the migrations and the grants. Says so when a `renormalise` is required |
 | `finstore serve` | app | The HTTP server, the scheduler and the Monzo worker |
 | `finstore account add`, `finstore account list` | app | Create and list file-fed accounts |
+| `finstore account end --slug S --last-date YYYY-MM-DD`, `finstore account end --slug S --clear` | app | Ends an account at a date, or removes its end. See [Ending an account](#ending-an-account) |
 | `finstore account accept-difference --slug S --reason TEXT` | app | For an account an API feeds: records that its current balance difference is known and accepted, so it stops counting as a mismatch. A different difference later counts again. A statement-fed account is refused: its gaps close when the missing statement is imported |
 | `finstore import` | app | Imports one statement from standard input |
 | `finstore load-capture --dir PATH [--dir PATH]...` | app | Loads API responses captured before the service existed. Loading twice loads once, and a capture older than what is already held never replaces newer data |
@@ -203,7 +235,7 @@ Five schemas:
 | Schema | Holds | Kept how |
 |---|---|---|
 | `raw` | Every API response and every imported file, byte for byte, plus what the operator entered | Append-only. Never updated, never deleted from |
-| `core` | Accounts, transactions and every version of each, balances, the reconciliation state | Disposable: `renormalise` rebuilds it from `raw` |
+| `core` | Accounts, transactions, standing orders and direct debits and every version of each, balances, the periods each completed fetch covered, the reconciliation state | Disposable: `renormalise` rebuilds it from `raw` |
 | `sync` | Runs, the consent's history, connect attempts, the full-history fetch's progress | Durable |
 | `secret` | The bank tokens | Durable, and left out of dumps |
 | `agent` | Read-only views for whatever queries the data | Rebuilt with `core` |
@@ -248,6 +280,25 @@ leave out:
   status. It is null for every other transaction.
 
 These columns come after the others, so a query that reads columns by position is unaffected.
+`agent.accounts` also ends with `bank_ref` (see [Bank references](#bank-references)) and `ended_on`
+(see [Ending an account](#ending-an-account)).
+
+Standing orders and direct debits ("mandates") have a view each, with one row per mandate per
+account:
+
+- `agent.standing_orders`: the account, the source that reported it, its bank reference and key,
+  the payee, reference, frequency and status, the first, next and final payment dates and amounts
+  as the bank gives them, when it was first and last seen, `disappeared_at`, and the full source
+  record in `detail`.
+- `agent.direct_debits`: the same for a direct debit, with its name, status and the date and
+  amount of the previous payment.
+
+A mandate is keyed by the bank's mandate id where it gives one, otherwise by its name (a direct
+debit) or its payee, reference and frequency (a standing order), with `#2`, `#3` added to the key of
+identical ones (a `#` or `\` in the bank's own text is stored as `\#` or `\\`, so the two never clash). Editing a standing order's reference therefore shows as one mandate ending and
+another starting. A mandate the bank's latest complete list leaves out gets `disappeared_at` (it was
+cancelled), cleared if it comes back. A mandate whose bank reference no account holds yet has a null
+`account_slug` until a later fetch or a `renormalise` attaches it.
 
 Two views follow the money into and out of pots:
 
@@ -279,6 +330,14 @@ Two views follow the money into and out of pots:
   that a transaction arriving mid-fetch does not raise a false alarm.
 - **File-fed accounts**: each statement must pass its own checks to be imported at all, and each
   must start from the balance the previous one ended on.
+- **Accounts with a running balance on every row** (`running_balance`): each day's rows must add
+  up, from the previous day's closing balance, to one of that day's running balances. The rows of a
+  day carry no time, so only the day's total is checked. A day that does not add up is a mismatch,
+  and `agent.coverage.failed_on` names the earliest. The newest closing balance is also compared
+  with the bank's balance; because the two are read moments apart, a difference counts only when
+  the next reading shows the same one.
+- **Bank references**: two accounts from different sources with the same bank reference, neither
+  ended, are both a mismatch.
 - **Pots** have balances only; Monzo's API does not list a pot's own transactions. The transfers
   in and out of a pot are listed on the account they were made on, and `agent.pot_reconciliation`
   compares them with the pot's balance. That comparison is information, not a check: it raises no
@@ -329,6 +388,23 @@ with the new image. It rebuilds `core` from the real `raw` rows with the new cod
 difference without changing anything. No difference means the new code reads your history exactly
 as the old code did. A difference is either a fix you were expecting or a regression: read it before
 you go on. Then `migrate`, and `renormalise` if `migrate` asks for it.
+
+Stop the service (`docker compose stop finstore`) before either `renormalise`, so that nothing is
+written while the record is rebuilt.
+
+When the new image has another normaliser revision (`migrate` says a `renormalise` is required), the
+live record was built by the old code and may have another shape. `renormalise --verify` then does not
+bring it up to date first, and it cannot compare a reshaped table row by row: it reports the table
+as different, and any row the old service had not yet read as present only in the rebuilt copy.
+Before the swap, keep what you will want to compare afterwards:
+
+```sh
+docker compose run --rm finstore-admin coverage --json > coverage-before.json
+docker exec finstore-db psql -U postgres -d finstore -c '\copy core.reconciliation TO STDOUT CSV HEADER' > reconciliation-before.csv
+```
+
+After `renormalise`, run both again and compare: transaction counts, dates and reconciliation states
+should match apart from what the release notes say changed.
 
 ## Telemetry
 

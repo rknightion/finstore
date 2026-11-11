@@ -3,6 +3,7 @@ package ledger
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/rknightion/finstore/internal/store"
@@ -12,7 +13,8 @@ import (
 //
 // The file is rejected, with nothing written, when its account is unknown or fed by an API, its
 // format has no normaliser, the normaliser refuses it (the statement fails its own checks), or
-// it names a bank account (AccountRef) other than the one the account's earlier imports set.
+// it names a bank account (AccountRef) other than the one the account's earlier imports set (its
+// bank_ref).
 //
 // Otherwise its transactions are applied with source "import:<format>" (a row already stored from
 // an overlapping statement has the same key, so the same id and hash, and is not stored again),
@@ -43,15 +45,17 @@ func (a *applier) importFile(ctx context.Context, f *store.ImportFile) error {
 	if fr.FirstDate.IsZero() || fr.LastDate.IsZero() || fr.LastDate.Before(fr.FirstDate) {
 		return rejected("bad_result")
 	}
+	refSet := false
 	if fr.AccountRef != "" {
 		switch {
-		case acc.FileRef == nil:
+		case acc.BankRef == nil:
+			refSet = true
 			ref := fr.AccountRef
-			acc.FileRef = &ref
+			acc.BankRef = &ref
 			if err := a.core.UpsertAccount(ctx, acc); err != nil {
 				return err
 			}
-		case *acc.FileRef != fr.AccountRef:
+		case *acc.BankRef != fr.AccountRef:
 			return rejected("account_mismatch")
 		}
 	}
@@ -78,7 +82,14 @@ func (a *applier) importFile(ctx context.Context, f *store.ImportFile) error {
 		LastDate: fr.LastDate, OpeningMinor: fr.OpeningMinor, ClosingMinor: fr.ClosingMinor, ExactPeriod: fr.PeriodExact}); err != nil {
 		return err
 	}
-	return a.recomputeContinuity(ctx, acc, f.ImportedAt)
+	if err := a.recomputeContinuity(ctx, acc, f.ImportedAt); err != nil {
+		return err
+	}
+	if refSet {
+		// The account now has a bank reference another source's account may hold.
+		return a.checkSharedBankRefs(ctx)
+	}
+	return nil
 }
 
 // recomputeContinuity rebuilds the account's file gaps and file reconciliation state from all of
@@ -97,15 +108,29 @@ func (a *applier) importFile(ctx context.Context, f *store.ImportFile) error {
 //
 // break_count is the number of gaps. reconciled_through is the last date reached when there is
 // no gap, else the after_date of the earliest gap. The check fields follow the gaps:
-// last_check_at is the import time of the file being applied, last_check_ok whether there is no
-// gap, last_diff_minor the earliest gap's difference (0 with none), and last_pass_at moves to
-// last_check_at on a pass.
+// last_check_at is the time of the row being applied, last_check_ok whether there is no gap (and
+// no shared bank reference), last_diff_minor the earliest gap's difference (0 with none), and
+// last_pass_at moves to last_check_at on a pass.
+//
+// For an account with an end (ended_on), statements whose first date is after it are left out of
+// the walk and no gap is recorded whose later side is after it: the account that continues it
+// holds those days. An account with no statement left has no gap and no check.
 func (a *applier) recomputeContinuity(ctx context.Context, acc store.Account, at time.Time) error {
 	stmts, err := a.core.ListStatements(ctx, acc.ID)
 	if err != nil {
 		return err
 	}
-	gaps, through := continuity(stmts)
+	if acc.EndedOn != nil {
+		stmts = slices.DeleteFunc(stmts, func(s store.Statement) bool { return s.FirstDate.After(*acc.EndedOn) })
+	}
+	var gaps []store.FileGap
+	var through time.Time
+	if len(stmts) > 0 {
+		gaps, through = continuity(stmts)
+	}
+	if acc.EndedOn != nil {
+		gaps = slices.DeleteFunc(gaps, func(g store.FileGap) bool { return g.BeforeDate.After(*acc.EndedOn) })
+	}
 	if err := a.core.ReplaceFileGaps(ctx, acc.ID, gaps); err != nil {
 		return err
 	}
@@ -113,11 +138,18 @@ func (a *applier) recomputeContinuity(ctx context.Context, acc store.Account, at
 	if err != nil {
 		return err
 	}
+	if len(stmts) == 0 {
+		rec.BreakCount, rec.ReconciledThrough, rec.LastCheckOK, rec.LastDiffMinor, rec.LastCheckAt = 0, nil, nil, nil, nil
+		return a.core.PutReconciliation(ctx, rec)
+	}
+	if len(gaps) > 0 {
+		through = gaps[0].AfterDate
+	}
 	var diff int64
 	if len(gaps) > 0 {
 		diff = gaps[0].DiffMinor
 	}
-	ok := len(gaps) == 0
+	ok := len(gaps) == 0 && !sharedFlag(rec)
 	rec.BreakCount = len(gaps)
 	rec.ReconciledThrough = &through
 	rec.LastCheckAt = &at

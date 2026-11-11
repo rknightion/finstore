@@ -34,9 +34,11 @@ var ErrRenormaliseRequired = errors.New("store: core was built by another normal
 
 // Migrate connects as finstore_owner and, under the advisory lock MigrateLockKey: runs the goose
 // migrations for raw, sync and secret; creates core from the embedded DDL when core has no
-// tables; drops and recreates the agent views; applies the grants; and seeds
-// core.projection_state with last_seq 0 and normaliserRev when it is empty. When the stored
-// revision differs from normaliserRev it returns an error wrapping ErrRenormaliseRequired.
+// tables; seeds core.projection_state with last_seq 0 and normaliserRev when it is empty; and,
+// when the stored revision is normaliserRev, drops and recreates the agent views and applies the
+// grants. When the stored revision differs it leaves the views as they are (renormalise
+// recreates them with the new core), applies the grants to what exists, and returns an error
+// wrapping ErrRenormaliseRequired.
 func Migrate(ctx context.Context, ownerURL string, normaliserRev int) error {
 	cfg, err := pgx.ParseConfig(ownerURL)
 	if err != nil {
@@ -67,15 +69,25 @@ func Migrate(ctx context.Context, ownerURL string, normaliserRev int) error {
 				return err
 			}
 		}
-		if err := applyViewsAndGrants(ctx, tx); err != nil {
-			return err
-		}
 		if _, err := tx.Exec(ctx,
 			"INSERT INTO core.projection_state (only_row, last_seq, normaliser_rev) VALUES (true, 0, $1) ON CONFLICT DO NOTHING",
 			normaliserRev); err != nil {
 			return fmt.Errorf("store: migrate: seed projection state: %w", err)
 		}
-		return tx.QueryRow(ctx, "SELECT normaliser_rev FROM core.projection_state").Scan(&stored)
+		if err := tx.QueryRow(ctx, "SELECT normaliser_rev FROM core.projection_state").Scan(&stored); err != nil {
+			return err
+		}
+		// Core built by another revision may have another shape, which this binary's views do not
+		// fit: they are left as they are, and the renormalise swap recreates them on the new core.
+		if stored != normaliserRev {
+			// The grants still apply, to the objects that exist, so a table a migration added
+			// with the revision change is usable before the swap.
+			if _, err := tx.Exec(ctx, grantsSQL); err != nil {
+				return fmt.Errorf("store: apply grants: %w", err)
+			}
+			return nil
+		}
+		return applyViewsAndGrants(ctx, tx)
 	})
 	if err != nil {
 		return fmt.Errorf("store: migrate: %w", err)

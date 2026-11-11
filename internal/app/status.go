@@ -92,9 +92,10 @@ func (p *statusPublisher) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// An ended account is continued by another and is never import due.
 	expects := map[string]bool{}
 	for _, a := range accounts {
-		expects[a.Slug] = a.Feed != feedAPI && a.ExpectsImports
+		expects[a.Slug] = a.Feed != feedAPI && a.ExpectsImports && a.EndedOn == nil
 	}
 	for _, c := range coverage {
 		if c.ReconciliationState == store.StateBalancesOnly {

@@ -200,3 +200,50 @@ func TestImportFileAndCaptureIdempotence(t *testing.T) {
 		t.Fatalf("APIResponsesForFetch = %+v, %v", rs, err)
 	}
 }
+
+func TestCountCallsTodayCountsOneEndpointAndBankRefInTheLocalDay(t *testing.T) {
+	c := newCluster(t)
+	ctx := context.Background()
+	q := openStore(t, c.app).DB()
+	london, err := time.LoadLocation("Europe/London")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A summer day in London is 23:00 UTC the day before to 23:00 UTC that day.
+	dayStart := time.Date(2030, time.July, 10, 0, 0, 0, 0, london)
+	const src, txns = "truelayer:ob-lloyds", "/data/v1/accounts/{id}/transactions"
+	fetchID, err := store.InsertFetch(ctx, q, store.Fetch{Source: src, Kind: "sync", RunID: 1, StartedAt: dayStart})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := func(source, endpoint string, params string, status int, at time.Time) {
+		t.Helper()
+		if _, err := store.InsertAPIResponse(ctx, q, store.APIResponse{FetchID: fetchID, Source: source, Endpoint: endpoint,
+			Params: json.RawMessage(params), Status: status, ContentType: "application/json", FetchedAt: at,
+			Body: []byte(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ref := `{"account_id":"made-up-1","bank_ref":"112233 12345678"}`
+	call(src, txns, ref, 200, dayStart)                                // first instant of the day
+	call(src, txns, ref, 429, dayStart.Add(6*time.Hour))               // a refused call counts too
+	call(src, txns, ref, 200, dayStart.Add(24*time.Hour-time.Second))  // last second of the day
+	call(src, txns, ref, 200, dayStart.Add(-time.Second))              // the day before
+	call(src, txns, ref, 200, dayStart.Add(24*time.Hour))              // the day after
+	call(src, txns, `{"bank_ref":"112233 87654321"}`, 200, dayStart)   // another account
+	call(src, "/data/v1/accounts/{id}/balance", ref, 200, dayStart)    // another endpoint
+	call("truelayer:ob-monzo", txns, ref, 200, dayStart)               // another source
+	call(src, "/data/v1/accounts", `{}`, 200, dayStart.Add(time.Hour)) // no bank reference
+	call(src, "/data/v1/accounts", `{}`, 200, dayStart.Add(2*time.Hour))
+
+	day := time.Date(2030, time.July, 10, 15, 0, 0, 0, london)
+	if n, err := store.CountCallsToday(ctx, q, src, txns, "112233 12345678", day); err != nil || n != 3 {
+		t.Fatalf("transactions calls today = %d, %v; want 3", n, err)
+	}
+	if n, err := store.CountCallsToday(ctx, q, src, "/data/v1/accounts", "", day); err != nil || n != 2 {
+		t.Fatalf("account list calls today = %d, %v; want 2 (a call with no bank reference counts against none)", n, err)
+	}
+	if n, err := store.CountCallsToday(ctx, q, src, txns, "112233 12345678", day.AddDate(0, 0, 1)); err != nil || n != 1 {
+		t.Fatalf("transactions calls the next day = %d, %v; want 1", n, err)
+	}
+}

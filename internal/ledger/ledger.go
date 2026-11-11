@@ -91,14 +91,27 @@ var ErrZoneChanged = fmt.Errorf("ledger: the configured time zone differs from t
 	store.ErrRenormaliseRequired)
 
 // Renormalise rebuilds core from raw as the owner role. It first catches live core up (CatchUp on
-// store.SchemaCore), so that rows stored without a catch-up are not reported as differences; a
+// store.SchemaCore), so that rows stored without a catch-up are not reported as differences,
+// unless live core was built by another normaliser revision (its shape may differ); a
 // live core built with another time zone is left as it is, since it is about to be compared or
 // replaced. Then store.CreateCoreNext, CatchUp into core_next from zero, and either
 // store.SwapCore, or when verify is true store.DiffCore followed by store.DropCoreNext with the
 // differences returned and nothing swapped.
 func (l *Ledger) Renormalise(ctx context.Context, owner store.DBTX, verify bool) ([]store.CoreDiff, error) {
-	if _, err := l.CatchUp(ctx, owner, store.SchemaCore); err != nil && !errors.Is(err, ErrZoneChanged) {
-		return nil, fmt.Errorf("ledger: catch up live core: %w", err)
+	live, err := store.NewCore(owner, store.SchemaCore)
+	if err != nil {
+		return nil, err
+	}
+	ps, err := live.GetProjectionState(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("ledger: read live projection state: %w", err)
+	}
+	// A live core built by another revision may have another shape, which this code cannot write:
+	// it is left as it is, and verify reports its unprojected rows as only in core_next.
+	if ps.NormaliserRev == NormaliserRev {
+		if _, err := l.CatchUp(ctx, owner, store.SchemaCore); err != nil && !errors.Is(err, ErrZoneChanged) {
+			return nil, fmt.Errorf("ledger: catch up live core: %w", err)
+		}
 	}
 	if err := store.CreateCoreNext(ctx, owner, NormaliserRev); err != nil {
 		return nil, err
@@ -226,6 +239,11 @@ func (s *Stats) add(o Stats) {
 	s.TransactionsChanged += o.TransactionsChanged
 	s.Disappeared += o.Disappeared
 	s.Returned += o.Returned
+	s.MandatesCreated += o.MandatesCreated
+	s.MandatesChanged += o.MandatesChanged
+	s.MandatesUnresolved += o.MandatesUnresolved
+	s.MandatesDisappeared += o.MandatesDisappeared
+	s.MandatesReturned += o.MandatesReturned
 	s.FilesRejected += o.FilesRejected
 	s.Rejections = append(s.Rejections, o.Rejections...)
 }

@@ -448,6 +448,38 @@ func TestServiceEndToEnd(t *testing.T) {
 		t.Fatalf("latest stored balance %d, want the statement's closing balance %d", n, st.Closing)
 	}
 
+	// account end records an operator entry that hides the account's rows after the date; a
+	// second entry clears it. An unknown account is refused and records nothing.
+	endAt := func(slug string, last *time.Time) int {
+		code, _ := w.command(nil, func(ctx context.Context, e app.Env) int { return app.AccountEnd(ctx, e, slug, last) })
+		return code
+	}
+	lastDay := month.AddDate(0, 0, 7) // after day(2), before day(9) and day(20)
+	if code := endAt("bank-joint", &lastDay); code != app.ExitOK {
+		t.Fatalf("account end exit %d: %s", code, w.stderr.String())
+	}
+	if n := w.queryInt(`SELECT count(*) FROM raw.operator_entry WHERE kind = 'account_end'`); n != 1 {
+		t.Fatalf("%d account_end entries, want 1", n)
+	}
+	if got := w.coverage()["bank-joint"]; got.TransactionCount != 1 {
+		t.Fatalf("bank-joint after its end: %+v", got)
+	}
+	if n := w.queryInt(`SELECT count(*) FROM agent.transactions WHERE account_slug = 'bank-joint'`); n != 1 {
+		t.Fatalf("agent.transactions shows %d bank-joint rows after its end, want 1", n)
+	}
+	if code := endAt("no-such-account", &lastDay); code != app.ExitError {
+		t.Fatalf("account end of an unknown account: exit %d, want %d", code, app.ExitError)
+	}
+	if code := endAt("bank-joint", nil); code != app.ExitOK {
+		t.Fatalf("account end --clear exit %d: %s", code, w.stderr.String())
+	}
+	if n := w.queryInt(`SELECT count(*) FROM raw.operator_entry WHERE kind = 'account_end'`); n != 2 {
+		t.Fatalf("%d account_end entries, want 2", n)
+	}
+	if got := w.coverage()["bank-joint"]; got.TransactionCount != 3 {
+		t.Fatalf("bank-joint after its end was cleared: %+v", got)
+	}
+
 	// Rebuilding from the stored source data gives exactly the record the live path built.
 	if code, out := w.command(nil, func(ctx context.Context, e app.Env) int { return app.Renormalise(ctx, e, true) }); code != app.ExitOK {
 		t.Fatalf("renormalise --verify exit %d:\n%s\n%s", code, out, w.stderr.String())

@@ -35,6 +35,9 @@ type AccountRec struct {
 	// OpenedOn is the opening date at midnight UTC, or the zero time when unknown.
 	OpenedOn time.Time
 	Closed   bool
+	// BankRef is the account's bank reference (BankRef of its sort code and account number), or
+	// empty when the source gives none.
+	BankRef string
 }
 
 // TxnRec is one transaction as a source describes it at one moment.
@@ -82,11 +85,84 @@ type BalanceRec struct {
 	Currency          string
 }
 
+// Mandate kinds: the two kinds of instruction that move money out of an account on a schedule.
+const (
+	MandateStandingOrder = "standing_order"
+	MandateDirectDebit   = "direct_debit"
+)
+
+// StandingOrderRec is one standing order as a source describes it at one moment. Dates are
+// calendar days at midnight UTC, or the zero time when the bank gives none; amounts are in minor
+// units, or nil when the bank gives none.
+type StandingOrderRec struct {
+	// BankRef is the bank reference of the account the standing order is on. The ledger resolves
+	// it to an account: the fetching source's account with that source key, otherwise the one
+	// unended account of any source with that bank reference.
+	BankRef string
+	// MandateKey identifies the standing order within its source, bank reference and kind. Where
+	// the bank gives no id it is built from the payee, reference and frequency. Records of one
+	// Result that share a key are told apart by the ledger, which escapes every key ("\" to "\\",
+	// "#" to "\#") and appends "#2", "#3" ... to all but the first after ordering them by first
+	// payment date, then first amount.
+	MandateKey string
+
+	Payee            string
+	Reference        string
+	Frequency        string
+	Status           string
+	FirstDate        time.Time
+	FirstAmountMinor *int64
+	NextDate         time.Time
+	NextAmountMinor  *int64
+	FinalDate        time.Time
+	FinalAmountMinor *int64
+	Currency         string
+
+	// Content is the whole source object, stored with each version.
+	Content json.RawMessage
+	// HashInput is the canonical encoding of the business fields the version hash is computed
+	// over: never a bank's per-call id or a fetch time.
+	HashInput []byte
+}
+
+// DirectDebitRec is one direct debit as a source describes it at one moment. Dates and amounts
+// are as in StandingOrderRec.
+type DirectDebitRec struct {
+	// BankRef is resolved to an account as StandingOrderRec.BankRef is.
+	BankRef string
+	// MandateKey is the bank's mandate id where it gives one, otherwise the name. Records that
+	// share a key are told apart as StandingOrderRec.MandateKey says, ordered by previous payment
+	// date, then previous amount.
+	MandateKey string
+
+	Name                string
+	Status              string
+	PreviousDate        time.Time
+	PreviousAmountMinor *int64
+	Currency            string
+
+	Content   json.RawMessage
+	HashInput []byte
+}
+
+// MandateList says that a response was a complete list of one kind of mandate (MandateStandingOrder
+// or MandateDirectDebit) for the account with BankRef. A normaliser emits one for every successful
+// list response, empty or not; the ledger then marks that source's mandates of that kind and bank
+// reference that the Result does not carry as disappeared. A response that is not a successful
+// list carries no MandateList and so proves nothing.
+type MandateList struct {
+	Kind    string
+	BankRef string
+}
+
 // Result is everything one raw row yields.
 type Result struct {
-	Accounts []AccountRec
-	Txns     []TxnRec
-	Balances []BalanceRec
+	Accounts       []AccountRec
+	Txns           []TxnRec
+	Balances       []BalanceRec
+	StandingOrders []StandingOrderRec
+	DirectDebits   []DirectDebitRec
+	MandateLists   []MandateList
 }
 
 // Response is one stored bank response, as the normaliser sees it.
@@ -145,7 +221,7 @@ type FileNormaliser interface {
 // NormaliserRev is the revision of the normalising code. Bump it whenever a change to a
 // normaliser or to the core schema would give different core rows for the same raw rows; a
 // deployment must then run `finstore renormalise`.
-const NormaliserRev = 1
+const NormaliserRev = 2
 
 // Stats counts what one CatchUp did.
 type Stats struct {
@@ -156,6 +232,14 @@ type Stats struct {
 	TransactionsChanged int
 	Disappeared         int
 	Returned            int
+	MandatesCreated     int
+	MandatesChanged     int
+	// MandatesUnresolved counts the mandate records applied with no account found for their bank
+	// reference. Such a mandate is kept with no account until a later record, or a renormalise,
+	// resolves it.
+	MandatesUnresolved  int
+	MandatesDisappeared int
+	MandatesReturned    int
 	FilesRejected       int
 	// Rejections holds the fixed category of each rejected file, in raw seq order: one of
 	// unknown_account, api_account, unknown_format, check_failed, bad_result, account_mismatch,

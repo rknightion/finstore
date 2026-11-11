@@ -49,6 +49,7 @@ const (
 const (
 	entryAccountAdd       = "account_add"
 	entryAcceptDifference = "accept_difference"
+	entryAccountEnd       = "account_end"
 )
 
 const (
@@ -329,6 +330,48 @@ func AcceptDifference(ctx context.Context, e Env, slug, reason string) int {
 		return e.fail(err)
 	}
 	_, _ = fmt.Fprintf(e.Stdout, "account %s: a difference of %d minor units is recorded as accepted\n", slug, diff)
+	return ExitOK
+}
+
+// AccountEnd records that an account has no transactions after lastDate (a calendar day), or with
+// a nil lastDate clears its end, by writing an account_end operator entry and normalising it. The
+// account's rows and readings after the date stay stored but leave the agent views.
+func AccountEnd(ctx context.Context, e Env, slug string, lastDate *time.Time) int {
+	var last *string
+	if lastDate != nil {
+		d := lastDate.Format(time.DateOnly)
+		last = &d
+	}
+	payload, err := json.Marshal(ledger.AccountEnd{Slug: slug, LastDate: last})
+	if err != nil {
+		return e.fail(err)
+	}
+	err = withWriter(ctx, e, "account", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
+		core, err := store.NewCore(tx, store.SchemaCore)
+		if err != nil {
+			return err
+		}
+		if _, err := core.GetAccountBySlug(ctx, slug); errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("no account has the slug %q", slug)
+		} else if err != nil {
+			return err
+		}
+		if _, err := store.InsertOperatorEntry(ctx, tx, store.OperatorEntry{
+			Kind: entryAccountEnd, Payload: payload, EnteredAt: e.now(),
+		}); err != nil {
+			return err
+		}
+		_, err = l.CatchUp(ctx, tx, store.SchemaCore)
+		return err
+	})
+	if err != nil {
+		return e.fail(err)
+	}
+	if last == nil {
+		_, _ = fmt.Fprintf(e.Stdout, "account %s: end cleared\n", slug)
+	} else {
+		_, _ = fmt.Fprintf(e.Stdout, "account %s ends on %s: its later rows are left out of the agent views\n", slug, *last)
+	}
 	return ExitOK
 }
 
