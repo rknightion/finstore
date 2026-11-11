@@ -132,6 +132,9 @@ func TestRequire(t *testing.T) {
 		{"bootstrap", without(EnvSuperuserDatabaseURL), EnvSuperuserDatabaseURL},
 		{"bootstrap", without(EnvAppPassword), EnvAppPassword},
 		{"bootstrap", without(EnvOwnerPassword), EnvOwnerPassword},
+		// The MCP password is never required: empty leaves the finstore_mcp role NOLOGIN.
+		{"bootstrap", full, ""},
+		{"serve", full, ""},
 		{"bootstrap", without(EnvDatabaseURL, EnvOwnerDatabaseURL), ""},
 		{"import", without(EnvDatabaseURL), EnvDatabaseURL},
 		{"account", without(EnvDatabaseURL), EnvDatabaseURL},
@@ -173,6 +176,7 @@ func TestSecretsAreRedacted(t *testing.T) {
 		EnvSuperuserDatabaseURL:  "SECRET-MARKER-super",
 		EnvAppPassword:           "SECRET-MARKER-apppw",
 		EnvOwnerPassword:         "SECRET-MARKER-ownerpw",
+		EnvMCPPassword:           "SECRET-MARKER-mcppw",
 		EnvMonzoClientSecret:     "SECRET-MARKER-client",
 		EnvTrueLayerClientID:     "client-id-test",
 		EnvTrueLayerClientSecret: "SECRET-MARKER-truelayer",
@@ -195,6 +199,9 @@ func TestSecretsAreRedacted(t *testing.T) {
 		if strings.Contains(out, "SECRET-MARKER") {
 			t.Errorf("%s output leaks a secret: %s", name, out)
 		}
+	}
+	if !strings.Contains(c.String(), "mcp_password=[redacted]") || c.MCPPassword != "SECRET-MARKER-mcppw" {
+		t.Errorf("String does not say the MCP password is set: %s", c.String())
 	}
 	if !strings.Contains(c.String(), "truelayer_client_secret=[redacted]") {
 		t.Errorf("String does not say the TrueLayer secret is set: %s", c.String())

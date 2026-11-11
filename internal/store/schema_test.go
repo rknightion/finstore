@@ -30,9 +30,14 @@ func catalogSnapshot(t *testing.T, superURL string) string {
 	defer func() { _ = conn.Close(ctx) }()
 	var s string
 	err = conn.QueryRow(ctx, `SELECT string_agg(x, E'\n' ORDER BY x) FROM (
-		SELECT format('role %s super=%s login=%s createrole=%s createdb=%s password=%s',
-		              rolname, rolsuper, rolcanlogin, rolcreaterole, rolcreatedb, rolpassword IS NOT NULL)
-		FROM pg_authid WHERE rolname IN ('finstore_owner', 'finstore_app', 'finstore_agent')
+		SELECT format('role %s super=%s login=%s createrole=%s createdb=%s password=%s connlimit=%s replication=%s bypassrls=%s inherit=%s',
+		              rolname, rolsuper, rolcanlogin, rolcreaterole, rolcreatedb, rolpassword IS NOT NULL,
+		              rolconnlimit, rolreplication, rolbypassrls, rolinherit)
+		FROM pg_authid WHERE rolname IN ('finstore_owner', 'finstore_app', 'finstore_agent', 'finstore_mcp')
+		UNION ALL
+		SELECT format('setting role=%s database=%s %s', pg_get_userbyid(setrole), setdatabase,
+		              (SELECT string_agg(s, ',' ORDER BY s) FROM unnest(setconfig) s))
+		FROM pg_db_role_setting
 		UNION ALL
 		SELECT format('database acl=%s', datacl) FROM pg_database WHERE datname = current_database()
 		UNION ALL
@@ -106,6 +111,9 @@ func TestBootstrapAndMigrateAreIdempotent(t *testing.T) {
 		"role finstore_owner super=f login=t createrole=f createdb=f password=t",
 		"role finstore_app super=f login=t createrole=f createdb=f password=t",
 		"role finstore_agent super=f login=f createrole=f createdb=f password=f",
+		"role finstore_mcp super=f login=f createrole=f createdb=f password=f connlimit=4 replication=f bypassrls=f inherit=t",
+		"setting role=finstore_mcp database=0 default_transaction_read_only=on,idle_in_transaction_session_timeout=30s," +
+			"lock_timeout=2s,statement_timeout=15s,temp_file_limit=1GB",
 		"schema raw owner=finstore_owner", "schema core owner=finstore_owner", "schema sync owner=finstore_owner",
 		"schema secret owner=finstore_owner", "schema agent owner=finstore_owner",
 		"projection 0 1",
@@ -220,7 +228,7 @@ func durableTables(t *testing.T, conn *pgx.Conn) map[string][]string {
 }
 
 var agentViews = []string{"accounts", "transactions", "transaction_history", "balances", "coverage", "sync_status",
-	"pot_transactions", "pot_reconciliation", "standing_orders", "direct_debits", "pending_transactions"}
+	"pot_transactions", "pot_reconciliation", "standing_orders", "direct_debits", "pending_transactions", "identity"}
 
 // assertAgentBoundary checks that finstore_agent can read every agent view and no table.
 func assertAgentBoundary(t *testing.T, superURL string) {
@@ -318,5 +326,228 @@ func TestAppRoleCannotAlterSchemaOrRaw(t *testing.T) {
 	}
 	if _, err := store.Coverage(ctx, app); err != nil {
 		t.Fatalf("finstore_app Coverage: %v", err)
+	}
+}
+
+// mcpRole reads finstore_mcp's login flag and password verifier.
+func mcpRole(t *testing.T, superURL string) (login bool, verifier *string) {
+	t.Helper()
+	conn, err := pgx.Connect(context.Background(), superURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+	if err := conn.QueryRow(context.Background(),
+		"SELECT rolcanlogin, rolpassword FROM pg_authid WHERE rolname = $1", store.RoleMCP).Scan(&login, &verifier); err != nil {
+		t.Fatalf("read finstore_mcp: %v", err)
+	}
+	return login, verifier
+}
+
+func TestEnableMCPLoginWithAndWithoutAPasswordSurvivesBootstrap(t *testing.T) {
+	ctx := context.Background()
+	super := testpg.Start(t)
+	if err := store.Bootstrap(ctx, super, "owner-secret", "app-secret"); err != nil {
+		t.Fatal(err)
+	}
+	if login, pw := mcpRole(t, super); login || pw != nil {
+		t.Fatalf("after Bootstrap the role has login=%v password=%v, want NOLOGIN and none", login, pw != nil)
+	}
+	if _, err := pgx.Connect(ctx, testpg.UserURL(t, super, store.RoleMCP)); err == nil {
+		t.Fatal("finstore_mcp logged in before EnableMCPLogin")
+	}
+
+	// A password with every character that breaks naive quoting.
+	const password = `mcp'pass"; DROP ROLE finstore_app; --%L$1\`
+	if err := store.EnableMCPLogin(ctx, super, password); err != nil {
+		t.Fatalf("EnableMCPLogin: %v", err)
+	}
+	login, verifier := mcpRole(t, super)
+	if !login || verifier == nil || !scramMatches(t, *verifier, password) {
+		t.Fatalf("after EnableMCPLogin: login=%v, password set=%v, matching=%v", login, verifier != nil,
+			verifier != nil && scramMatches(t, *verifier, password))
+	}
+	conn, err := pgx.Connect(ctx, testpg.UserURL(t, super, store.RoleMCP))
+	if err != nil {
+		t.Fatalf("finstore_mcp cannot log in after EnableMCPLogin: %v", err)
+	}
+	_ = conn.Close(ctx)
+
+	// Bootstrap again, and again after Migrate: the login and the password stay.
+	if err := store.Bootstrap(ctx, super, "owner-secret", "app-secret"); err != nil {
+		t.Fatalf("second Bootstrap: %v", err)
+	}
+	if err := store.Migrate(ctx, testpg.UserURL(t, super, store.RoleOwner), testRev); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if err := store.Bootstrap(ctx, super, "owner-secret", "app-secret"); err != nil {
+		t.Fatalf("third Bootstrap: %v", err)
+	}
+	login2, verifier2 := mcpRole(t, super)
+	if !login2 || verifier2 == nil || *verifier2 != *verifier {
+		t.Fatalf("Bootstrap changed the MCP login: login=%v, password unchanged=%v", login2, verifier2 != nil && *verifier2 == *verifier)
+	}
+
+	// An empty password turns the login and the password off; EnableMCPLogin is repeatable.
+	for range 2 {
+		if err := store.EnableMCPLogin(ctx, super, ""); err != nil {
+			t.Fatalf("EnableMCPLogin with no password: %v", err)
+		}
+		if login, pw := mcpRole(t, super); login || pw != nil {
+			t.Fatalf("with no password: login=%v password=%v, want NOLOGIN and none", login, pw != nil)
+		}
+	}
+	if _, err := pgx.Connect(ctx, testpg.UserURL(t, super, store.RoleMCP)); err == nil {
+		t.Fatal("finstore_mcp logged in after EnableMCPLogin with no password")
+	}
+	if err := store.EnableMCPLogin(ctx, super, "another"); err != nil {
+		t.Fatal(err)
+	}
+	if login, pw := mcpRole(t, super); !login || pw == nil {
+		t.Fatalf("EnableMCPLogin did not turn the login back on: login=%v", login)
+	}
+}
+
+func TestEnableMCPLoginNeedsBootstrapFirst(t *testing.T) {
+	err := store.EnableMCPLogin(context.Background(), testpg.Start(t), "x")
+	if err == nil || !strings.Contains(err.Error(), store.RoleMCP) {
+		t.Fatalf("EnableMCPLogin before Bootstrap: want an error naming %s, got %v", store.RoleMCP, err)
+	}
+}
+
+// Bootstrap puts the role's fixed attributes right on every run, so a role someone loosened is
+// tightened again, while its login stays as it was.
+func TestBootstrapRestoresTheMCPRoleAttributes(t *testing.T) {
+	ctx := context.Background()
+	super := testpg.Start(t)
+	if err := store.Bootstrap(ctx, super, "o", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnableMCPLogin(ctx, super, "pw"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(ctx, testpg.UserURL(t, super, store.RoleOwner), testRev); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := pgx.Connect(ctx, super)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, `ALTER ROLE finstore_mcp CREATEDB CREATEROLE CONNECTION LIMIT 99`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `ALTER ROLE finstore_mcp RESET temp_file_limit`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Bootstrap(ctx, super, "o", "a"); err != nil {
+		t.Fatal(err)
+	}
+	want := "role finstore_mcp super=f login=t createrole=f createdb=f password=t connlimit=4 replication=f bypassrls=f inherit=t"
+	if snap := catalogSnapshot(t, super); !strings.Contains(snap, want) || !strings.Contains(snap, "temp_file_limit=1GB") {
+		t.Errorf("Bootstrap did not restore the role:\n%s", snap)
+	}
+}
+
+// A login as finstore_mcp can rewrite the role's own settings, role-wide and for the database (which
+// a role-wide setting does not override), and so remove its limits for the next session. Bootstrap
+// puts the role back on every run: the catalog is as it was, and a fresh session has the limits.
+func TestBootstrapRestoresSettingsTheMCPRoleChangedForItself(t *testing.T) {
+	ctx := context.Background()
+	super := testpg.Start(t)
+	if err := store.Bootstrap(ctx, super, "o", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnableMCPLogin(ctx, super, "pw"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(ctx, testpg.UserURL(t, super, store.RoleOwner), testRev); err != nil {
+		t.Fatal(err)
+	}
+	before := catalogSnapshot(t, super)
+	url := testpg.UserURL(t, super, store.RoleMCP)
+	show := func(setting string) string {
+		t.Helper()
+		conn, err := pgx.Connect(ctx, url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close(ctx) }()
+		var v string
+		if err := conn.QueryRow(ctx, "SELECT current_setting($1)", setting).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	wantDefaults := map[string]string{"statement_timeout": "15s", "lock_timeout": "2s",
+		"idle_in_transaction_session_timeout": "30s", "default_transaction_read_only": "on", "temp_file_limit": "1GB", "work_mem": "4MB"}
+	for k, want := range wantDefaults {
+		if got := show(k); got != want {
+			t.Fatalf("%s = %q before the tamper, want %q", k, got, want)
+		}
+	}
+
+	self, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = self.Close(ctx) }()
+	for _, stmt := range []string{
+		"SET default_transaction_read_only = off",
+		"ALTER ROLE finstore_mcp IN DATABASE " + testpg.Database + " SET statement_timeout = 0",
+		"ALTER ROLE finstore_mcp IN DATABASE " + testpg.Database + " SET default_transaction_read_only = off",
+		"ALTER ROLE finstore_mcp SET statement_timeout = 0",
+		"ALTER ROLE finstore_mcp SET work_mem = '1GB'",
+	} {
+		if _, err := self.Exec(ctx, stmt); err != nil {
+			t.Fatalf("the role could not change its own settings (%s): %v", stmt, err)
+		}
+	}
+	// The one it cannot.
+	_, err = self.Exec(ctx, "ALTER ROLE finstore_mcp SET temp_file_limit = '10GB'")
+	requireDenied(t, err, "ALTER ROLE ... SET temp_file_limit")
+	if got := show("statement_timeout"); got != "0" || show("default_transaction_read_only") != "off" {
+		t.Fatalf("the tamper did not reach a new session: statement_timeout=%q", got)
+	}
+
+	if err := store.Bootstrap(ctx, super, "o", "a"); err != nil {
+		t.Fatal(err)
+	}
+	for k, want := range wantDefaults {
+		if got := show(k); got != want {
+			t.Errorf("%s = %q after Bootstrap, want %q", k, got, want)
+		}
+	}
+	if after := catalogSnapshot(t, super); after != before {
+		t.Errorf("Bootstrap did not restore the catalog:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+// The grants name finstore_mcp, so a database whose role is missing cannot be migrated, and the
+// error says which role: bootstrap must run first.
+func TestMigrateFailsNamingTheMissingMCPRole(t *testing.T) {
+	ctx := context.Background()
+	super := testpg.Start(t)
+	if err := store.Bootstrap(ctx, super, "owner-secret", "app-secret"); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := pgx.Connect(ctx, super)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, "DROP ROLE finstore_mcp"); err != nil {
+		t.Fatal(err)
+	}
+	err = store.Migrate(ctx, testpg.UserURL(t, super, store.RoleOwner), testRev)
+	if err == nil || !strings.Contains(err.Error(), store.RoleMCP) {
+		t.Fatalf("Migrate without the role: want an error naming %s, got %v", store.RoleMCP, err)
+	}
+	// Bootstrap puts it back, and Migrate then works.
+	if err := store.Bootstrap(ctx, super, "owner-secret", "app-secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(ctx, testpg.UserURL(t, super, store.RoleOwner), testRev); err != nil {
+		t.Fatalf("Migrate after Bootstrap: %v", err)
 	}
 }

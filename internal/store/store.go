@@ -85,6 +85,8 @@ type OpenOption func(*openConfig)
 type openConfig struct {
 	tp trace.TracerProvider
 	mp metric.MeterProvider
+	// agentSQL is set by ForAgentSQL: the connections run SQL an agent wrote.
+	agentSQL bool
 }
 
 // WithTelemetry makes a store trace what it does: every query, connect and pool acquire becomes a
@@ -96,6 +98,16 @@ type openConfig struct {
 // a value; the span exporter's allow-list removes it (see internal/telemetry).
 func WithTelemetry(tp trace.TracerProvider, mp metric.MeterProvider) OpenOption {
 	return func(c *openConfig) { c.tp, c.mp = tp, mp }
+}
+
+// ForAgentSQL marks the connections of OpenReader as running SQL an agent wrote, so that SQL never
+// reaches telemetry: no span carries db.query.text, every database span is named
+// semconv.SpanMCPQuery whatever the statement (and so is its db.operation.name), and the query
+// duration metrics carry no operation name (otelpgx's default span name and metric operation name
+// are the statement's first word, which for a statement written without spaces is the whole
+// statement). It has an effect only together with WithTelemetry, and only on OpenReader.
+func ForAgentSQL() OpenOption {
+	return func(c *openConfig) { c.agentSQL = true }
 }
 
 func newOpenConfig(opts []OpenOption) openConfig {
@@ -125,6 +137,16 @@ func (c openConfig) providers() (trace.TracerProvider, metric.MeterProvider) {
 // statement.
 func (c openConfig) queryTracer() *otelpgx.Tracer {
 	tp, mp := c.providers()
+	if c.agentSQL {
+		// Agent SQL: nothing derived from the statement may leave. No statement attribute, a
+		// constant span name (which is also db.operation.name), no metric operation name.
+		return otelpgx.NewTracer(
+			otelpgx.WithTracerProvider(tp),
+			otelpgx.WithMeterProvider(mp),
+			otelpgx.WithDisableSQLStatementInAttributes(),
+			otelpgx.WithSpanNameFunc(func(string) string { return semconv.SpanMCPQuery }),
+		)
+	}
 	return otelpgx.NewTracer(
 		otelpgx.WithTracerProvider(tp),
 		otelpgx.WithMeterProvider(mp),

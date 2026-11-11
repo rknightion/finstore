@@ -191,6 +191,10 @@ const SpanBankCallPrefix = "bank "
 // SpanCommandPrefix starts the name of a CLI command's root span: "finstore account add".
 const SpanCommandPrefix = "finstore "
 
+// SpanMCPQuery names every database span of the MCP reader (store.ForAgentSQL): a constant, so the
+// text of an agent's query never becomes a span name.
+const SpanMCPQuery = "mcp.query"
+
 // Span attribute keys that are not finstore's own. The names follow the OpenTelemetry semantic
 // conventions; the ones libraries set are listed so the exporter allow-list can keep them.
 const (

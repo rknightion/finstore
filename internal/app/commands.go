@@ -194,6 +194,11 @@ func Bootstrap(ctx context.Context, e Env) int {
 	if err := store.Bootstrap(ctx, e.Cfg.SuperuserDatabaseURL, e.Cfg.OwnerPassword, e.Cfg.AppPassword); err != nil {
 		return e.fail(err)
 	}
+	// The MCP login follows FINSTORE_MCP_PASSWORD: set turns it on with that password, empty turns it
+	// off. No command requires the password.
+	if err := store.EnableMCPLogin(ctx, e.Cfg.SuperuserDatabaseURL, e.Cfg.MCPPassword); err != nil {
+		return e.fail(err)
+	}
 	_, _ = fmt.Fprintln(e.Stdout, "roles and schemas are in place")
 	return ExitOK
 }

@@ -23,3 +23,10 @@ $$;
 -- they read core, sync and raw with the owner's rights.
 GRANT USAGE ON SCHEMA agent TO finstore_agent;
 GRANT SELECT ON ALL TABLES IN SCHEMA agent TO finstore_agent;
+
+-- finstore_mcp: everything but secret, read only. The role's defaults make every transaction
+-- read only; it has no INSERT, UPDATE, DELETE, TRUNCATE or DDL right anywhere. secret is
+-- deliberately absent: never add it, and never grant on ALL SCHEMAS. The role must exist before
+-- this runs: bootstrap creates it, so bootstrap runs before migrate.
+GRANT USAGE ON SCHEMA agent, core, raw, sync TO finstore_mcp;
+GRANT SELECT ON ALL TABLES IN SCHEMA agent, core, raw, sync TO finstore_mcp;
