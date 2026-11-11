@@ -23,6 +23,7 @@ type Metrics struct {
 	importLast      metric.Int64Gauge
 	dumpLastSuccess metric.Int64Gauge
 	up              metric.Int64Gauge
+	unresolved      metric.Int64Gauge
 }
 
 // NewMetrics creates every instrument on meter.
@@ -56,6 +57,7 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 	gauge(&m.importLast, semconv.MetricImportLastTime, "s", "Unix time of the newest statement date imported")
 	gauge(&m.dumpLastSuccess, semconv.MetricDumpLastSuccessTime, "s", "Unix time of the last successful dump")
 	gauge(&m.up, semconv.MetricUp, "1", "1 while the service is running")
+	gauge(&m.unresolved, semconv.MetricMandatesUnresolved, "1", "Mandates whose account is not known")
 	if err != nil {
 		return nil, err
 	}
@@ -73,6 +75,26 @@ func (m *Metrics) SyncRun(ctx context.Context, source, kind, outcome string) {
 		attribute.String(semconv.AttrSource, source),
 		attribute.String(semconv.AttrKind, kind),
 		attribute.String(semconv.AttrOutcome, outcome)))
+}
+
+// SyncRunWithCategory counts a finished run as SyncRun does, adding its error category as
+// error_category when it has one, so runs that ended for one reason (rate_limited, say) can be
+// counted.
+func (m *Metrics) SyncRunWithCategory(ctx context.Context, source, kind, outcome, category string) {
+	attrs := []attribute.KeyValue{
+		attribute.String(semconv.AttrSource, source),
+		attribute.String(semconv.AttrKind, kind),
+		attribute.String(semconv.AttrOutcome, outcome),
+	}
+	if category != "" {
+		attrs = append(attrs, attribute.String(semconv.AttrErrorCategory, category))
+	}
+	m.syncRuns.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// MandatesUnresolved records how many of a source's mandates have no account.
+func (m *Metrics) MandatesUnresolved(ctx context.Context, source string, n int) {
+	m.unresolved.Record(ctx, int64(n), metric.WithAttributes(attribute.String(semconv.AttrSource, source)))
 }
 
 // BankRequest counts a request made to a bank.

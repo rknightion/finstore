@@ -26,6 +26,7 @@ const (
 	MetricImportLastTime         = "finstore.import.last.time"
 	MetricDumpLastSuccessTime    = "finstore.dump.last_success.time"
 	MetricUp                     = "finstore.up"
+	MetricMandatesUnresolved     = "finstore.mandates.unresolved"
 )
 
 // Metric attribute keys.
@@ -37,6 +38,9 @@ const (
 	AttrStatusClass = "status_class"
 	AttrState       = "state"
 	AttrAccount     = "account"
+	// AttrErrorCategory is a finished run's error category on finstore.sync.runs, present only
+	// when the run recorded one: a fixed category word, never text from a response.
+	AttrErrorCategory = "error_category"
 )
 
 // Log field keys.
