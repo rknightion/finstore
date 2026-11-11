@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>finstore</title>
+<style>{{.CSS}}</style>
+</head>
+<body>
+<h1>finstore</h1>
+<p class="note">Status at {{.Generated}} ({{.Zone}}). This page shows states, dates and counts only.</p>
+
+{{range .Sources}}
+<h2>Monzo connection</h2>
+<dl>
+<dt>Consent</dt><dd>{{.ConsentState}}</dd>
+<dt>Approved</dt><dd>{{.ApprovedAt}}</dd>
+<dt>Expected to end</dt><dd>{{.ExpiresAt}}</dd>
+<dt>Days left</dt><dd>{{.DaysToExpiry}}</dd>
+<dt>Last successful sync</dt><dd>{{.LastSyncOK}}</dd>
+<dt>Last run</dt><dd>{{.LastOutcome}}</dd>
+</dl>
+<form method="post" action="/connect/monzo">
+{{if .Connected}}
+<p class="warn">Reconnecting replaces the current connection as soon as you follow the link in
+Monzo's email, before you approve anything. After that link, approve the request in the Monzo app
+straight away: the full history can only be fetched in the first few minutes after the link.</p>
+<button type="submit">Reconnect Monzo</button>
+{{else}}
+<p class="warn">After you follow the link in Monzo's email, approve the request in the Monzo app
+straight away: the full history can only be fetched in the first few minutes after the link.</p>
+<button type="submit">Connect Monzo</button>
+{{end}}
+</form>
+{{end}}
+
+<h2>Accounts</h2>
+{{if .Accounts}}
+<table>
+<thead>
+<tr><th>Account</th><th>Feed</th><th>Earliest</th><th>Latest</th><th>Transactions</th><th>Check</th><th>Checked through</th><th>Last import</th><th>Gaps</th></tr>
+</thead>
+<tbody>
+{{range .Accounts}}
+<tr>
+<td>{{.Slug}}</td><td>{{.Feed}}</td><td>{{.Earliest}}</td><td>{{.Latest}}</td><td>{{.Transactions}}</td>
+<td>{{.State}}</td><td>{{.ReconciledThrough}}</td><td>{{.LastImport}}</td>
+<td>{{if .Gaps}}<ul>{{range .Gaps}}<li>{{.From}} to {{.To}}: {{.Reason}}</li>{{end}}</ul>{{else}}none{{end}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p>No accounts yet.</p>
+{{end}}
+</body>
+</html>
