@@ -19,5 +19,8 @@ FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266
 COPY --from=build /out/finstore /usr/local/bin/finstore
 USER 65532:65532
 EXPOSE 8080
+# The check covers the process and its database only. A stalled sync is an alert, not a restart.
+HEALTHCHECK --interval=30s --timeout=6s --start-period=20s --retries=3 \
+    CMD ["/usr/local/bin/finstore", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/finstore"]
 CMD ["serve"]

@@ -1,0 +1,4 @@
+# /etc/default/finstore-dump: the one file that holds a host's values for finstore-dump.sh.
+FINSTORE_DB_CONTAINER=finstore-db
+FINSTORE_DUMP_DIR=/srv/finstore/dumps
+FINSTORE_STATUS_DIR=/srv/finstore/data/status

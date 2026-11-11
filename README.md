@@ -4,7 +4,7 @@ A self-hosted datastore for your own bank data, built to be queried by tools and
 than looked at. It keeps what the bank sent, byte for byte, keeps every version of a transaction,
 and checks the stored transactions against the balances the bank reports.
 
-Status: early. The design is settled and the build is in progress.
+Status: early. It runs one person's deployment; expect rough edges and breaking changes.
 
 ## What it does
 
@@ -21,8 +21,25 @@ for personal use only.
 
 ## Running it
 
-See `docs/operations.md` once it exists. In short: a Postgres 18 database, one container, a Monzo
-OAuth client of your own, and a reverse proxy that puts single sign-on in front of the status page.
+`docs/operations.md` is the guide and `deploy/` is a working example. In short: a Postgres 18
+database, one container, a Monzo OAuth client of your own, and a reverse proxy that puts single
+sign-on in front of the status page. Nothing should be reachable from the public internet.
+
+```sh
+docker compose up -d finstore-db
+docker compose run --rm finstore-admin bootstrap
+docker compose run --rm finstore-admin migrate
+docker compose up -d finstore
+```
+
+Then open the status page and connect Monzo.
+
+## Reading the data
+
+Queries go through the `agent` schema: read-only views over accounts, transactions, every version
+of each transaction, balances, and a coverage view that says what is held for each account, whether
+it agrees with the bank's balance, and where the gaps are. The role `finstore_agent` can read those
+views and nothing else: not the raw payloads, not the tokens.
 
 ## Development
 

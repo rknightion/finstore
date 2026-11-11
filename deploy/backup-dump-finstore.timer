@@ -1,0 +1,11 @@
+[Unit]
+Description=Twice-daily pre-backup dump: finstore
+
+[Timer]
+# Set these ahead of your backup tool's schedule, so each dump is picked up by the next snapshot.
+OnCalendar=*-*-* 10:45:00
+OnCalendar=*-*-* 22:45:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

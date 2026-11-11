@@ -1,0 +1,8 @@
+[Unit]
+Description=Pre-backup dump: finstore
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/backup-dumps/finstore-dump.sh

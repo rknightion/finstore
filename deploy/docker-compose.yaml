@@ -1,0 +1,62 @@
+# An example deployment: the database, the service, and a one-off container for the owner commands.
+# Copy it, set your own host name and paths, and keep both env files at mode 600.
+name: finstore
+
+services:
+  finstore-db:
+    image: postgres:18.6@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+    container_name: finstore-db
+    restart: unless-stopped
+    env_file: ./owner.env # POSTGRES_PASSWORD
+    environment:
+      POSTGRES_DB: finstore
+    volumes:
+      # A bind mount, so the data directory is easy to leave out of a file-level backup: a copy of
+      # a running data directory is not a backup. The dump script is.
+      - ./data/pgdata:/var/lib/postgresql
+    # No ports: the database is reached only by the service and through `docker exec`.
+    networks: [default]
+    healthcheck:
+      # Over TCP on purpose: during the image's first start a temporary server answers on the
+      # socket before the real one listens on the network.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d finstore"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  finstore:
+    image: ghcr.io/rknightion/finstore:main
+    container_name: finstore
+    restart: unless-stopped
+    env_file: ./finstore.env
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      # Written by the dump script; the service only reports its time as a metric.
+      - ./data/status:/var/lib/finstore/status:ro
+    networks: [default]
+    # Put a reverse proxy that signs users in front of port 8080 and have it pass the signed-in
+    # address in the header named by FINSTORE_AUTH_HEADER. The path prefix /callback/ must reach
+    # the service without the sign-in, and nothing should be reachable from the public internet.
+    # docs/operations.md shows the two routes.
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      finstore-db:
+        condition: service_healthy
+
+  # docker compose run --rm finstore-admin bootstrap|migrate|renormalise
+  finstore-admin:
+    image: ghcr.io/rknightion/finstore:main
+    profiles: ["admin"]
+    env_file: [./finstore.env, ./owner.env]
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [default]
+    depends_on:
+      finstore-db:
+        condition: service_healthy
