@@ -85,15 +85,19 @@ const (
 	AttrStatusClass = "status_class"
 	AttrState       = "state"
 	AttrAccount     = "account"
-	// AttrResult is how an optional read ended: ok, unsupported, refused, rate_limited or failed.
+	// AttrResult is how an optional read ended: ok, unsupported, refused, rate_limited, failed or
+	// ResultSCARequired.
 	AttrResult = "result"
 	// AttrErrorCategory is a finished run's error category on finstore.sync.runs, present only
 	// when the run recorded one: a fixed category word, never text from a response.
 	AttrErrorCategory = "error_category"
 	// AttrReason is why a bank call was retried: rate_limited, server_error, timeout or network.
 	AttrReason = "reason"
-	// AttrJob is a scheduler job's registered name.
-	AttrJob = "job"
+	// AttrJob is a scheduler job's registered name, on the scheduler metrics. It is the same key as
+	// the span attribute SpanJob and is not called plain "job" on purpose: Grafana Cloud's OTLP
+	// gateway sets the Prometheus job label from the service, so a metric attribute named job is
+	// overwritten and every job reads as one series. finstore.job is queried as finstore_job.
+	AttrJob = SpanJob
 	// AttrHolder is who holds the writer lock; the values are fixed words chosen in code.
 	AttrHolder = "holder"
 	// AttrSignal is the telemetry signal an export carried: traces, metrics or logs.
@@ -102,6 +106,12 @@ const (
 	// from data.
 	AttrKey = "key"
 )
+
+// ResultSCARequired is the AttrResult of a TrueLayer mandate read, during a scheduled sync, that
+// the bank refused with 403 sca_exceeded: its answer is protected and readable only shortly after
+// the owner authenticates. It is expected on every scheduled sync of a bank that does this, and is
+// neither a failure nor a refusal of the consent.
+const ResultSCARequired = "sca_required"
 
 // StatusClassNoResponse is the status_class of a bank attempt with no usable HTTP response: none
 // arrived (a transport failure or a timeout), its body could not be read, or its status was

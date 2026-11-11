@@ -23,6 +23,19 @@ func finishedRun(t *testing.T, q store.DBTX, source, kind, outcome string, categ
 	}
 }
 
+// captureRun records an ok Monzo capture run that stored rows responses, finished at finished.
+func captureRun(t *testing.T, q store.DBTX, rows int, finished time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	id, err := store.StartRun(ctx, q, "monzo", "capture", finished.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishRun(ctx, q, id, store.RunResult{FinishedAt: finished, Outcome: "ok", Requests: rows, RowsSeen: rows}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // activeConsent makes a current active consent for source, approved at approved.
 func activeConsent(t *testing.T, q store.DBTX, source string, approved time.Time) int64 {
 	t.Helper()
@@ -182,6 +195,53 @@ func TestConsentHistoryNeedsAnOkFetchRunSinceApproval(t *testing.T) {
 	finishedRun(t, q, "monzo", "backfill", "ok", nil, approved.Add(4*time.Minute))
 	if got := read(); !got["monzo"] {
 		t.Fatalf("after an ok backfill since approval: %v", got)
+	}
+}
+
+// A capture run (load-capture, which loads a captured full history) that ended ok after the
+// consent's approval is the consent's history fetch, as a connect or a backfill is.
+func TestConsentHistoryCountsAnOkCaptureRunSinceApproval(t *testing.T) {
+	c := newCluster(t)
+	ctx := context.Background()
+	q := openStore(t, c.app).DB()
+	approved := time.Date(2030, 5, 1, 9, 0, 0, 0, time.UTC)
+	read := func() map[string]bool {
+		t.Helper()
+		rows, err := store.ConsentHistory(ctx, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]bool{}
+		for _, r := range rows {
+			out[r.Source] = r.OK
+		}
+		return out
+	}
+
+	// Monzo: a capture run from before the approval proves nothing, and neither does an hourly sync.
+	finishedRun(t, q, "monzo", "capture", "ok", nil, approved.Add(-time.Hour))
+	activeConsent(t, q, "monzo", approved)
+	finishedRun(t, q, "monzo", "hourly", "ok", nil, approved.Add(time.Hour))
+	// Another source's ok capture run is not Monzo's, and a capture that did not end ok is no history.
+	activeConsent(t, q, "truelayer:ob-lloyds", approved)
+	finishedRun(t, q, "truelayer:ob-lloyds", "capture", "partial", nil, approved.Add(time.Hour))
+	finishedRun(t, q, "truelayer:ob-monzo", "capture", "ok", nil, approved.Add(time.Hour))
+	if got := read(); len(got) != 2 || got["monzo"] || got["truelayer:ob-lloyds"] {
+		t.Fatalf("before an ok capture since approval: %v, want both false", got)
+	}
+
+	// A capture load that stored nothing (a reload of responses already held) is no history.
+	captureRun(t, q, 0, approved.Add(90*time.Minute))
+	if got := read(); got["monzo"] {
+		t.Fatalf("after a capture run that stored nothing: %v, want monzo false", got)
+	}
+
+	// The load-capture run that ends ok after the approval, having stored responses, makes Monzo's
+	// history whole.
+	captureRun(t, q, 801, approved.Add(2*time.Hour))
+	got := read()
+	if !got["monzo"] || got["truelayer:ob-lloyds"] {
+		t.Fatalf("after an ok capture since approval: %v, want monzo true and lloyds false", got)
 	}
 }
 

@@ -429,6 +429,15 @@ func isRefused(err error) bool {
 		(be.Status == http.StatusUnauthorized || be.Status == http.StatusForbidden || be.BankCode == "access_denied")
 }
 
+// isSCAExceeded reports whether a data call was refused with 403 and the bank code sca_exceeded: a
+// protected resource, readable only shortly after the owner authenticates, read too late. It is
+// no loss of the consent (isAccessDenied is false for it).
+func isSCAExceeded(err error) bool {
+	var be *bankhttp.Error
+	return errors.As(err, &be) && be.Path != bankhttp.TrueLayerAuthTokenPath &&
+		be.Status == http.StatusForbidden && be.BankCode == "sca_exceeded"
+}
+
 // isUnsupported reports whether the bank answered a data call by saying it does not offer the
 // endpoint: a 501, or the bank code endpoint_not_supported or not_supported.
 func isUnsupported(err error) bool {

@@ -230,6 +230,12 @@ type provider struct {
 	consentEnd time.Time
 	revoked    bool
 	expired    bool
+	// authAt is when the consent's code was exchanged, the PSU authentication SCA is measured from.
+	authAt time.Time
+	// sca, when set, makes the mandate reads answer 403 sca_exceeded once scaWindow has passed
+	// since authAt.
+	sca       bool
+	scaWindow time.Duration
 	// historyStart hides transactions before it, as a bank that holds a shorter history.
 	historyStart time.Time
 }
@@ -473,6 +479,24 @@ func (f *Fake) FailWith(providerID, template string, status int, code string, n 
 	f.mu.Unlock()
 }
 
+// SetSCAWindow makes a provider's standing orders and direct debits readable only for window after
+// the consent's code exchange, as a bank whose SCA exemption has expired: a read at or after that
+// moment answers 403 sca_exceeded, with a window of zero every read (a connect's too). Every other
+// path is unaffected. ClearSCAWindow undoes it.
+func (f *Fake) SetSCAWindow(providerID string, window time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := f.prov(providerID)
+	p.sca, p.scaWindow = true, window
+}
+
+// ClearSCAWindow makes a provider's mandate reads unrestricted again.
+func (f *Fake) ClearSCAWindow(providerID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.prov(providerID).sca = false
+}
+
 // FailMe makes the next n /data/v1/me calls to a provider answer 500.
 func (f *Fake) FailMe(providerID string, n int) {
 	f.mu.Lock()
@@ -538,6 +562,13 @@ type reply struct {
 
 func oauthErr(status int, code string) reply {
 	return reply{status: status, body: map[string]string{"error": code, "error_description": "synthetic error"}}
+}
+
+// scaExceeded is a bank's refusal of a protected resource read outside the window that follows the
+// owner's authentication: 403 with the error code sca_exceeded.
+func scaExceeded() reply {
+	return reply{status: http.StatusForbidden, body: map[string]string{"error": "sca_exceeded",
+		"error_description": "SCA exemption has expired. This resource is protected and should be accessed shortly after PSU Authentication."}}
 }
 
 // ServeHTTP implements http.Handler.
@@ -608,6 +639,10 @@ func (f *Fake) handle(r *http.Request) reply {
 		if !slices.Contains(p.granted(), need) {
 			return oauthErr(http.StatusForbidden, "access_denied")
 		}
+	}
+	if p.sca && !now.Before(p.authAt.Add(p.scaWindow)) &&
+		(template == "/data/v1/accounts/{id}/standing_orders" || template == "/data/v1/accounts/{id}/direct_debits") {
+		return scaExceeded()
 	}
 	var acct *account
 	var card *FakeCard
@@ -752,6 +787,7 @@ func (f *Fake) token(r *http.Request, now time.Time) reply {
 		p.generation++
 		p.revoked, p.expired = false, false
 		p.consentEnd = now.Add(f.consentLife).Truncate(time.Second)
+		p.authAt = now
 		f.seq++
 		p.refresh = fmt.Sprintf("refresh-test-%04d", f.seq)
 	case "refresh_token":

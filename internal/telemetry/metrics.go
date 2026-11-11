@@ -84,7 +84,7 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 	gauge(&m.lastRunOK, semconv.MetricSyncLastRunOK, "1", "1 when the newest finished run of a source and kind ended ok, 0 when it ended partial or failed")
 	gauge(&m.lastRunTime, semconv.MetricSyncLastRunTime, "s", "Unix time the newest finished run of a source and kind ended")
 	gauge(&m.lastRateLimited, semconv.MetricSyncLastRateLimitedTime, "s", "Unix time the newest rate-limited run of a source ended; absent for a source that never had one")
-	gauge(&m.historyOK, semconv.MetricConsentHistoryOK, "1", "1 when a connect or backfill run ended ok since the source's current consent was approved, 0 when none has")
+	gauge(&m.historyOK, semconv.MetricConsentHistoryOK, "1", "1 when a connect, backfill or capture run ended ok since the source's current consent was approved, 0 when none has")
 	gauge(&m.unanswered, semconv.MetricConnectUnanswered, "1", "Connect attempts of a source that expired unused in the last 24 hours")
 	if err == nil {
 		m.syncRunDuration, err = meter.Float64Histogram(semconv.MetricSyncRunDuration,
