@@ -20,10 +20,19 @@ import (
 // Job is one unit of scheduled work. It should return when ctx is done.
 type Job func(ctx context.Context) error
 
+// Observer watches each job run. Start is called as a run begins, with the context the job would
+// receive, and returns the context to give the job (it may carry a span) and a function the
+// scheduler calls once the run has ended, with its outcome: ok, error or panic. A job's panic is
+// recovered before that call, so finish always runs.
+type Observer interface {
+	Start(ctx context.Context, job string) (context.Context, func(outcome string))
+}
+
 // Scheduler runs jobs registered with Every and Daily once Run is called.
 type Scheduler struct {
 	now func() time.Time
 	log *slog.Logger
+	obs Observer
 
 	// Test seams: after waits d, and rnd returns a value in [0, n).
 	after func(time.Duration) <-chan time.Time
@@ -44,11 +53,13 @@ type task struct {
 	next  func(start, end time.Time) time.Duration
 }
 
-// New returns a Scheduler that reads the time from now and logs to log.
-func New(now func() time.Time, log *slog.Logger) *Scheduler {
+// New returns a Scheduler that reads the time from now and logs to log. A non-nil obs is told of
+// every job run; nil observes nothing.
+func New(now func() time.Time, log *slog.Logger, obs Observer) *Scheduler {
 	return &Scheduler{
 		now:   now,
 		log:   log,
+		obs:   obs,
 		after: time.After,
 		rnd:   rand.Int64N,
 	}
@@ -177,20 +188,68 @@ func (s *Scheduler) loop(ctx context.Context, t task) {
 }
 
 // runJob runs one job, recovering a panic and logging a failure by name and outcome only.
+//
+// A job that returns an error after ctx was cancelled is reported as cancelled, not as an error:
+// that is the service shutting down, and not a failure of the job. It is not logged as one.
 func (s *Scheduler) runJob(ctx context.Context, t task) {
-	outcome := "ok"
+	jobCtx, finish := s.observeStart(ctx, t.name)
+	outcome := semconv.JobOK
 	defer func() {
 		if r := recover(); r != nil {
-			outcome = "panic"
+			outcome = semconv.JobPanic
 		}
-		if outcome != "ok" {
-			s.log.LogAttrs(ctx, slog.LevelError, "scheduled job failed",
+		// The line is logged before the observer is told, so it is written inside the run's span.
+		if outcome == semconv.JobError || outcome == semconv.JobPanic {
+			s.log.LogAttrs(jobCtx, slog.LevelError, "scheduled job failed",
 				slog.String(semconv.LogKind, t.name), slog.String(semconv.LogOutcome, outcome))
 		}
+		s.observeFinish(jobCtx, t.name, finish, outcome)
 	}()
-	if err := t.job(ctx); err != nil {
-		outcome = "error"
+	if err := t.job(jobCtx); err != nil {
+		outcome = semconv.JobError
+		if ctx.Err() != nil {
+			outcome = semconv.JobCancelled
+		}
 	}
+}
+
+// observeStart tells the observer a run is starting. An observer that panics or returns nothing
+// usable is logged and ignored: telemetry must never stop a job or crash the service.
+func (s *Scheduler) observeStart(ctx context.Context, job string) (out context.Context, finish func(string)) {
+	out, finish = ctx, func(string) {}
+	if s.obs == nil {
+		return out, finish
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			out, finish = ctx, func(string) {}
+			s.observerFailed(ctx, job, "start")
+		}
+	}()
+	c, f := s.obs.Start(ctx, job)
+	if c != nil {
+		out = c
+	}
+	if f != nil {
+		finish = f
+	}
+	return out, finish
+}
+
+// observeFinish tells the observer how the run ended, surviving an observer that panics.
+func (s *Scheduler) observeFinish(ctx context.Context, job string, finish func(string), outcome string) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.observerFailed(ctx, job, "finish")
+		}
+	}()
+	finish(outcome)
+}
+
+// observerFailed logs that the observer panicked, by job and stage only: never the panic value.
+func (s *Scheduler) observerFailed(ctx context.Context, job, stage string) {
+	s.log.LogAttrs(ctx, slog.LevelError, "scheduler observer failed",
+		slog.String(semconv.LogKind, job), slog.String(semconv.LogState, stage))
 }
 
 // nextDaily returns the first start of hour:minute in loc that is after t.

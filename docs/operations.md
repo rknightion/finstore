@@ -577,6 +577,9 @@ metric value, a label or a log field; the log handler drops any field that is no
 | `finstore.dump.last_success.time` | none | Unix time from the dump status file |
 | `finstore.up` | none | 1, sent every minute |
 | `finstore.process.start.time` | none | Unix time `serve` started. The value changes at each start, so `changes()` over it counts restarts |
+| `finstore.scheduler.job.runs` (counter) | `job`, `outcome` | Scheduler job runs, by the job's registered name and outcome: `ok`, `error`, `panic` or `cancelled`. `cancelled` is a job that returned an error after `serve` was told to stop, such as a deploy interrupting a running sync; it is not a failure |
+| `finstore.scheduler.job.duration` (histogram) | `job` | Seconds one job run took, with buckets from 1 s to 1 hour |
+| `finstore.scheduler.job.last_ok` | `job` | 1 when the job's last run ended `ok`, 0 for `error` or `panic`. A `cancelled` run does not change it. It is held in the `serve` process, not read from the database, so after a restart it is absent until each job has run once. The `status` job runs every minute, so a failing `status` shows within a minute and every other finstore gauge is stale until it recovers |
 | `finstore.telemetry.export.failures` (counter) | `signal` | Exports that failed, by `traces`, `metrics` or `logs` |
 | `finstore.telemetry.span_attributes.dropped` (counter) | `key` | Span attributes the exporter allow-list removed, by key. A key here is a library that added an attribute; nothing leaked |
 | `http.server.request.duration` | OpenTelemetry HTTP server attributes, including `http.route` | Duration of every request except `GET /healthz`, in seconds, with buckets from 5 ms to 90 s |
@@ -603,6 +606,34 @@ answered (`GET /{$}`) and carrying `http.route`, the method, the status and the 
 query string or a header. A `traceparent` header on an incoming request becomes a link, never the
 parent; finstore sends none to a bank. Each command makes a root span named `finstore <command>`
 with `process.exit.code`; a non-zero exit marks it as an error.
+
+Besides the server span, `serve` makes these spans. None carries a code, a state, a query string or
+error text: only fixed words.
+
+| Span | When | Attributes |
+|---|---|---|
+| `connect` | A connect post (`POST /connect/...`) that passed the sign-in; a request answered 404 has its server span only | `finstore.source`, `finstore.connect.outcome` |
+| `callback` | A request to a callback route that reached its handler, for Monzo's route and for the TrueLayer route they share | `finstore.source`, `finstore.connect.outcome`, and `error.type` when the outcome is `failed` |
+| `scheduler.job` | Each scheduled job run: a new root span, never a child of anything | `finstore.job` (the job's registered name: `status`, `hourly`, `nightly` and one per TrueLayer connection and time of day), `finstore.job.outcome` (`ok`, `error`, `panic` or `cancelled`; only `error` and `panic` mark the span failed) |
+
+`finstore.connect.outcome` says how the request ended:
+
+| Outcome | HTTP status | Meaning |
+|---|---|---|
+| `started` | 200 | A connect post served the page that moves the browser on to the bank |
+| `cross_site` | 400 | A connect post that did not come from the status page |
+| `start_failed` | 500 | The attempt could not be started, or gave no usable bank link. The span is marked failed |
+| `exchanged` | 303 | The callback was accepted and the bank's code exchanged |
+| `invalid_link` | 400 | The callback had no `state` or no `code` |
+| `bank_declined` | 400 | The TrueLayer callback came back with the bank's `error` parameter |
+| `refused` | 400 | The `state` was unknown, expired, already used or issued for a source that does not use this callback |
+| `failed` | 502 or 503 | `error.type` is `exchange` (502, the exchange failed) or `attempt_read` (503, the attempt could not be read). The span is marked failed |
+
+`finstore.source` is the source the route belongs to. On the TrueLayer callback, which both
+TrueLayer connections share, it is `unknown` until the attempt the `state` belongs to has been
+read, and stays `unknown` when the request ends before that (a missing parameter, the bank's error,
+an unusable or unreadable attempt). A `state` issued for another source, such as Monzo's, shows
+that source with the outcome `refused`.
 
 One allow-list at the exporter is the only redaction layer for spans. A span attribute whose key is
 not on it is dropped and counted (`finstore.telemetry.span_attributes.dropped`); `url.full` is kept

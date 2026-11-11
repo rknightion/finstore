@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,7 +51,7 @@ func newTest(t *testing.T) (*Scheduler, *fakeClock, *bytes.Buffer) {
 	t.Helper()
 	clk := &fakeClock{t: time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)}
 	var logs syncBuffer
-	s := New(clk.now, slog.New(slog.NewTextHandler(&logs, nil)))
+	s := New(clk.now, slog.New(slog.NewTextHandler(&logs, nil)), nil)
 	s.after = clk.after
 	s.rnd = func(n int64) int64 { return n - 1 } // the largest jitter
 	return s, clk, &logs.Buffer
@@ -155,6 +156,188 @@ func TestPanickingJobIsRecoveredAndRunsAgain(t *testing.T) {
 	}
 	if strings.Contains(out, "PANIC-MARKER") || strings.Contains(out, "ERROR-MARKER") || strings.Contains(out, "kind=good") {
 		t.Fatalf("log carries more than the job name and outcome: %q", out)
+	}
+}
+
+type ctxKey struct{}
+
+// recordingObserver notes every Start and finish, and gives each job a context marked with its
+// name, so a test can see that the job runs in the context Start returned.
+type recordingObserver struct {
+	mu       sync.Mutex
+	started  []string
+	finished []string // "job=outcome", in finish order
+}
+
+func (o *recordingObserver) Start(ctx context.Context, job string) (context.Context, func(string)) {
+	o.mu.Lock()
+	o.started = append(o.started, job)
+	o.mu.Unlock()
+	return context.WithValue(ctx, ctxKey{}, job), func(outcome string) {
+		o.mu.Lock()
+		o.finished = append(o.finished, job+"="+outcome)
+		o.mu.Unlock()
+	}
+}
+
+func (o *recordingObserver) snapshot() (started, finished []string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]string(nil), o.started...), append([]string(nil), o.finished...)
+}
+
+// Every run is reported to the observer with its outcome: ok for a nil error, error for an error
+// and panic for a recovered panic, and each job runs in the context Start returned.
+func TestObserverSeesEveryRunWithItsOutcome(t *testing.T) {
+	obs := &recordingObserver{}
+	// The real clock: each job runs once at start and next an hour later, so once in this test.
+	s := New(time.Now, slog.New(slog.DiscardHandler), obs)
+	var mu sync.Mutex
+	seen := map[string]string{}
+	record := func(job string) func(ctx context.Context) {
+		return func(ctx context.Context) {
+			v, _ := ctx.Value(ctxKey{}).(string)
+			mu.Lock()
+			seen[job] = v
+			mu.Unlock()
+		}
+	}
+	okSeen, errSeen, panicSeen := record("fine"), record("fails"), record("boom")
+	var runs atomic.Int32
+	s.Every("fine", time.Hour, 0, func(ctx context.Context) error { okSeen(ctx); runs.Add(1); return nil })
+	s.Every("fails", time.Hour, 0, func(ctx context.Context) error { errSeen(ctx); runs.Add(1); return errors.New("nope") })
+	s.Every("boom", time.Hour, 0, func(ctx context.Context) error { panicSeen(ctx); runs.Add(1); panic("boom") })
+	runUntil(t, s, func() bool {
+		_, fin := obs.snapshot()
+		return len(fin) >= 3
+	})
+	started, finished := obs.snapshot()
+	slices.Sort(started)
+	slices.Sort(finished)
+	if want := []string{"boom", "fails", "fine"}; !slices.Equal(started, want) {
+		t.Errorf("started = %v, want %v first", started, want)
+	}
+	if want := []string{"boom=panic", "fails=error", "fine=ok"}; !slices.Equal(finished, want) {
+		t.Errorf("finished = %v, want %v first", finished, want)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, job := range []string{"fine", "fails", "boom"} {
+		if seen[job] != job {
+			t.Errorf("job %s ran in a context without the observer's value: %q", job, seen[job])
+		}
+	}
+}
+
+// A job that returns an error once the scheduler's context is cancelled (serve shutting down) is
+// reported as cancelled, not as an error; one that fails while the scheduler runs is still an error.
+func TestObserverSeesShutdownAsCancelledNotError(t *testing.T) {
+	obs := &recordingObserver{}
+	s := New(time.Now, slog.New(slog.DiscardHandler), obs)
+	started := make(chan struct{})
+	s.Every("long", time.Hour, 0, func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	s.Every("fails", time.Hour, 0, func(context.Context) error { return errors.New("nope") })
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		cancel()
+		t.Fatal("the long job never started")
+	}
+	// Let the failing job finish while the scheduler is still running.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, fin := obs.snapshot(); len(fin) >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("the failing job never finished")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	_, finished := obs.snapshot()
+	slices.Sort(finished)
+	if want := []string{"fails=error", "long=cancelled"}; !slices.Equal(finished, want) {
+		t.Errorf("finished = %v, want %v", finished, want)
+	}
+}
+
+// panickingObserver panics in Start, in finish, or both.
+type panickingObserver struct {
+	inStart, inFinish bool
+	finished          atomic.Int32
+}
+
+func (o *panickingObserver) Start(ctx context.Context, _ string) (context.Context, func(string)) {
+	if o.inStart {
+		panic("observer start exploded")
+	}
+	return ctx, func(string) {
+		o.finished.Add(1)
+		if o.inFinish {
+			panic("observer finish exploded")
+		}
+	}
+}
+
+// A broken observer must not take the service down or stop jobs: the job still runs, the
+// scheduler survives and runs it again, and the failure is logged without the panic value.
+func TestAPanickingObserverDoesNotStopTheJobOrTheScheduler(t *testing.T) {
+	for name, obs := range map[string]*panickingObserver{
+		"start":  {inStart: true},
+		"finish": {inFinish: true},
+		"both":   {inStart: true, inFinish: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			clk := &fakeClock{t: time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)}
+			var logs syncBuffer
+			s := New(clk.now, slog.New(slog.NewTextHandler(&logs, nil)), obs)
+			s.after = clk.after
+			var runs atomic.Int32
+			var sawCtx atomic.Bool
+			s.Every("job", time.Minute, 0, func(ctx context.Context) error {
+				sawCtx.Store(ctx != nil)
+				runs.Add(1)
+				return nil
+			})
+			runUntil(t, s, func() bool { return runs.Load() >= 3 })
+			if !sawCtx.Load() {
+				t.Error("the job ran without a usable context")
+			}
+			out := logs.String()
+			if !strings.Contains(out, "scheduler observer failed") {
+				t.Errorf("the observer's panic was not logged: %s", out)
+			}
+			if strings.Contains(out, "exploded") {
+				t.Errorf("the panic value was logged: %s", out)
+			}
+		})
+	}
+}
+
+// A job that is never started because the scheduler stopped is not reported.
+func TestObserverIsNotToldOfARunThatNeverStarted(t *testing.T) {
+	obs := &recordingObserver{}
+	s := New(time.Now, slog.New(slog.DiscardHandler), obs)
+	s.Every("never", time.Hour, time.Hour, func(context.Context) error { return nil })
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if started, finished := obs.snapshot(); len(started)+len(finished) != 0 {
+		t.Errorf("observer saw %v / %v for a job that never ran", started, finished)
 	}
 }
 

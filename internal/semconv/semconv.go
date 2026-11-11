@@ -219,6 +219,49 @@ const (
 	SpanCommand        = AttrCommand
 )
 
+// Values of finstore.connect.outcome on a connect or callback span.
+const (
+	// ConnectCrossSite: a connect post that did not come from the status page (400).
+	ConnectCrossSite = "cross_site"
+	// ConnectStartFailed: the attempt could not be started or gave no usable bank link (500).
+	ConnectStartFailed = "start_failed"
+	// ConnectStarted: the page that moves the browser on to the bank was served (200).
+	ConnectStarted = "started"
+	// ConnectInvalidLink: the callback had no state or no code (400).
+	ConnectInvalidLink = "invalid_link"
+	// ConnectBankDeclined: the shared callback came back with the bank's error parameter (400).
+	ConnectBankDeclined = "bank_declined"
+	// ConnectRefused: the state was unknown, expired, used or another source's (400).
+	ConnectRefused = "refused"
+	// ConnectFailed: the attempt could not be read (503) or the exchange failed (502). The span's
+	// error.type says which (ErrorAttemptRead or ErrorExchange).
+	ConnectFailed = "failed"
+	// ConnectExchanged: the connector succeeded (303).
+	ConnectExchanged = "exchanged"
+)
+
+// SourceUnknown is finstore.source on the shared TrueLayer callback until the attempt's source has
+// been read, and for a request that never reaches it.
+const SourceUnknown = "unknown"
+
+// Values of error.type on a connect or callback span that failed.
+const (
+	ErrorAttemptRead = "attempt_read"
+	ErrorExchange    = "exchange"
+)
+
+// Values of finstore.job.outcome on a scheduler.job span and of the outcome attribute on
+// finstore.scheduler.job.runs.
+const (
+	JobOK    = "ok"
+	JobError = "error"
+	JobPanic = "panic"
+	// JobCancelled: the job returned an error after the scheduler's context was cancelled, which is
+	// serve shutting down, not a failure. It is counted but never changes last_ok and never marks
+	// the span failed.
+	JobCancelled = "cancelled"
+)
+
 // spanAttributes is the span exporter's allow-list. pgx.query.parameters is deliberately absent,
 // as is every header, query string and exception key: a library upgrade that adds a key shows up
 // as a dropped-key count, never as a leak.
