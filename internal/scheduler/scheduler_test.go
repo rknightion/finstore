@@ -220,7 +220,7 @@ func TestDailyFirstDelayAndNext(t *testing.T) {
 	s, clk, _ := newTest(t) // 12:00 UTC on 2026-11-11, London is on GMT
 	london := mustLoc(t, "Europe/London")
 	var runs atomic.Int32
-	s.Daily("nightly", 3, 0, london, func(context.Context) error {
+	s.Daily("nightly", 3, 0, london, 0, func(context.Context) error {
 		runs.Add(1)
 		clk.advance(time.Minute)
 		return nil
@@ -230,6 +230,53 @@ func TestDailyFirstDelayAndNext(t *testing.T) {
 	if d[0] != 15*time.Hour { // 12:00 -> 03:00 tomorrow
 		t.Fatalf("first delay = %v, want 15h", d[0])
 	}
+}
+
+// A jittered daily job runs a random delay of up to the jitter after its slot, each day, and the
+// next day's slot is counted from the slot, not from the late start.
+func TestDailyJitterDelaysEachRun(t *testing.T) {
+	s, clk, _ := newTest(t) // 12:00 UTC on 2026-11-11; rnd gives the largest jitter
+	london := mustLoc(t, "Europe/London")
+	var runs atomic.Int32
+	s.Daily("truelayer", 18, 20, london, 5*time.Minute, func(context.Context) error {
+		runs.Add(1)
+		clk.advance(time.Minute)
+		return nil
+	})
+	// The fake after does not move the clock, so move it by each delay asked.
+	inner := s.after
+	s.after = func(d time.Duration) <-chan time.Time {
+		clk.advance(d)
+		return inner(d)
+	}
+	runUntil(t, s, func() bool { return runs.Load() >= 2 })
+	d := clk.delaysCopy()
+	if want := 6*time.Hour + 25*time.Minute; d[0] != want { // 12:00 -> 18:20 + 5m
+		t.Fatalf("first delay = %v, want %v", d[0], want)
+	}
+	// Started 18:25 and ran a minute: the next run is 18:20 tomorrow plus the jitter again.
+	if want := 24*time.Hour - 6*time.Minute + 5*time.Minute; d[1] != want {
+		t.Fatalf("second delay = %v, want %v", d[1], want)
+	}
+}
+
+func TestNamesListsTheRegisteredJobsInOrder(t *testing.T) {
+	s, _, _ := newTest(t)
+	s.Every("a", time.Minute, 0, func(context.Context) error { return nil })
+	s.Daily("b", 6, 20, time.UTC, time.Minute, func(context.Context) error { return nil })
+	if got := strings.Join(s.Names(), ","); got != "a,b" {
+		t.Fatalf("Names = %q, want a,b", got)
+	}
+}
+
+func TestDailyRefusesANegativeJitter(t *testing.T) {
+	s, _, _ := newTest(t)
+	defer func() {
+		if recover() == nil {
+			t.Fatal("Daily accepted a negative jitter")
+		}
+	}()
+	s.Daily("bad", 6, 20, time.UTC, -time.Second, func(context.Context) error { return nil })
 }
 
 func mustLoc(t *testing.T, name string) *time.Location {

@@ -77,17 +77,33 @@ func (s *Scheduler) Every(name string, interval, jitter time.Duration, job Job) 
 // Daily runs job each day at hour:minute local time in loc. A time that does not exist on a day
 // (clocks going forward) runs at the same instant the day's clocks would have shown it, which is
 // that wall time moved on by the change; a time that occurs twice (clocks going back) runs at its
-// first occurrence only.
-func (s *Scheduler) Daily(name string, hour, minute int, loc *time.Location, job Job) {
+// first occurrence only. Each run starts a random delay in [0, jitter] after its time, so that
+// a fleet of clients does not reach a bank in the same second; the next day's time is counted
+// from the slot, so the delay never accumulates. A jitter of an hour or more is refused: it could
+// push a run past the next day's slot.
+func (s *Scheduler) Daily(name string, hour, minute int, loc *time.Location, jitter time.Duration, job Job) {
 	if hour < 0 || hour > 23 || minute < 0 || minute > 59 || loc == nil {
 		panic("scheduler: Daily needs a valid time of day and a location")
 	}
+	if jitter < 0 || jitter >= time.Hour {
+		panic("scheduler: Daily needs a jitter of at least zero and under an hour")
+	}
+	delay := func() time.Duration {
+		if jitter == 0 {
+			return 0
+		}
+		return time.Duration(s.rnd(int64(jitter) + 1))
+	}
 	s.add(task{
-		name:  name,
-		job:   job,
-		first: func(now time.Time) time.Duration { return nextDaily(now, hour, minute, loc).Sub(now) },
+		name: name,
+		job:  job,
+		first: func(now time.Time) time.Duration {
+			return nextDaily(now, hour, minute, loc).Sub(now) + delay()
+		},
+		// start is at or after its slot and under an hour past it, so the next slot after start is
+		// the following day's.
 		next: func(start, end time.Time) time.Duration {
-			return max(0, nextDaily(start, hour, minute, loc).Sub(end))
+			return max(0, nextDaily(start, hour, minute, loc).Add(delay()).Sub(end))
 		},
 	})
 }
@@ -99,6 +115,17 @@ func (s *Scheduler) add(t task) {
 		panic("scheduler: job added after Run")
 	}
 	s.tasks = append(s.tasks, t)
+}
+
+// Names returns the names of the registered jobs, in the order they were registered.
+func (s *Scheduler) Names() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.tasks))
+	for i, t := range s.tasks {
+		out[i] = t.name
+	}
+	return out
 }
 
 // LastTick returns when any job last started, or the zero time before the first start.

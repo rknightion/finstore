@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rknightion/finstore/internal/consent"
 	"github.com/rknightion/finstore/internal/store"
 	"github.com/rknightion/finstore/internal/telemetry"
 )
@@ -26,6 +27,8 @@ const (
 var errRefused = errors.New("refused")
 
 type fakeConn struct {
+	// url is the bank login URL AuthoriseURL returns; empty means the default.
+	url            string
 	authoriseCalls int
 	authoriseErr   error
 	callbackCalls  int
@@ -38,6 +41,9 @@ type fakeConn struct {
 
 func (f *fakeConn) AuthoriseURL(context.Context) (string, error) {
 	f.authoriseCalls++
+	if f.url != "" {
+		return f.url, f.authoriseErr
+	}
 	return "https://auth.bank.test/?client_id=c&state=s", f.authoriseErr
 }
 
@@ -55,6 +61,22 @@ type fakeReader struct {
 	sources  []store.SyncStatusRow
 	coverage []store.CoverageRow
 	readErr  error
+	// attempts maps a state's SHA-256 (as a string) to its source; a state not in it is unusable.
+	attempts     map[string]string
+	attemptErr   error
+	attemptCalls int
+}
+
+func (f *fakeReader) ConnectAttemptSource(_ context.Context, stateSHA256 []byte, _ time.Time) (string, error) {
+	f.attemptCalls++
+	if f.attemptErr != nil {
+		return "", f.attemptErr
+	}
+	src, ok := f.attempts[string(stateSHA256)]
+	if !ok {
+		return "", store.ErrAttemptUnusable
+	}
+	return src, nil
 }
 
 func (f *fakeReader) Ping(context.Context) error { return f.pingErr }
@@ -72,19 +94,79 @@ func newServer(t *testing.T, conn *fakeConn, read *fakeReader, logTo io.Writer) 
 	if logTo == nil {
 		logTo = io.Discard
 	}
-	s, err := New(Options{
-		AllowedEmails: []string{allowedEmail},
-		AuthHeader:    authHeader,
-		BankAuthURL:   "https://auth.bank.test/",
-		IsRefusal:     func(err error) bool { return errors.Is(err, errRefused) },
-		Location:      time.UTC,
-		Now:           func() time.Time { return time.Date(2030, 3, 4, 5, 6, 0, 0, time.UTC) },
-		Log:           telemetry.NewLogger(logTo, slog.LevelDebug),
-	}, conn, read)
+	s, err := New(options(logTo, monzoSource(conn)), read)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return s.Handler()
+}
+
+func options(logTo io.Writer, sources ...Source) Options {
+	return Options{
+		AllowedEmails: []string{allowedEmail},
+		AuthHeader:    authHeader,
+		Sources:       sources,
+		Location:      time.UTC,
+		Now:           func() time.Time { return time.Date(2030, 3, 4, 5, 6, 0, 0, time.UTC) },
+		Log:           telemetry.NewLogger(logTo, slog.LevelDebug),
+	}
+}
+
+func monzoSource(conn *fakeConn) Source {
+	return Source{
+		Name: "monzo", Label: "Monzo", ConnectPath: "/connect/monzo", CallbackPath: "/callback/monzo",
+		AuthURL: "https://auth.bank.test/", Connector: conn,
+		IsRefusal: func(err error) bool { return errors.Is(err, errRefused) },
+	}
+}
+
+const (
+	srcLloyds  = "truelayer:ob-lloyds"
+	srcTLMonzo = "truelayer:ob-monzo"
+)
+
+// threeSources is Monzo and both TrueLayer connections, the two sharing one callback.
+type threeSources struct {
+	monzo, lloyds, tlMonzo *fakeConn
+	read                   *fakeReader
+	h                      http.Handler
+}
+
+func newThree(t *testing.T, logTo io.Writer) *threeSources {
+	t.Helper()
+	if logTo == nil {
+		logTo = io.Discard
+	}
+	ts := &threeSources{
+		monzo:   &fakeConn{},
+		lloyds:  &fakeConn{url: "https://auth.truelayer.test/?provider_id=ob-lloyds&state=s"},
+		tlMonzo: &fakeConn{url: "https://auth.truelayer.test/?provider_id=ob-monzo&state=s"},
+		read:    &fakeReader{attempts: map[string]string{}},
+	}
+	tl := func(name, label string, conn *fakeConn) Source {
+		return Source{
+			Name: name, Label: label, ConnectPath: "/connect/" + strings.ReplaceAll(name, ":", "/"),
+			CallbackPath: "/callback/truelayer", AuthURL: "https://auth.truelayer.test", Connector: conn,
+			IsRefusal: func(err error) bool { return errors.Is(err, errRefused) },
+		}
+	}
+	s, err := New(options(logTo, monzoSource(ts.monzo),
+		tl(srcLloyds, "Lloyds (TrueLayer)", ts.lloyds), tl(srcTLMonzo, "Monzo (TrueLayer)", ts.tlMonzo)), ts.read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts.h = s.Handler()
+	return ts
+}
+
+// attempt registers a live attempt for source and returns its state.
+func (ts *threeSources) attempt(state, source string) string {
+	ts.read.attempts[string(consent.HashState(state))] = source
+	return state
+}
+
+func (ts *threeSources) callbackCalls() int {
+	return ts.monzo.callbackCalls + ts.lloyds.callbackCalls + ts.tlMonzo.callbackCalls
 }
 
 func do(h http.Handler, method, target string, header map[string]string) *httptest.ResponseRecorder {
@@ -161,7 +243,7 @@ func TestTwoAuthHeaderLinesAreRefused(t *testing.T) {
 }
 
 func TestAnEmptyAllowListIsRefusedAtStart(t *testing.T) {
-	if _, err := New(Options{AuthHeader: authHeader}, &fakeConn{}, &fakeReader{}); err == nil {
+	if _, err := New(Options{AuthHeader: authHeader, Sources: []Source{monzoSource(&fakeConn{})}}, &fakeReader{}); err == nil {
 		t.Fatal("New accepted an empty allow-list")
 	}
 }

@@ -29,7 +29,7 @@ func TestConnectAttemptSourceIsReadOnlyAndRefusesUnusableAttempts(t *testing.T) 
 		}
 	}
 	// Reading did not consume it.
-	if _, err := store.ConsumeConnectAttempt(ctx, q, hash("live"), now.Add(time.Minute)); err != nil {
+	if _, err := store.ConsumeConnectAttempt(ctx, q, "truelayer:ob-lloyds", hash("live"), now.Add(time.Minute)); err != nil {
 		t.Fatalf("consume after read: %v", err)
 	}
 	if _, err := store.ConnectAttemptSource(ctx, q, hash("live"), now.Add(time.Minute)); !errors.Is(err, store.ErrAttemptUnusable) {

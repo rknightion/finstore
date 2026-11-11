@@ -116,15 +116,13 @@ func (m *Manager) ConsumeAttempt(ctx context.Context, q store.DBTX, state string
 	if state == "" {
 		return store.ConnectAttempt{}, ErrAttemptRefused
 	}
-	a, err := store.ConsumeConnectAttempt(ctx, q, HashState(state), m.now())
+	// Only this source's attempt is consumed: another source's state is refused and left unused.
+	a, err := store.ConsumeConnectAttempt(ctx, q, m.source, HashState(state), m.now())
 	if errors.Is(err, store.ErrAttemptUnusable) {
 		return store.ConnectAttempt{}, ErrAttemptRefused
 	}
 	if err != nil {
 		return store.ConnectAttempt{}, err
-	}
-	if a.Source != m.source {
-		return store.ConnectAttempt{}, ErrAttemptRefused
 	}
 	return a, nil
 }

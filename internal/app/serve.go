@@ -15,6 +15,7 @@ import (
 	"github.com/rknightion/finstore/internal/semconv"
 	"github.com/rknightion/finstore/internal/store"
 	"github.com/rknightion/finstore/internal/telemetry"
+	"github.com/rknightion/finstore/internal/truelayer"
 	"github.com/rknightion/finstore/internal/web"
 )
 
@@ -25,6 +26,49 @@ const (
 	// completion row is written, and the next run starts afresh.
 	hourlyRunLimit  = 15 * time.Minute
 	nightlyRunLimit = 45 * time.Minute
+	// A TrueLayer run has its own 15-minute deadline once it holds the writer lock; this bounds
+	// the wait for the lock as well.
+	trueLayerRunLimit = 2 * truelayer.DefaultRunTimeout
+	// trueLayerJitter is the most a scheduled TrueLayer sync starts after its time.
+	trueLayerJitter = 5 * time.Minute
+)
+
+// trueLayerSyncTimes are the times of day, in FINSTORE_TIMEZONE, of the scheduled TrueLayer syncs.
+// A connect day spends three of the four calls a day each endpoint allows: the connect and these
+// two.
+var trueLayerSyncTimes = []config.TimeOfDay{{Hour: 6, Minute: 20}, {Hour: 18, Minute: 20}}
+
+// trueLayerJob runs one scheduled sync of tw within trueLayerRunLimit.
+func trueLayerJob(tw *truelayer.Worker) scheduler.Job {
+	return func(ctx context.Context) error {
+		ctx, cancel := context.WithTimeout(ctx, trueLayerRunLimit)
+		defer cancel()
+		return tw.RunScheduled(ctx)
+	}
+}
+
+// The status page's words for each connection.
+const (
+	monzoConnectNotice = "After you follow the link in Monzo's email, approve the request in the Monzo app " +
+		"straight away: the full history can only be fetched in the first few minutes after the link."
+	monzoReconnectNotice = "Reconnecting replaces the current connection as soon as you follow the link in " +
+		"Monzo's email, before you approve anything. After that link, approve the request in the Monzo app " +
+		"straight away: the full history can only be fetched in the first few minutes after the link."
+	trueLayerReconnectNotice = "Reconnecting replaces the current connection when you come back from the bank, " +
+		"and starts a new 90-day consent."
+)
+
+var (
+	trueLayerLabels = map[string]string{
+		truelayer.ConnLloyds: "Lloyds (TrueLayer)",
+		truelayer.ConnMonzo:  "Monzo (TrueLayer)",
+	}
+	trueLayerNotices = map[string]string{
+		truelayer.ConnLloyds: "You approve access at Lloyds through TrueLayer. The full history is fetched " +
+			"as soon as you come back here.",
+		truelayer.ConnMonzo: "You approve access in the Monzo app through TrueLayer. This connection reads " +
+			"standing orders and direct debits for the Monzo accounts above.",
+	}
 )
 
 // Hooks lets a test observe and adjust a running server. Every field is optional.
@@ -35,14 +79,24 @@ type Hooks struct {
 	Worker func(w *monzo.Worker)
 	// MonzoOptions may change the worker's options before it is built.
 	MonzoOptions func(o *monzo.Options)
+	// TrueLayerOptions may change each TrueLayer worker's options before it is built.
+	TrueLayerOptions func(o *truelayer.Options)
+	// TrueLayerWorker is called with each TrueLayer worker before the scheduler starts.
+	TrueLayerWorker func(w *truelayer.Worker)
 	// NoSchedule leaves the scheduler's jobs unregistered, so a test drives every run itself.
 	NoSchedule bool
+	// Scheduler is called with the scheduler once its jobs are registered, before it runs.
+	Scheduler func(s *scheduler.Scheduler)
 }
 
 // reader adapts the store to the pages' needs.
 type reader struct{ st *store.Store }
 
 func (r reader) Ping(ctx context.Context) error { return r.st.Ping(ctx) }
+
+func (r reader) ConnectAttemptSource(ctx context.Context, stateSHA256 []byte, now time.Time) (string, error) {
+	return store.ConnectAttemptSource(ctx, r.st.DB(), stateSHA256, now)
+}
 
 func (r reader) SyncStatus(ctx context.Context) ([]store.SyncStatusRow, error) {
 	return store.SyncStatus(ctx, r.st.DB())
@@ -52,7 +106,8 @@ func (r reader) Coverage(ctx context.Context) ([]store.CoverageRow, error) {
 	return store.Coverage(ctx, r.st.DB())
 }
 
-// Serve runs the HTTP server, the scheduler and the Monzo worker until ctx ends.
+// Serve runs the HTTP server, the scheduler, the Monzo worker and, when TrueLayer is configured,
+// a worker for each TrueLayer connection until ctx ends.
 func Serve(ctx context.Context, e Env, hooks *Hooks) int {
 	if err := serve(ctx, e, hooks); err != nil {
 		return e.fail(err)
@@ -110,19 +165,78 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 	if hooks.Worker != nil {
 		hooks.Worker(worker)
 	}
+	sources := []web.Source{{
+		Name: sourceMonzo, Label: "Monzo", ConnectPath: "/connect/monzo", CallbackPath: "/callback/monzo",
+		AuthURL: cfg.MonzoAuthURL, Connector: worker,
+		IsRefusal:       func(err error) bool { return errors.Is(err, monzo.ErrCallbackRefused) },
+		ConnectNotice:   monzoConnectNotice,
+		ReconnectNotice: monzoReconnectNotice,
+	}}
+
+	// The TrueLayer connections run only when TrueLayer is configured; their normalisers are
+	// registered either way (NewLedger), so a renormalise always reads their stored responses.
+	var tlWorkers []*truelayer.Worker
+	if cfg.TrueLayerEnabled() {
+		for _, conn := range []string{truelayer.ConnLloyds, truelayer.ConnMonzo} {
+			o := truelayer.Options{
+				Connection: conn, ClientID: cfg.TrueLayerClientID, ClientSecret: cfg.TrueLayerClientSecret,
+				AuthURL: cfg.TrueLayerAuthURL, APIURL: cfg.TrueLayerAPIURL, PublicURL: cfg.PublicURL,
+				Location: cfg.Timezone, Now: e.Now,
+			}
+			if hooks.TrueLayerOptions != nil {
+				hooks.TrueLayerOptions(&o)
+			}
+			tw, err := truelayer.New(o, st, l, metrics, log)
+			if err != nil {
+				return err
+			}
+			defer tw.Close()
+			if hooks.TrueLayerWorker != nil {
+				hooks.TrueLayerWorker(tw)
+			}
+			tlWorkers = append(tlWorkers, tw)
+			sources = append(sources, web.Source{
+				Name: tw.Source(), Label: trueLayerLabels[conn],
+				ConnectPath: "/connect/truelayer/" + conn, CallbackPath: "/callback/truelayer",
+				AuthURL: cfg.TrueLayerAuthURL, Connector: tw,
+				IsRefusal:       func(err error) bool { return errors.Is(err, truelayer.ErrCallbackRefused) },
+				ConnectNotice:   trueLayerNotices[conn],
+				ReconnectNotice: trueLayerReconnectNotice,
+			})
+		}
+	}
 
 	pages, err := web.New(web.Options{
 		AllowedEmails: cfg.AllowedEmails,
 		AuthHeader:    cfg.AuthHeader,
-		BankAuthURL:   cfg.MonzoAuthURL,
-		IsRefusal:     func(err error) bool { return errors.Is(err, monzo.ErrCallbackRefused) },
+		Sources:       sources,
 		Location:      cfg.Timezone,
 		Now:           e.now,
 		Log:           log,
-	}, worker, reader{st})
+	}, reader{st})
 	if err != nil {
 		return err
 	}
+	// Pick up an approval wait or a full-history fetch that a restart interrupted. Each worker's
+	// Resume runs before the listener opens: a callback that arrived first could start a connect
+	// run that Resume would then end as interrupted while it ran.
+	if err := worker.Resume(ctx); err != nil {
+		log.ErrorContext(ctx, "monzo background work not resumed", semconv.LogOutcome, "error")
+	}
+	// The same for each TrueLayer connection. A consent whose token is missing (only a database
+	// restore does that) ends lost with token_missing and Resume says so with ErrConsentLost: the
+	// service carries on, and the status page offers a reconnect.
+	for _, tw := range tlWorkers {
+		switch err := tw.Resume(ctx); {
+		case errors.Is(err, truelayer.ErrConsentLost):
+			log.WarnContext(ctx, "truelayer consent lost at start", semconv.LogSource, tw.Source(),
+				semconv.LogOutcome, "lost")
+		case err != nil:
+			log.ErrorContext(ctx, "truelayer background work not resumed", semconv.LogSource, tw.Source(),
+				semconv.LogOutcome, "error")
+		}
+	}
+
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
@@ -132,11 +246,6 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 	go func() { serveErr <- srv.Serve(ln) }()
 	if hooks.Listening != nil {
 		hooks.Listening(ln.Addr())
-	}
-
-	// Pick up an approval wait or a full-history fetch that a restart interrupted.
-	if err := worker.Resume(ctx); err != nil {
-		log.ErrorContext(ctx, "monzo background work not resumed", semconv.LogOutcome, "error")
 	}
 
 	status := &statusPublisher{st: st, m: metrics, log: log, dumpFile: cfg.DumpStatusFile, now: e.now}
@@ -155,8 +264,17 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 		}
 		sched.Every(monzo.KindHourly, cfg.MonzoSyncInterval, min(time.Minute, cfg.MonzoSyncInterval/10),
 			bounded(monzo.KindHourly, hourlyRunLimit))
-		sched.Daily(monzo.KindNightly, cfg.MonzoNightlyAt.Hour, cfg.MonzoNightlyAt.Minute, cfg.Timezone,
+		sched.Daily(monzo.KindNightly, cfg.MonzoNightlyAt.Hour, cfg.MonzoNightlyAt.Minute, cfg.Timezone, 0,
 			bounded(monzo.KindNightly, nightlyRunLimit))
+		for _, tw := range tlWorkers {
+			for _, at := range trueLayerSyncTimes {
+				sched.Daily(fmt.Sprintf("%s %02d:%02d", tw.Source(), at.Hour, at.Minute), at.Hour, at.Minute, cfg.Timezone, trueLayerJitter,
+					trueLayerJob(tw))
+			}
+		}
+	}
+	if hooks.Scheduler != nil {
+		hooks.Scheduler(sched)
 	}
 	schedErr := make(chan error, 1)
 	schedCtx, stopSched := context.WithCancel(ctx)

@@ -28,6 +28,7 @@ import (
 	"github.com/rknightion/finstore/internal/monzo"
 	"github.com/rknightion/finstore/internal/store"
 	"github.com/rknightion/finstore/internal/telemetry"
+	"github.com/rknightion/finstore/internal/truelayer"
 )
 
 // Exit codes. Each command documents which it returns.
@@ -99,10 +100,16 @@ func (e Env) fail(err error) int {
 	return ExitError
 }
 
-// NewLedger builds the projection with every source and file format the binary knows.
+// NewLedger builds the projection with every source and file format the binary knows. Both
+// TrueLayer connections are registered whether or not TrueLayer is configured, so renormalise
+// always reads their stored responses.
 func NewLedger(loc *time.Location, log *slog.Logger) *ledger.Ledger {
 	return ledger.New(
-		map[string]ledger.SourceNormaliser{sourceMonzo: monzo.Normaliser{}},
+		map[string]ledger.SourceNormaliser{
+			sourceMonzo:                            monzo.Normaliser{},
+			truelayer.Source(truelayer.ConnLloyds): truelayer.Normaliser{Connection: truelayer.ConnLloyds},
+			truelayer.Source(truelayer.ConnMonzo):  truelayer.Normaliser{Connection: truelayer.ConnMonzo},
+		},
 		map[string]ledger.FileNormaliser{
 			FormatHalifaxPDF: importer.Normaliser{},
 			FormatManualCSV:  importer.Normaliser{},

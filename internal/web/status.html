@@ -12,7 +12,7 @@
 <p class="note">Status at {{.Generated}} ({{.Zone}}). This page shows states, dates and counts only.</p>
 
 {{range .Sources}}
-<h2>Monzo connection</h2>
+<h2>{{.Label}} connection</h2>
 <dl>
 <dt>Consent</dt><dd>{{.ConsentState}}</dd>
 <dt>Approved</dt><dd>{{.ApprovedAt}}</dd>
@@ -21,17 +21,9 @@
 <dt>Last successful sync</dt><dd>{{.LastSyncOK}}</dd>
 <dt>Last run</dt><dd>{{.LastOutcome}}</dd>
 </dl>
-<form method="post" action="/connect/monzo">
-{{if .Connected}}
-<p class="warn">Reconnecting replaces the current connection as soon as you follow the link in
-Monzo's email, before you approve anything. After that link, approve the request in the Monzo app
-straight away: the full history can only be fetched in the first few minutes after the link.</p>
-<button type="submit">Reconnect Monzo</button>
-{{else}}
-<p class="warn">After you follow the link in Monzo's email, approve the request in the Monzo app
-straight away: the full history can only be fetched in the first few minutes after the link.</p>
-<button type="submit">Connect Monzo</button>
-{{end}}
+<form method="post" action="{{.ConnectPath}}">
+{{with .Notice}}<p class="warn">{{.}}</p>{{end}}
+<button type="submit">{{if .Connected}}Reconnect{{else}}Connect{{end}} {{.Label}}</button>
 </form>
 {{end}}
 

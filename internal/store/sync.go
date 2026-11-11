@@ -260,14 +260,15 @@ func CreateConnectAttempt(ctx context.Context, q DBTX, source string, stateSHA25
 	return id, nil
 }
 
-// ConsumeConnectAttempt marks the attempt with this state hash used at now and returns it, in one
-// statement, so of two concurrent callers exactly one succeeds. It returns ErrAttemptUnusable
-// when the attempt is unknown, expired at now, already used or already has an outcome.
-func ConsumeConnectAttempt(ctx context.Context, q DBTX, stateSHA256 []byte, now time.Time) (ConnectAttempt, error) {
+// ConsumeConnectAttempt marks source's attempt with this state hash used at now and returns it, in
+// one statement, so of two concurrent callers exactly one succeeds. It returns ErrAttemptUnusable,
+// changing nothing, when the attempt is unknown, belongs to another source, is expired at now,
+// already used or already has an outcome: a state sent to the wrong callback is not spent.
+func ConsumeConnectAttempt(ctx context.Context, q DBTX, source string, stateSHA256 []byte, now time.Time) (ConnectAttempt, error) {
 	var a ConnectAttempt
 	err := q.QueryRow(ctx, `UPDATE sync.connect_attempt SET used_at = $2
-		WHERE state_sha256 = $1 AND used_at IS NULL AND outcome IS NULL AND expires_at > $2
-		RETURNING id, source, state_sha256, started_at, expires_at, used_at, outcome`, stateSHA256, now).
+		WHERE state_sha256 = $1 AND source = $3 AND used_at IS NULL AND outcome IS NULL AND expires_at > $2
+		RETURNING id, source, state_sha256, started_at, expires_at, used_at, outcome`, stateSHA256, now, source).
 		Scan(&a.ID, &a.Source, &a.StateSHA256, &a.StartedAt, &a.ExpiresAt, &a.UsedAt, &a.Outcome)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ConnectAttempt{}, ErrAttemptUnusable
