@@ -69,6 +69,13 @@ type harness struct {
 
 func newHarness(t *testing.T, fakeOpts []monzotest.Option, mod func(*Options)) *harness {
 	t.Helper()
+	return newHarnessWith(t, fakeOpts, mod)
+}
+
+// newHarnessWith is newHarness with options for the store's connection pool, such as
+// store.WithTelemetry to trace its queries.
+func newHarnessWith(t *testing.T, fakeOpts []monzotest.Option, mod func(*Options), storeOpts ...store.OpenOption) *harness {
+	t.Helper()
 	ctx := context.Background()
 	super := testpg.Start(t)
 	if err := store.Bootstrap(ctx, super, "owner-secret", "app-secret"); err != nil {
@@ -77,7 +84,7 @@ func newHarness(t *testing.T, fakeOpts []monzotest.Option, mod func(*Options)) *
 	if err := store.Migrate(ctx, testpg.UserURL(t, super, store.RoleOwner), ledger.NormaliserRev); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	st, err := store.Open(ctx, testpg.UserURL(t, super, store.RoleApp))
+	st, err := store.Open(ctx, testpg.UserURL(t, super, store.RoleApp), storeOpts...)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -181,7 +188,12 @@ func (h *harness) sleepCount() int {
 // callback starts an attempt and completes the callback with a fresh code.
 func (h *harness) callback(w *Worker) {
 	h.t.Helper()
-	ctx := context.Background()
+	h.callbackCtx(context.Background(), w)
+}
+
+// callbackCtx is callback with the context HandleCallback is given, which may carry a span.
+func (h *harness) callbackCtx(ctx context.Context, w *Worker) {
+	h.t.Helper()
 	u, err := w.AuthoriseURL(ctx)
 	if err != nil {
 		h.t.Fatalf("AuthoriseURL: %v", err)
@@ -204,6 +216,12 @@ func (h *harness) callback(w *Worker) {
 // 403), runs extra on approval, and waits for the full-history fetch to finish.
 func (h *harness) connect(onApprove func()) {
 	h.t.Helper()
+	h.connectCtx(context.Background(), onApprove)
+}
+
+// connectCtx is connect with the context HandleCallback is given, which may carry a span.
+func (h *harness) connectCtx(ctx context.Context, onApprove func()) {
+	h.t.Helper()
 	start := h.sleepCount()
 	h.setOnSleep(func(_ context.Context, n int, _ time.Duration) error {
 		if n == start {
@@ -214,7 +232,7 @@ func (h *harness) connect(onApprove func()) {
 		}
 		return nil
 	})
-	h.callback(h.w)
+	h.callbackCtx(ctx, h.w)
 	h.w.Wait()
 	h.setOnSleep(nil)
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -171,6 +172,11 @@ func tlEnv(t *testing.T, super, monzoURL, tlURL string) config.Config {
 	}
 	return cfg
 }
+
+// logIDs matches the trace and span ids a log line carries. They are random hex and hold no data,
+// but a four digit marker (the tail of an account number) can occur inside one by chance, so the
+// marker check leaves them out. Nothing else in the log is skipped.
+var logIDs = regexp.MustCompile(`"(?:trace_id|span_id)":"[0-9a-f]+"`)
 
 // TestTrueLayerEndToEnd drives the service with both TrueLayer connections configured, through
 // the real ledger and store, the HTTP routes and both fakes: a consent left with no token at
@@ -577,7 +583,7 @@ func TestTrueLayerEndToEnd(t *testing.T) {
 	if v := mfake.Violations(); len(v) != 0 {
 		t.Fatalf("the service made requests to Monzo a read-only client never makes: %+v", v)
 	}
-	logs := w.stderr.String()
+	logs := logIDs.ReplaceAllString(w.stderr.String(), "")
 	for _, marker := range []string{tlDescMarker, state, code, lloydsJointID, "12345678", "MADE UP LANDLORD",
 		tlCardMarker, tlPendingMarker, tlIdentity, "4321", "7654"} {
 		if strings.Contains(logs, marker) {

@@ -542,7 +542,8 @@ func TestResumeEndsAConsentWithNoStoredToken(t *testing.T) {
 	}
 }
 
-// A run has a deadline: one that passes ends the run failed and records it.
+// A run has a deadline: one that passes ends the run failed with the category timeout (not
+// cancelled, which the state gauges skip) and records it.
 func TestRunDeadline(t *testing.T) {
 	h := newHarness(t)
 	h.lloydsFixture()
@@ -552,5 +553,5 @@ func TestRunDeadline(t *testing.T) {
 	if err := short.RunScheduled(context.Background()); err == nil {
 		t.Fatal("a run past its deadline reported no error")
 	}
-	requireRun(t, h.lastRun(Source(ConnLloyds)), KindSync, outcomeFailed, "cancelled")
+	requireRun(t, h.lastRun(Source(ConnLloyds)), KindSync, outcomeFailed, "timeout")
 }

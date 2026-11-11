@@ -413,3 +413,122 @@ func ListBackfillWindows(ctx context.Context, q DBTX, accountKey string) ([]Back
 	}
 	return out, nil
 }
+
+// StateRunKinds are the run kinds the state gauges report: the scheduled and connect-time fetches
+// of a bank. Import and capture runs are operator commands, which no alert reads.
+var StateRunKinds = []string{"hourly", "nightly", "sync", "connect", "backfill"}
+
+// LatestRun is the newest finished run of one source and kind.
+type LatestRun struct {
+	Source     string
+	Kind       string
+	OK         bool // the run's outcome was ok; partial and failed are not
+	FinishedAt time.Time
+}
+
+// LatestRuns returns, for each source and each of StateRunKinds that has one, its newest finished
+// run. A run that ended with error_category cancelled is skipped: its context was cancelled (serve
+// was stopped under it, or a newer connect replaced it), which says nothing about the bank, and the
+// run before it still stands. A run that passed its own deadline is category timeout and counts.
+// Ordered by source and kind.
+func LatestRuns(ctx context.Context, q DBTX) ([]LatestRun, error) {
+	rows, err := q.Query(ctx, `SELECT DISTINCT ON (source, kind) source, kind, outcome = 'ok', finished_at
+		FROM sync.run
+		WHERE finished_at IS NOT NULL AND kind = ANY($1) AND error_category IS DISTINCT FROM 'cancelled'
+		ORDER BY source, kind, finished_at DESC, id DESC`, StateRunKinds)
+	if err != nil {
+		return nil, fmt.Errorf("store: latest runs: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (LatestRun, error) {
+		var l LatestRun
+		err := r.Scan(&l.Source, &l.Kind, &l.OK, &l.FinishedAt)
+		return l, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: latest runs: %w", err)
+	}
+	return out, nil
+}
+
+// RateLimitedRun is the newest rate-limited run of a source.
+type RateLimitedRun struct {
+	Source     string
+	FinishedAt time.Time
+}
+
+// LastRateLimited returns, for each source that has had a run end with error_category
+// rate_limited, when the newest such run finished. A source that never had one is not listed.
+func LastRateLimited(ctx context.Context, q DBTX) ([]RateLimitedRun, error) {
+	rows, err := q.Query(ctx, `SELECT source, max(finished_at) FROM sync.run
+		WHERE error_category = 'rate_limited' AND finished_at IS NOT NULL
+		GROUP BY source ORDER BY source`)
+	if err != nil {
+		return nil, fmt.Errorf("store: last rate limited: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (RateLimitedRun, error) {
+		var l RateLimitedRun
+		err := r.Scan(&l.Source, &l.FinishedAt)
+		return l, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: last rate limited: %w", err)
+	}
+	return out, nil
+}
+
+// HistoryStatus is whether a source's current consent has its history.
+type HistoryStatus struct {
+	Source string
+	OK     bool
+}
+
+// ConsentHistory returns, for each source whose current consent is active, whether a connect run
+// (TrueLayer) or backfill run (Monzo) ended ok at or after the consent's approval.
+func ConsentHistory(ctx context.Context, q DBTX) ([]HistoryStatus, error) {
+	rows, err := q.Query(ctx, `SELECT c.source, EXISTS (
+			SELECT 1 FROM sync.run r
+			WHERE r.source = c.source AND r.kind IN ('connect', 'backfill') AND r.outcome = 'ok'
+			  AND r.finished_at >= c.approved_at)
+		FROM sync.consent c
+		WHERE c.is_current AND c.state = 'active' AND c.approved_at IS NOT NULL
+		ORDER BY c.source`)
+	if err != nil {
+		return nil, fmt.Errorf("store: consent history: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (HistoryStatus, error) {
+		var h HistoryStatus
+		err := r.Scan(&h.Source, &h.OK)
+		return h, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: consent history: %w", err)
+	}
+	return out, nil
+}
+
+// UnansweredConnect is how many connect attempts of a source expired unused in the last 24 hours.
+type UnansweredConnect struct {
+	Source string
+	Count  int
+}
+
+// UnansweredConnects returns, for each source that has had a connect attempt, how many attempts
+// started within the 24 hours before now and expired unused. A source whose attempts are all
+// older reads 0, so a gauge that read 1 reads 0 again.
+func UnansweredConnects(ctx context.Context, q DBTX, now time.Time) ([]UnansweredConnect, error) {
+	rows, err := q.Query(ctx, `SELECT source,
+			count(*) FILTER (WHERE outcome = 'expired' AND started_at > $1::timestamptz - interval '24 hours')
+		FROM sync.connect_attempt GROUP BY source ORDER BY source`, now)
+	if err != nil {
+		return nil, fmt.Errorf("store: unanswered connects: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (UnansweredConnect, error) {
+		var u UnansweredConnect
+		err := r.Scan(&u.Source, &u.Count)
+		return u, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: unanswered connects: %w", err)
+	}
+	return out, nil
+}

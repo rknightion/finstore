@@ -15,6 +15,7 @@ import (
 
 	"github.com/rknightion/finstore/internal/app"
 	"github.com/rknightion/finstore/internal/monzo"
+	"github.com/rknightion/finstore/internal/monzotest"
 	"github.com/rknightion/finstore/internal/semconv"
 	"github.com/rknightion/finstore/internal/telemetry/telemetrytest"
 )
@@ -30,6 +31,8 @@ func TestServeExportsConnectCallbackAndSchedulerTelemetry(t *testing.T) {
 	srv := w.fake.Start()
 	t.Cleanup(srv.Close)
 	cfg.MonzoAPIURL = srv.URL
+	// An open account, so the history fetch has a range to fetch.
+	w.fake.AddAccount(monzotest.Account{ID: "acc_test_1", Type: "uk_retail", Created: time.Now().AddDate(0, -3, 0)})
 	client := &http.Client{
 		Timeout:       30 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -149,6 +152,40 @@ func TestServeExportsConnectCallbackAndSchedulerTelemetry(t *testing.T) {
 		t.Errorf("callback outcomes = %v, want refused and exchanged", outcomes)
 	}
 
+	// The history fetch the exchanged callback started is its own trace, linked to the callback,
+	// and each range it fetched is a root linked to that run.
+	var exchanged telemetrytest.Span
+	for _, c := range callbacks {
+		if c.Attrs[semconv.SpanConnectOutcome] == "exchanged" {
+			exchanged = c
+		}
+	}
+	var backfill *telemetrytest.Span
+	for i, s := range byName[semconv.SpanSyncRun] {
+		if s.Attrs[semconv.SpanRunKind] == "backfill" {
+			backfill = &byName[semconv.SpanSyncRun][i]
+		}
+	}
+	if backfill == nil {
+		t.Fatalf("no backfill sync.run span in %+v", byName[semconv.SpanSyncRun])
+	}
+	if backfill.ParentSpanID != "" || backfill.TraceID == exchanged.TraceID ||
+		len(backfill.LinkTraceIDs) != 1 || backfill.LinkTraceIDs[0] != exchanged.TraceID {
+		t.Errorf("backfill sync.run = %+v, want a root in its own trace linked to the callback trace %s", *backfill, exchanged.TraceID)
+	}
+	if backfill.Attrs[semconv.SpanSource] != "monzo" || backfill.Attrs[semconv.SpanRunID] == "" || backfill.Attrs[semconv.SpanRunOutcome] == "" {
+		t.Errorf("backfill sync.run attributes = %v", backfill.Attrs)
+	}
+	ranges := byName[semconv.SpanMonzoFetchRange]
+	if len(ranges) == 0 {
+		t.Error("the backfill exported no monzo.fetch_range span")
+	}
+	for _, r := range ranges {
+		if r.ParentSpanID != "" || len(r.LinkTraceIDs) != 1 || r.LinkTraceIDs[0] != backfill.TraceID {
+			t.Errorf("monzo.fetch_range = %+v, want a root linked to the backfill run's trace", r)
+		}
+	}
+
 	jobs := byName[semconv.SpanSchedulerJob]
 	var status *telemetrytest.Span
 	for i := range jobs {
@@ -186,6 +223,18 @@ func TestServeExportsConnectCallbackAndSchedulerTelemetry(t *testing.T) {
 	if len(statusLastOK) == 0 || statusLastOK[len(statusLastOK)-1] != 1 {
 		t.Errorf("%s{job=status} = %v, want 1; all points %+v", semconv.MetricSchedulerJobLastOK, statusLastOK,
 			metrics[semconv.MetricSchedulerJobLastOK].Points)
+	}
+
+	// The expired attempt the status job retired is one unanswered connect for monzo, and the
+	// run state it publishes carries the same source label the alerts select on.
+	unanswered := false
+	for _, p := range metrics[semconv.MetricConnectUnanswered].Points {
+		if p.Attrs[semconv.AttrSource] == "monzo" && p.Value == 1 {
+			unanswered = true
+		}
+	}
+	if !unanswered {
+		t.Errorf("%s{source=monzo} = 1 not exported; points %+v", semconv.MetricConnectUnanswered, metrics[semconv.MetricConnectUnanswered].Points)
 	}
 
 	// Nothing a callback carried left the process: not in the decoded signals, and not in a raw

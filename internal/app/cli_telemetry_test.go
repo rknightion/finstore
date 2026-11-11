@@ -281,14 +281,23 @@ func TestServeExportsItsFixedIdentityAndStartTime(t *testing.T) {
 
 	// The status page's own queries are CLIENT spans beneath its server span (a store opened with
 	// telemetry traces what runs under a span); nothing else is exported, and /healthz made none.
-	var spans, dbSpans []telemetrytest.Span
+	// The one other span is Monzo's start-up recovery, `resume`, a root made before the listener
+	// opens (no TrueLayer connection is configured here).
+	var spans, dbSpans, resumes []telemetrytest.Span
 	all := sink.Spans()
 	for _, s := range all {
-		if s.Attrs[semconv.SpanDBSystemName] == "" {
-			spans = append(spans, s)
-		} else {
+		switch {
+		case s.Attrs[semconv.SpanDBSystemName] != "":
 			dbSpans = append(dbSpans, s)
+		case s.Name == semconv.SpanResume:
+			resumes = append(resumes, s)
+		default:
+			spans = append(spans, s)
 		}
+	}
+	if len(resumes) != 1 || resumes[0].ParentSpanID != "" || resumes[0].Attrs[semconv.SpanSource] != "monzo" ||
+		resumes[0].Attrs[semconv.SpanRunOutcome] != "ok" {
+		t.Errorf("resume spans = %+v, want one root for monzo with outcome ok", resumes)
 	}
 	if len(spans) != 1 || spans[0].Name != "GET /{$}" || spans[0].Attrs[semconv.SpanHTTPRoute] != "/{$}" {
 		t.Fatalf("spans = %+v, want only the status page's server span", spans)
@@ -297,8 +306,8 @@ func TestServeExportsItsFixedIdentityAndStartTime(t *testing.T) {
 		t.Error("the status page's queries made no span")
 	}
 	for _, s := range dbSpans {
-		if s.Kind != 3 || !descendsFrom(all, s, spans[0].SpanID) {
-			t.Errorf("database span %q (kind %d) is not a CLIENT descendant of the server span", s.Name, s.Kind)
+		if s.Kind != 3 || (!descendsFrom(all, s, spans[0].SpanID) && (len(resumes) != 1 || !descendsFrom(all, s, resumes[0].SpanID))) {
+			t.Errorf("database span %q (kind %d) is not a CLIENT descendant of the server span or the resume span", s.Name, s.Kind)
 		}
 	}
 	res := spans[0].Resource

@@ -214,7 +214,12 @@ func category(err error) string {
 	if errors.Is(err, ErrConsentLost) {
 		return "consent_lost"
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	// A deadline is a timeout and a real failure; only a cancellation (serve stopping, or a newer
+	// connect replacing this work) is "cancelled", which the state gauges skip.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
 		return "cancelled"
 	}
 	return "internal"

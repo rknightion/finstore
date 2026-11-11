@@ -51,6 +51,44 @@ type statusPublisher struct {
 	now      func() time.Time
 }
 
+// publishRunState sends the gauges the run alerts read, all from the database: each kind of run's
+// latest result, when each source was last rate limited, whether each current consent has its
+// history, and the connect attempts that expired unused. A source with nothing to say for a gauge
+// is skipped, so an alert never sees a series for it (a source never rate limited has no
+// last_rate_limited point). Run kinds an operator command writes (import, capture) are never read.
+func (p *statusPublisher) publishRunState(ctx context.Context) error {
+	db := p.st.DB()
+	runs, err := store.LatestRuns(ctx, db)
+	if err != nil {
+		return err
+	}
+	for _, r := range runs {
+		p.m.LastRun(ctx, r.Source, r.Kind, r.OK, r.FinishedAt)
+	}
+	limited, err := store.LastRateLimited(ctx, db)
+	if err != nil {
+		return err
+	}
+	for _, r := range limited {
+		p.m.LastRateLimited(ctx, r.Source, r.FinishedAt)
+	}
+	history, err := store.ConsentHistory(ctx, db)
+	if err != nil {
+		return err
+	}
+	for _, h := range history {
+		p.m.ConsentHistory(ctx, h.Source, h.OK)
+	}
+	unanswered, err := store.UnansweredConnects(ctx, db, p.now())
+	if err != nil {
+		return err
+	}
+	for _, u := range unanswered {
+		p.m.ConnectsUnanswered(ctx, u.Source, u.Count)
+	}
+	return nil
+}
+
 func (p *statusPublisher) run(ctx context.Context) error {
 	p.m.Up(ctx)
 	if at, ok := readDumpStatus(p.dumpFile); ok {
@@ -79,6 +117,9 @@ func (p *statusPublisher) run(ctx context.Context) error {
 		if s.LastSyncOKAt != nil {
 			p.m.SyncSucceeded(ctx, s.Source, *s.LastSyncOKAt)
 		}
+	}
+	if err := p.publishRunState(ctx); err != nil {
+		return err
 	}
 	coverage, err := store.Coverage(ctx, db)
 	if err != nil {

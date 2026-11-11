@@ -35,6 +35,12 @@ type Metrics struct {
 	jobRuns         metric.Int64Counter
 	jobDuration     metric.Float64Histogram
 	jobLastOK       metric.Int64Gauge
+	syncRunDuration metric.Float64Histogram
+	lastRunOK       metric.Int64Gauge
+	lastRunTime     metric.Int64Gauge
+	lastRateLimited metric.Int64Gauge
+	historyOK       metric.Int64Gauge
+	unanswered      metric.Int64Gauge
 	bank            bankInstruments
 }
 
@@ -75,6 +81,18 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 	gauge(&m.processStart, semconv.MetricProcessStartTime, "s", "Unix time serve started")
 	counter(&m.jobRuns, semconv.MetricSchedulerJobRuns, "Scheduler job runs, by job and outcome (ok, error or panic)")
 	gauge(&m.jobLastOK, semconv.MetricSchedulerJobLastOK, "1", "1 when the job's last run ended ok, 0 otherwise; held in the serve process, so absent after a restart until the job has run")
+	gauge(&m.lastRunOK, semconv.MetricSyncLastRunOK, "1", "1 when the newest finished run of a source and kind ended ok, 0 when it ended partial or failed")
+	gauge(&m.lastRunTime, semconv.MetricSyncLastRunTime, "s", "Unix time the newest finished run of a source and kind ended")
+	gauge(&m.lastRateLimited, semconv.MetricSyncLastRateLimitedTime, "s", "Unix time the newest rate-limited run of a source ended; absent for a source that never had one")
+	gauge(&m.historyOK, semconv.MetricConsentHistoryOK, "1", "1 when a connect or backfill run ended ok since the source's current consent was approved, 0 when none has")
+	gauge(&m.unanswered, semconv.MetricConnectUnanswered, "1", "Connect attempts of a source that expired unused in the last 24 hours")
+	if err == nil {
+		m.syncRunDuration, err = meter.Float64Histogram(semconv.MetricSyncRunDuration,
+			metric.WithUnit("s"), metric.WithDescription("Sync run duration, by source, kind and outcome"))
+		if err != nil {
+			err = fmt.Errorf("create %s: %w", semconv.MetricSyncRunDuration, err)
+		}
+	}
 	if err == nil {
 		m.jobDuration, err = meter.Float64Histogram(semconv.MetricSchedulerJobDuration,
 			metric.WithUnit("s"), metric.WithDescription("Scheduler job run duration, by job"))
@@ -166,6 +184,40 @@ func (m *Metrics) SyncRunWithCategory(ctx context.Context, source, kind, outcome
 		attrs = append(attrs, attribute.String(semconv.AttrErrorCategory, category))
 	}
 	m.syncRuns.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// LastRun records the newest finished run of a source and kind: whether it ended ok (1) or
+// partial or failed (0), and when it finished.
+func (m *Metrics) LastRun(ctx context.Context, source, kind string, ok bool, finishedAt time.Time) {
+	attrs := metric.WithAttributes(attribute.String(semconv.AttrSource, source), attribute.String(semconv.AttrKind, kind))
+	var v int64
+	if ok {
+		v = 1
+	}
+	m.lastRunOK.Record(ctx, v, attrs)
+	m.lastRunTime.Record(ctx, finishedAt.Unix(), attrs)
+}
+
+// LastRateLimited records when a source's newest rate-limited run finished. The caller records it
+// only for a source that has had one.
+func (m *Metrics) LastRateLimited(ctx context.Context, source string, at time.Time) {
+	m.lastRateLimited.Record(ctx, at.Unix(), metric.WithAttributes(attribute.String(semconv.AttrSource, source)))
+}
+
+// ConsentHistory records whether a source's current consent has its history: 1 when a connect or
+// backfill run ended ok since the approval, 0 when none has.
+func (m *Metrics) ConsentHistory(ctx context.Context, source string, ok bool) {
+	var v int64
+	if ok {
+		v = 1
+	}
+	m.historyOK.Record(ctx, v, metric.WithAttributes(attribute.String(semconv.AttrSource, source)))
+}
+
+// ConnectsUnanswered records how many of a source's connect attempts expired unused in the last
+// 24 hours.
+func (m *Metrics) ConnectsUnanswered(ctx context.Context, source string, n int) {
+	m.unanswered.Record(ctx, int64(n), metric.WithAttributes(attribute.String(semconv.AttrSource, source)))
 }
 
 // MandatesUnresolved records how many of a source's mandates have no account.
