@@ -589,7 +589,7 @@ identity records included, with one request: a process on such a device is as tr
 ### Client setup
 
 ```sh
-claude mcp add --transport http --scope user finstore https://<your node>.<tailnet>.ts.net/mcp
+claude mcp add --transport http --scope user finstore https://<finance node MagicDNS name>/mcp
 ```
 
 Codex takes an `[mcp_servers.finstore]` entry with `url` set to the same address. No headers or

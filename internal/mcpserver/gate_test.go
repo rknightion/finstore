@@ -225,7 +225,7 @@ func TestGateReportsThePeerFromTheFirstForwardedAddress(t *testing.T) {
 		{"two headers", []string{"100.64.0.7", "10.0.0.1"}, "100.64.0.7"},
 		{"IPv6", []string{"fd7a:115c:a1e0::1"}, "fd7a:115c:a1e0::1"},
 		{"not an address", []string{"not-an-ip"}, ""},
-		{"text a caller could forge into a log line", []string{"1.2.3.4\"}, \"outcome\":\"ok"}, ""},
+		{"text a caller could forge into a log line", []string{"192.0.2.4\"}, \"outcome\":\"ok"}, ""},
 		{"an empty value", []string{""}, ""},
 	}
 	for _, tt := range tests {
