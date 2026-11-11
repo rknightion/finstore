@@ -126,6 +126,10 @@ type FileResult struct {
 	ClosingMinor int64
 	FirstDate    time.Time
 	LastDate     time.Time
+	// AccountRef identifies the bank account the statement says it belongs to, or is empty when
+	// the format names none. The ledger rejects a statement whose AccountRef differs from the one
+	// the account's earlier imports set.
+	AccountRef string
 }
 
 // FileNormaliser turns one stored import file into records. It returns an error when the file
