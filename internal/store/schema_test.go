@@ -114,7 +114,7 @@ func TestBootstrapAndMigrateAreIdempotent(t *testing.T) {
 			t.Errorf("catalog lacks %q", want)
 		}
 	}
-	for _, v := range []string{"accounts", "transactions", "transaction_history", "balances", "coverage", "sync_status"} {
+	for _, v := range agentViews {
 		if !strings.Contains(first, "rel agent."+v+" kind=v owner=finstore_owner") {
 			t.Errorf("agent.%s is not a view owned by finstore_owner", v)
 		}
@@ -183,7 +183,8 @@ func durableTables(t *testing.T, conn *pgx.Conn) map[string][]string {
 	return out
 }
 
-var agentViews = []string{"accounts", "transactions", "transaction_history", "balances", "coverage", "sync_status"}
+var agentViews = []string{"accounts", "transactions", "transaction_history", "balances", "coverage", "sync_status",
+	"pot_transactions", "pot_reconciliation"}
 
 // assertAgentBoundary checks that finstore_agent can read every agent view and no table.
 func assertAgentBoundary(t *testing.T, superURL string) {

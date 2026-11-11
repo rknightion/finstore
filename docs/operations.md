@@ -230,6 +230,48 @@ Start with `agent.coverage`: one row per account with the earliest and latest da
 transaction count, whether the stored transactions agree with the bank's balance, and every known
 gap with its reason. A reader should check it before trusting a total.
 
+Each account and transaction also carries the source's own record, for anything the named columns
+leave out:
+
+- `agent.accounts.detail` is the latest account object Monzo returned for the account (from
+  `/accounts`) or the pot (from `/pots`), as JSON. It is null for a file-fed account. It is read
+  from the newest successful response for each request, newest by when it was fetched, so a
+  capture loaded later with older responses does not replace it. A stored body that cannot be read
+  as JSON is skipped. Monzo keeps closed accounts and deleted pots in those lists. The account
+  object includes Monzo's identifiers for the account (account number and sort code), its owners'
+  names and Monzo user ids, so anyone given `finstore_agent` can read them.
+- `agent.transactions.detail` is the latest version of the transaction's source record: the whole
+  Monzo transaction object, or the parsed statement row for an imported one. Earlier versions are
+  in `agent.transaction_history`.
+- `agent.transactions.pot_slug` names the pot a Monzo pot transfer moved money to or from (the pot
+  id in the transaction's metadata, when it is a pot finstore holds), whatever the transaction's
+  status. It is null for every other transaction.
+
+These columns come after the others, so a query that reads columns by position is unaffected.
+
+Two views follow the money into and out of pots:
+
+- `agent.pot_transactions` has one row per Monzo transaction that moved money into or out of a pot
+  finstore holds: the pot, the account the transfer was made on (which can be a joint account, not
+  the pot's parent), the date and time, `amount_minor` from the pot's side (positive into the pot),
+  the currency, the description, Monzo's `trigger` (such as `coin_jar` for round-ups, `user` or
+  `scheduled_payment`; null when Monzo gives none), the status and the full record in `detail`.
+  Declined transfers are left out, and so are transactions Monzo stopped returning. Pending
+  transfers are kept, because they already move the pot's balance. Some transfers carry the
+  trigger `interest_payout`; they are listed and counted like any other transfer. What Monzo does
+  not list is the interest it credits inside a savings pot.
+- `agent.pot_reconciliation` has one row per pot: its parent account, the pot type Monzo reports
+  (`default` is a plain pot), whether it is closed, its latest balance and when that was read, the
+  net and count of its transfers as at that reading (the transfers in `agent.pot_transactions`
+  made at or before it, so one made since is not counted until the next reading; all of them for a
+  pot with no reading), the difference (balance minus transfers) and a `reason`:
+
+  | `reason` | Means |
+  |---|---|
+  | `matches` | The transfers sum to the balance |
+  | `interest_not_listed` | A savings pot whose balance is above its transfers. Monzo pays the interest inside the pot and does not list it. Only the types `instant_access` and `flexible_savings` count as savings pots; a pot of any other type falls to `unexplained` |
+  | `unexplained` | Anything else, including a pot with no balance reading (its balance and difference are null) |
+
 ### How the data is checked
 
 - **Monzo accounts**: the balance Monzo reports must equal the sum of the stored transactions that
@@ -237,7 +279,10 @@ gap with its reason. A reader should check it before trusting a total.
   that a transaction arriving mid-fetch does not raise a false alarm.
 - **File-fed accounts**: each statement must pass its own checks to be imported at all, and each
   must start from the balance the previous one ended on.
-- **Pots** have balances only; Monzo's API does not list a pot's own transactions.
+- **Pots** have balances only; Monzo's API does not list a pot's own transactions. The transfers
+  in and out of a pot are listed on the account they were made on, and `agent.pot_reconciliation`
+  compares them with the pot's balance. That comparison is information, not a check: it raises no
+  alarm.
 
 ## Backups
 
