@@ -9,13 +9,15 @@ One container runs `finstore serve`: an HTTP server with a status page, a schedu
 worker. One container runs PostgreSQL 18. A host timer dumps the database to a file for your backup
 tool. Nothing else is needed.
 
-The service must not be reachable from the public internet. It expects a reverse proxy in front that
-signs users in and passes the signed-in address in a request header.
+The service must not be reachable from the public internet. It expects something in front that
+knows who the user is and passes their address in a request header. The example in `deploy/` uses a
+Tailscale sidecar for that; a reverse proxy with single sign-on works too.
 
 ## Setup
 
-1. Copy `deploy/docker-compose.yaml`, `deploy/finstore.env.example` (as `finstore.env`) and
-   `deploy/owner.env.example` (as `owner.env`). Set every `CHANGE-ME` value. Keep both env files at
+1. Copy `deploy/docker-compose.yaml`, `deploy/ts/tailscale-serve.json` (into `ts/`),
+   `deploy/finstore.env.example` (as `finstore.env`), `deploy/owner.env.example` (as `owner.env`)
+   and `deploy/ts.env.example` (as `ts.env`). Set every `CHANGE-ME` value. Keep the env files at
    mode 600.
 2. Register an OAuth client at <https://developers.monzo.com>: confidential, with the redirect URL
    `<FINSTORE_PUBLIC_URL>/callback/monzo`. Put its id and secret in `finstore.env`.
@@ -25,15 +27,35 @@ signs users in and passes the signed-in address in a request header.
    docker compose up -d finstore-db
    docker compose run --rm finstore-admin bootstrap
    docker compose run --rm finstore-admin migrate
-   docker compose up -d finstore
+   docker compose up -d finstore finstore-ts
    ```
 
-4. Put the proxy in front (next section), open the status page, and connect Monzo.
+4. Open the status page from a device signed in to your tailnet, and connect Monzo.
 5. Install the dump script and its timer (see "Backups").
 
-### The proxy
+### The front door: a Tailscale sidecar
 
-Two routes to the service's port 8080, both restricted to your private network:
+The example gives the service its own tailnet node. `finstore-ts` runs Tailscale in userspace mode
+with no capabilities, and `tailscale serve` terminates HTTPS for `<TS_HOSTNAME>.<tailnet>.ts.net`
+and proxies to `finstore:8080`. Nothing else reaches the service: it publishes no port and shares
+no network.
+
+- **Who it is.** For a request from a user's device, `tailscale serve` adds `Tailscale-User-Login`
+  and drops any copy the client sent. Set `FINSTORE_AUTH_HEADER=Tailscale-User-Login` and list your
+  tailnet login in `FINSTORE_ALLOWED_EMAILS`. A tagged device gets no header, so it gets 404.
+- **Who can connect.** Before minting the auth key, add the tag to `tagOwners` in your tailnet
+  policy and grant only the users who should reach it, on port 443. Policy tests that deny your
+  servers' tags are cheap insurance.
+- **The auth key** is used once. After the first login the node's identity is in `data/ts-state`;
+  losing that directory needs a new key.
+- **Why not a proxy's IP allow-list.** On a host that is itself a Tailscale subnet router or exit
+  node, tailscaled masquerades tailnet traffic forwarded into Docker, so a reverse proxy in a
+  container sees every tailnet client as the Docker gateway and cannot tell them from the host.
+
+### Or: a sign-in proxy
+
+Any reverse proxy that signs users in also works. Two routes to the service's port 8080, both
+restricted to your private network:
 
 | Route | Sign-in | Why |
 |---|---|---|
@@ -160,7 +182,7 @@ Environment variables only.
 | `FINSTORE_LISTEN_ADDR` | `serve`, `healthcheck` | `:8080` | Address the HTTP server binds |
 | `FINSTORE_PUBLIC_URL` | `serve` | none | Base URL users reach the service at |
 | `FINSTORE_ALLOWED_EMAILS` | `serve` | none | Comma-separated addresses allowed to use the pages |
-| `FINSTORE_AUTH_HEADER` | `serve` | `X-Auth-Request-Email` | Header carrying the signed-in address |
+| `FINSTORE_AUTH_HEADER` | `serve` | `X-Auth-Request-Email` | Header carrying the signed-in address (`Tailscale-User-Login` with the sidecar) |
 | `FINSTORE_MONZO_CLIENT_ID`, `FINSTORE_MONZO_CLIENT_SECRET` | `serve` | none | The OAuth client |
 | `FINSTORE_MONZO_API_URL` | `serve` | `https://api.monzo.com` | |
 | `FINSTORE_MONZO_AUTH_URL` | `serve` | `https://auth.monzo.com/` | |

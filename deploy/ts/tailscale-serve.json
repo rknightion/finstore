@@ -1,0 +1,4 @@
+{
+  "TCP": {"443": {"HTTPS": true}},
+  "Web": {"${TS_CERT_DOMAIN}:443": {"Handlers": {"/": {"Proxy": "http://finstore:8080"}}}}
+}

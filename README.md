@@ -22,14 +22,15 @@ for personal use only.
 ## Running it
 
 `docs/operations.md` is the guide and `deploy/` is a working example. In short: a Postgres 18
-database, one container, a Monzo OAuth client of your own, and a reverse proxy that puts single
-sign-on in front of the status page. Nothing should be reachable from the public internet.
+database, one container, a Monzo OAuth client of your own, and something in front that knows who
+the user is: the example gives the service its own Tailscale node, and a reverse proxy with single
+sign-on works too. Nothing should be reachable from the public internet.
 
 ```sh
 docker compose up -d finstore-db
 docker compose run --rm finstore-admin bootstrap
 docker compose run --rm finstore-admin migrate
-docker compose up -d finstore
+docker compose up -d finstore finstore-ts
 ```
 
 Then open the status page and connect Monzo.
