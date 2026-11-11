@@ -13,6 +13,10 @@ const (
 	AttrServiceVersion        = "service.version"
 	AttrServiceInstanceID     = "service.instance.id"
 	AttrDeploymentEnvironment = "deployment.environment.name"
+	// AttrProcessRole is "serve" for the long-running service and "cli" for a one-off command.
+	AttrProcessRole = "finstore.process.role"
+	// AttrCommand names the CLI command a process runs, such as "account add". It is absent on serve.
+	AttrCommand = "finstore.command"
 )
 
 // Metric names.
@@ -34,6 +38,44 @@ const (
 	MetricTrueLayerCardsUnlisted = "finstore.truelayer.cards_unlisted"
 )
 
+// Metric names declared for the telemetry work that follows the telemetry core. Later changes
+// record them; none is recorded yet except where noted.
+const (
+	// MetricBankRequestDuration is a histogram (s) of one bank attempt, by source, endpoint and
+	// status_class ("no_response" when the attempt got no HTTP response).
+	MetricBankRequestDuration = "finstore.bank.request.duration"
+	// MetricBankRetries counts bank retries by source, endpoint and reason (AttrReason).
+	MetricBankRetries = "finstore.bank.retries"
+	// MetricSyncRunDuration is a histogram (s) of a finished run, by source, kind and outcome.
+	MetricSyncRunDuration = "finstore.sync.run.duration"
+	// MetricSchedulerJobRuns counts scheduler job runs by job and outcome.
+	MetricSchedulerJobRuns = "finstore.scheduler.job.runs"
+	// MetricSchedulerJobDuration is a histogram (s) of a scheduler job run, by job.
+	MetricSchedulerJobDuration = "finstore.scheduler.job.duration"
+	// MetricSchedulerJobLastOK is 1 or 0 for the job's last run, held in the serve process.
+	MetricSchedulerJobLastOK = "finstore.scheduler.job.last_ok"
+	// MetricWriterLockHeld is an observable gauge (s) of how long the writer lock has been held,
+	// by holder (AttrHolder). It reports nothing while the lock is free.
+	MetricWriterLockHeld = "finstore.store.writer_lock.held"
+	// MetricProcessStartTime is the Unix time serve started. Recorded by serve only.
+	MetricProcessStartTime = "finstore.process.start.time"
+	// MetricTelemetryExportFailures counts failed exports by signal (AttrSignal).
+	MetricTelemetryExportFailures = "finstore.telemetry.export.failures"
+	// MetricTelemetrySpanAttributesDropped counts span attribute keys the exporter allow-list
+	// removed, by key (AttrKey).
+	MetricTelemetrySpanAttributesDropped = "finstore.telemetry.span_attributes.dropped"
+	// MetricSyncLastRunOK is 1 when the latest finished run of a source and kind ended ok, else 0.
+	MetricSyncLastRunOK = "finstore.sync.last_run.ok"
+	// MetricSyncLastRunTime is when that run finished (Unix seconds).
+	MetricSyncLastRunTime = "finstore.sync.last_run.time"
+	// MetricSyncLastRateLimitedTime is when a source's newest rate-limited run finished.
+	MetricSyncLastRateLimitedTime = "finstore.sync.last_rate_limited.time"
+	// MetricConsentHistoryOK is 1 when the current consent's history fetch ended ok, else 0.
+	MetricConsentHistoryOK = "finstore.consent.history_ok"
+	// MetricConnectUnanswered counts connect attempts that expired unused in the last 24 hours.
+	MetricConnectUnanswered = "finstore.connect.unanswered"
+)
+
 // Metric attribute keys.
 const (
 	AttrSource      = "source"
@@ -48,6 +90,24 @@ const (
 	// AttrErrorCategory is a finished run's error category on finstore.sync.runs, present only
 	// when the run recorded one: a fixed category word, never text from a response.
 	AttrErrorCategory = "error_category"
+	// AttrReason is why a bank call was retried: rate_limited, server_error, timeout or network.
+	AttrReason = "reason"
+	// AttrJob is a scheduler job's registered name.
+	AttrJob = "job"
+	// AttrHolder is who holds the writer lock; the values are fixed words chosen in code.
+	AttrHolder = "holder"
+	// AttrSignal is the telemetry signal an export carried: traces, metrics or logs.
+	AttrSignal = "signal"
+	// AttrKey is a span attribute key the exporter allow-list removed. Keys come from code, never
+	// from data.
+	AttrKey = "key"
+)
+
+// Signal values for AttrSignal.
+const (
+	SignalTraces  = "traces"
+	SignalMetrics = "metrics"
+	SignalLogs    = "logs"
 )
 
 // Log field keys.
@@ -82,3 +142,126 @@ func LogFields() []string { return slices.Clone(logFields) }
 
 // IsLogField reports whether key is an allowed log field.
 func IsLogField(key string) bool { return slices.Contains(logFields, key) }
+
+// Span names. Every span a finstore package starts is named here; libraries name their own.
+const (
+	SpanConnect           = "connect"
+	SpanCallback          = "callback"
+	SpanSchedulerJob      = "scheduler.job"
+	SpanSyncRun           = "sync.run"
+	SpanMonzoFetchRange   = "monzo.fetch_range"
+	SpanResume            = "resume"
+	SpanWriterLock        = "store.writer_lock"
+	SpanLedgerCatchUp     = "ledger.catch_up"
+	SpanRenormaliseCreate = "ledger.renormalise.create"
+	SpanRenormaliseCatch  = "ledger.renormalise.catch_up"
+	SpanRenormaliseDiff   = "ledger.renormalise.diff"
+	SpanRenormaliseSwap   = "ledger.renormalise.swap"
+	SpanCaptureDirectory  = "capture.directory"
+	SpanCaptureFetch      = "capture.fetch"
+)
+
+// SpanCommandPrefix starts the name of a CLI command's root span: "finstore account add".
+const SpanCommandPrefix = "finstore "
+
+// Span attribute keys that are not finstore's own. The names follow the OpenTelemetry semantic
+// conventions; the ones libraries set are listed so the exporter allow-list can keep them.
+const (
+	SpanHTTPRequestMethod         = "http.request.method"
+	SpanHTTPRequestMethodOriginal = "http.request.method_original"
+	SpanHTTPResponseStatusCode    = "http.response.status_code"
+	SpanHTTPRoute                 = "http.route"
+	SpanURLPath                   = "url.path"
+	SpanURLScheme                 = "url.scheme"
+	SpanURLTemplate               = "url.template"
+	SpanURLFull                   = "url.full"
+	SpanServerAddress             = "server.address"
+	SpanServerPort                = "server.port"
+	SpanNetworkPeerAddress        = "network.peer.address"
+	SpanNetworkPeerPort           = "network.peer.port"
+	SpanNetworkProtocolName       = "network.protocol.name"
+	SpanNetworkProtocolVersion    = "network.protocol.version"
+	SpanClientAddress             = "client.address"
+	SpanUserAgentOriginal         = "user_agent.original"
+	SpanHTTPRequestResendCount    = "http.request.resend_count"
+	SpanHTTPRequestBodySize       = "http.request.body.size"
+	SpanHTTPResponseBodySize      = "http.response.body.size"
+	SpanErrorType                 = "error.type"
+	SpanDBSystemName              = "db.system.name"
+	SpanDBNamespace               = "db.namespace"
+	SpanDBQueryText               = "db.query.text"
+	SpanDBOperationName           = "db.operation.name"
+	SpanDBCollectionName          = "db.collection.name"
+	SpanDBOperationBatchSize      = "db.operation.batch.size"
+	SpanUserName                  = "user.name"
+	SpanPgxOperationType          = "pgx.operation.type"
+	SpanPgxSQLState               = "pgx.sql_state"
+	SpanProcessExitCode           = "process.exit.code"
+)
+
+// finstore's own span attribute keys.
+const (
+	SpanSource         = "finstore.source"
+	SpanConnectOutcome = "finstore.connect.outcome"
+	SpanJob            = "finstore.job"
+	SpanJobOutcome     = "finstore.job.outcome"
+	SpanRunKind        = "finstore.run.kind"
+	SpanRunID          = "finstore.run.id"
+	SpanRunOutcome     = "finstore.run.outcome"
+	SpanRunPages       = "finstore.run.pages"
+	SpanRunRows        = "finstore.run.rows"
+	SpanRangeStart     = "finstore.range.start"
+	SpanRangeEnd       = "finstore.range.end"
+	SpanBankCode       = "finstore.bank.code"
+	SpanLockHolder     = "finstore.lock.holder"
+	SpanLockWaitMS     = "finstore.lock.wait_ms"
+	SpanCount          = "finstore.count"
+	SpanCommand        = AttrCommand
+)
+
+// spanAttributes is the span exporter's allow-list. pgx.query.parameters is deliberately absent,
+// as is every header, query string and exception key: a library upgrade that adds a key shows up
+// as a dropped-key count, never as a leak.
+var spanAttributes = []string{
+	SpanHTTPRequestMethod, SpanHTTPRequestMethodOriginal, SpanHTTPResponseStatusCode, SpanHTTPRoute,
+	SpanURLPath, SpanURLScheme, SpanURLTemplate, SpanURLFull, SpanServerAddress, SpanServerPort,
+	SpanNetworkPeerAddress, SpanNetworkPeerPort, SpanNetworkProtocolName, SpanNetworkProtocolVersion,
+	SpanClientAddress, SpanUserAgentOriginal, SpanHTTPRequestResendCount, SpanHTTPRequestBodySize,
+	SpanHTTPResponseBodySize, SpanErrorType, SpanDBSystemName, SpanDBNamespace, SpanDBQueryText,
+	SpanDBOperationName, SpanDBCollectionName, SpanDBOperationBatchSize, SpanUserName,
+	SpanPgxOperationType, SpanPgxSQLState, SpanProcessExitCode,
+	SpanSource, SpanConnectOutcome, SpanJob, SpanJobOutcome, SpanRunKind, SpanRunID, SpanRunOutcome,
+	SpanRunPages, SpanRunRows, SpanRangeStart, SpanRangeEnd, SpanBankCode, SpanLockHolder,
+	SpanLockWaitMS, SpanCount, SpanCommand,
+}
+
+// SpanAttributes returns the span attribute keys the exporter allows.
+func SpanAttributes() []string { return slices.Clone(spanAttributes) }
+
+// IsSpanAttribute reports whether key may leave the process on a span.
+func IsSpanAttribute(key string) bool { return slices.Contains(spanAttributes, key) }
+
+// IsStatusCategory reports whether word is a fixed error category that may be a span's status
+// description: the bank client's categories, the run categories, the ledger's rejection
+// categories and database_error. Anything else in a status is free text, which the exporter
+// replaces.
+func IsStatusCategory(word string) bool { return slices.Contains(statusCategories, word) }
+
+// statusCategories are the words finstore code passes to telemetry.Fail. The bank client's
+// categories and the run, ledger and connect categories are fixed words; none carries anything
+// from a response, a file or a request.
+var statusCategories = []string{
+	// bankhttp.Category.
+	"timeout", "network", "rate_limited", "server_error", "unauthorised",
+	"forbidden_insufficient_permissions", "forbidden_verification_required", "bad_request",
+	"unexpected_status",
+	// Run categories (monzo, truelayer, consent).
+	"history_failed", "consent_lost", "superseded", "interrupted", "card_key_shared", "cards_refused",
+	"window_closed", "timestamp_group_over_page", "unexpected_body", "cancelled", "internal",
+	// Import and ledger rejections.
+	"check_failed", "account_mismatch", "unknown_format", "rejected_before",
+	// Connect and callback failures.
+	"attempt_read", "exchange",
+	// Other.
+	"database_error", "error",
+}

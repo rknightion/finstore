@@ -24,14 +24,18 @@ jobs:
     outputs:
       commit: ${{ steps.build.outputs.commit }}
       build_date: ${{ steps.build.outputs.build_date }}
+      version: ${{ steps.build.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - id: build
         run: |
-          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "build_date=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "build_date=$(git show -s --format=%cI HEAD)"
+            echo "version=main-$(git rev-parse --short=7 HEAD)"
+          } >> "$GITHUB_OUTPUT"
   image:
     name: publish image
     needs: metadata
@@ -47,5 +51,6 @@ jobs:
       release-tag: ""
       dockerfile: Dockerfile
       build-args: |
+        VERSION=${{ needs.metadata.outputs.version }}
         COMMIT=${{ needs.metadata.outputs.commit }}
         BUILD_DATE=${{ needs.metadata.outputs.build_date }}

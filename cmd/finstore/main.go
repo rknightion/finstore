@@ -72,7 +72,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		_, _ = fmt.Fprintln(stderr, "finstore:", err)
 		return app.ExitError
 	}
-	env := app.Env{Cfg: cfg, Stdin: stdin, Stdout: stdout, Stderr: stderr}
+	env := app.Env{Cfg: cfg, Stdin: stdin, Stdout: stdout, Stderr: stderr, Version: version}
 
 	flags := func(name string) *flag.FlagSet {
 		fs := flag.NewFlagSet("finstore "+name, flag.ContinueOnError)

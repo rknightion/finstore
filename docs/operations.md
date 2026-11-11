@@ -331,8 +331,11 @@ Environment variables only.
 | `FINSTORE_TRUELAYER_API_URL` | `serve` | `https://api.truelayer.com` | TrueLayer's Data API |
 | `FINSTORE_TIMEZONE` | all | `Europe/London` | Zone for a transaction's day and for the nightly time. Changing it after data is stored needs a `renormalise`, or days are mixed between the two zones |
 | `FINSTORE_DUMP_STATUS_FILE` | `serve` | empty | The dump script's status file; the dump metric is off when empty |
-| `FINSTORE_OTLP_ENDPOINT`, `FINSTORE_OTLP_INSTANCE_ID`, `FINSTORE_OTLP_TOKEN` | `serve` | empty | OTLP over HTTP with basic auth; export is off when the endpoint is empty |
-| `FINSTORE_ENVIRONMENT` | `serve` | `dev` | Value of `deployment.environment.name` |
+| `FINSTORE_OTLP_ENDPOINT`, `FINSTORE_OTLP_INSTANCE_ID`, `FINSTORE_OTLP_TOKEN` | `serve` and every command except `bootstrap`, `healthcheck`, `version` and `help` | empty | OTLP over HTTP with basic auth, for traces (`/v1/traces`), metrics and logs; export is off when the endpoint is empty. A command whose OTLP settings are unusable runs without telemetry and says so on stderr |
+| `FINSTORE_ENVIRONMENT` | `serve` and the same commands | `dev` | Value of `deployment.environment.name` |
+| `OTEL_SDK_DISABLED` | `serve` and the same commands | unset | `true` turns every telemetry provider into a no-op, whatever the OTLP settings say |
+| `OTEL_RESOURCE_ATTRIBUTES` | `serve` and the same commands | unset | Adds resource attributes. It cannot change `service.name`, `service.version`, `service.instance.id`, `deployment.environment.name` or `finstore.process.role`: finstore's own values win. `OTEL_SERVICE_NAME` is not read |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | `serve` and the same commands | `parentbased_always_on` | The SDK's trace sampler. `always_off` stops traces only |
 | `FINSTORE_LOG_LEVEL` | all | `info` | `debug`, `info`, `warn` or `error` |
 
 ## The data
@@ -573,6 +576,46 @@ metric value, a label or a log field; the log handler drops any field that is no
 | `finstore.import.last.time` | `account` | Unix time of the newest statement date imported |
 | `finstore.dump.last_success.time` | none | Unix time from the dump status file |
 | `finstore.up` | none | 1, sent every minute |
+| `finstore.process.start.time` | none | Unix time `serve` started. The value changes at each start, so `changes()` over it counts restarts |
+| `finstore.telemetry.export.failures` (counter) | `signal` | Exports that failed, by `traces`, `metrics` or `logs` |
+| `finstore.telemetry.span_attributes.dropped` (counter) | `key` | Span attributes the exporter allow-list removed, by key. A key here is a library that added an attribute; nothing leaked |
+| `http.server.request.duration` | OpenTelemetry HTTP server attributes, including `http.route` | Duration of every request except `GET /healthz`, in seconds, with buckets from 5 ms to 90 s |
+| `go.goroutine.count`, `go.memory.used`, `go.memory.allocated`, `go.memory.gc.goal`, `go.processor.limit`, `go.config.gogc` | none | Go runtime metrics |
+
+### Identity
+
+Every process exports one resource: `service.name` `finstore`, `service.version` (the image tag,
+such as `main-659f3b6`, or `dev` for an unlabelled build), `deployment.environment.name` and
+`finstore.process.role`.
+
+| Process | `service.instance.id` | `finstore.command` |
+|---|---|---|
+| `serve` | the fixed word `serve`, so its series keep their labels across restarts | absent |
+| A command (`migrate`, `renormalise`, `account add`, `account list`, `account accept-difference`, `account end`, `import`, `load-capture`, `coverage`) | a new UUID for each run, so a command never writes `serve`'s series | the command's name |
+
+`bootstrap`, `healthcheck`, `version` and `help` export nothing. `bootstrap` executes `CREATE ROLE`
+with a password, and the health check runs every 30 seconds.
+
+### Traces
+
+`serve` makes a server span for every request except `GET /healthz`, named for the route that
+answered (`GET /{$}`) and carrying `http.route`, the method, the status and the path, never the
+query string or a header. A `traceparent` header on an incoming request becomes a link, never the
+parent; finstore sends none to a bank. Each command makes a root span named `finstore <command>`
+with `process.exit.code`; a non-zero exit marks it as an error.
+
+One allow-list at the exporter is the only redaction layer for spans. A span attribute whose key is
+not on it is dropped and counted (`finstore.telemetry.span_attributes.dropped`); `url.full` is kept
+only without a query, fragment or credentials; no span event leaves the process, so an exception
+message never does; and a failed span's status text is kept only when it is one of finstore's fixed
+category words or a five-character SQLSTATE, otherwise it reads `error`. The list is in
+`internal/semconv`.
+
+### Logs and trace ids
+
+Logs go to OTLP and to stderr, from `serve` and from every command that sets telemetry up. A record
+written inside a span carries that span's `trace_id` and `span_id`: OTLP records as their trace
+fields, and the JSON lines on stderr (what `docker logs` shows) as `trace_id` and `span_id` keys.
 
 Alerts worth having: no successful sync for 3 hours (13 hours for a `truelayer:` source, which syncs
 twice a day); consent ending within 14 days; consent `lost`

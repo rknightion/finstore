@@ -19,13 +19,17 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/rknightion/finstore/internal/capture"
 	"github.com/rknightion/finstore/internal/config"
 	"github.com/rknightion/finstore/internal/importer"
 	"github.com/rknightion/finstore/internal/ledger"
 	"github.com/rknightion/finstore/internal/monzo"
+	"github.com/rknightion/finstore/internal/semconv"
 	"github.com/rknightion/finstore/internal/store"
 	"github.com/rknightion/finstore/internal/telemetry"
 	"github.com/rknightion/finstore/internal/truelayer"
@@ -84,6 +88,8 @@ type Env struct {
 	Stdout io.Writer
 	Stderr io.Writer
 	Now    func() time.Time
+	// Version is the build's version string, reported as service.version in telemetry.
+	Version string
 }
 
 func (e Env) now() time.Time {
@@ -93,7 +99,60 @@ func (e Env) now() time.Time {
 	return time.Now()
 }
 
-func (e Env) logger() *slog.Logger { return telemetry.NewLogger(e.Stderr, e.Cfg.LogLevel) }
+// cliShutdownTimeout bounds how long a command waits to flush its telemetry, so a dead collector
+// cannot hang it.
+const cliShutdownTimeout = 5 * time.Second
+
+// cliTelemetry is what a CLI command runs with: the providers, the instruments and a logger that
+// writes to stderr and to OTLP.
+type cliTelemetry struct {
+	Providers *telemetry.Providers
+	Metrics   *telemetry.Metrics
+	Log       *slog.Logger
+}
+
+// withTelemetry runs fn as the CLI command named command (for example "account add"). It owns
+// the command's telemetry: Setup under a per-invocation identity, a root span named
+// "finstore <command>" that ends with the exit code, a logger whose records reach OTLP with the
+// span's trace id, and a flush within cliShutdownTimeout. Telemetry never decides the outcome:
+// settings that cannot export leave the command running with no telemetry, and one line on
+// stderr that does not repeat the setting.
+//
+// Bootstrap, healthcheck, version and help never come through here. Bootstrap executes CREATE
+// ROLE with a password literal, and the health check runs every 30 seconds.
+func (e Env) withTelemetry(ctx context.Context, command string, fn func(ctx context.Context, t cliTelemetry) int) (code int) {
+	id := telemetry.Identity{Role: telemetry.RoleCLI, Command: command, Version: e.Version, InstanceID: uuid.NewString()}
+	providers, err := telemetry.Setup(ctx, e.Cfg, id)
+	if err != nil {
+		_, _ = fmt.Fprintln(e.Stderr, "finstore: telemetry disabled: the OTLP settings are not usable")
+		off := e.Cfg
+		off.OTLPEndpoint = ""
+		if providers, err = telemetry.Setup(ctx, off, id); err != nil {
+			return e.fail(err)
+		}
+	}
+	metrics, err := telemetry.NewMetrics(providers.Meter)
+	if err != nil {
+		return e.fail(err)
+	}
+	ctx, span := providers.Tracer(semconv.ServiceName).Start(ctx, semconv.SpanCommandPrefix+command,
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(attribute.String(semconv.SpanCommand, command)))
+	code = ExitError // what a panic leaves
+	defer func() {
+		span.SetAttributes(attribute.Int(semconv.SpanProcessExitCode, code))
+		if code != ExitOK {
+			telemetry.Fail(span, "error")
+		}
+		span.End()
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cliShutdownTimeout)
+		defer cancel()
+		_ = providers.Shutdown(sctx)
+	}()
+	log := telemetry.NewLogger(e.Stderr, e.Cfg.LogLevel, providers.LogHandler)
+	code = fn(ctx, cliTelemetry{Providers: providers, Metrics: metrics, Log: log})
+	return code
+}
 
 func (e Env) fail(err error) int {
 	_, _ = fmt.Fprintln(e.Stderr, "finstore:", err)
@@ -131,6 +190,10 @@ func Bootstrap(ctx context.Context, e Env) int {
 
 // Migrate applies the migrations and the grants as the owner.
 func Migrate(ctx context.Context, e Env) int {
+	return e.withTelemetry(ctx, "migrate", func(ctx context.Context, _ cliTelemetry) int { return migrate(ctx, e) })
+}
+
+func migrate(ctx context.Context, e Env) int {
 	if err := e.Cfg.Require("migrate"); err != nil {
 		return e.fail(err)
 	}
@@ -149,6 +212,12 @@ func Migrate(ctx context.Context, e Env) int {
 // Renormalise rebuilds core from raw as the owner. With verify it changes nothing and returns
 // ExitDifference when the rebuilt copy differs from the live one.
 func Renormalise(ctx context.Context, e Env, verify bool) int {
+	return e.withTelemetry(ctx, "renormalise", func(ctx context.Context, t cliTelemetry) int {
+		return renormalise(ctx, e, t, verify)
+	})
+}
+
+func renormalise(ctx context.Context, e Env, t cliTelemetry, verify bool) int {
 	if err := e.Cfg.Require("renormalise"); err != nil {
 		return e.fail(err)
 	}
@@ -157,7 +226,7 @@ func Renormalise(ctx context.Context, e Env, verify bool) int {
 		return e.fail(err)
 	}
 	defer st.Close()
-	l := NewLedger(e.Cfg.Timezone, e.logger())
+	l := NewLedger(e.Cfg.Timezone, t.Log)
 	var diffs []store.CoreDiff
 	err = st.HoldWriterLock(ctx, func(ctx context.Context, conn *pgx.Conn) error {
 		var err error
@@ -215,7 +284,7 @@ func (s AccountSpec) validate() error {
 }
 
 // withWriter opens the app store and runs fn under the writer lock in one transaction.
-func withWriter(ctx context.Context, e Env, command string, fn func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error) error {
+func withWriter(ctx context.Context, e Env, log *slog.Logger, command string, fn func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error) error {
 	if err := e.Cfg.Require(command); err != nil {
 		return err
 	}
@@ -224,12 +293,18 @@ func withWriter(ctx context.Context, e Env, command string, fn func(ctx context.
 		return err
 	}
 	defer st.Close()
-	l := NewLedger(e.Cfg.Timezone, e.logger())
+	l := NewLedger(e.Cfg.Timezone, log)
 	return st.WithWriterLock(ctx, func(ctx context.Context, tx pgx.Tx) error { return fn(ctx, tx, l) })
 }
 
 // AccountAdd creates a file-fed account by writing an operator entry and normalising it.
 func AccountAdd(ctx context.Context, e Env, spec AccountSpec) int {
+	return e.withTelemetry(ctx, "account add", func(ctx context.Context, t cliTelemetry) int {
+		return accountAdd(ctx, e, t, spec)
+	})
+}
+
+func accountAdd(ctx context.Context, e Env, t cliTelemetry, spec AccountSpec) int {
 	if err := spec.validate(); err != nil {
 		return e.fail(err)
 	}
@@ -237,7 +312,7 @@ func AccountAdd(ctx context.Context, e Env, spec AccountSpec) int {
 	if err != nil {
 		return e.fail(err)
 	}
-	err = withWriter(ctx, e, "account", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
+	err = withWriter(ctx, e, t.Log, "account", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
 		core, err := store.NewCore(tx, store.SchemaCore)
 		if err != nil {
 			return err
@@ -264,6 +339,10 @@ func AccountAdd(ctx context.Context, e Env, spec AccountSpec) int {
 
 // AccountList prints every account.
 func AccountList(ctx context.Context, e Env) int {
+	return e.withTelemetry(ctx, "account list", func(ctx context.Context, _ cliTelemetry) int { return accountList(ctx, e) })
+}
+
+func accountList(ctx context.Context, e Env) int {
 	if err := e.Cfg.Require("account"); err != nil {
 		return e.fail(err)
 	}
@@ -291,11 +370,17 @@ func AccountList(ctx context.Context, e Env) int {
 
 // AcceptDifference records that an account's current balance difference is known and accepted.
 func AcceptDifference(ctx context.Context, e Env, slug, reason string) int {
+	return e.withTelemetry(ctx, "account accept-difference", func(ctx context.Context, t cliTelemetry) int {
+		return acceptDifference(ctx, e, t, slug, reason)
+	})
+}
+
+func acceptDifference(ctx context.Context, e Env, t cliTelemetry, slug, reason string) int {
 	if strings.TrimSpace(reason) == "" {
 		return e.fail(errors.New("--reason is required"))
 	}
 	var diff int64
-	err := withWriter(ctx, e, "account", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
+	err := withWriter(ctx, e, t.Log, "account", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
 		core, err := store.NewCore(tx, store.SchemaCore)
 		if err != nil {
 			return err
@@ -344,6 +429,12 @@ func AcceptDifference(ctx context.Context, e Env, slug, reason string) int {
 // a nil lastDate clears its end, by writing an account_end operator entry and normalising it. The
 // account's rows and readings after the date stay stored but leave the agent views.
 func AccountEnd(ctx context.Context, e Env, slug string, lastDate *time.Time) int {
+	return e.withTelemetry(ctx, "account end", func(ctx context.Context, t cliTelemetry) int {
+		return accountEnd(ctx, e, t, slug, lastDate)
+	})
+}
+
+func accountEnd(ctx context.Context, e Env, t cliTelemetry, slug string, lastDate *time.Time) int {
 	var last *string
 	if lastDate != nil {
 		d := lastDate.Format(time.DateOnly)
@@ -353,7 +444,7 @@ func AccountEnd(ctx context.Context, e Env, slug string, lastDate *time.Time) in
 	if err != nil {
 		return e.fail(err)
 	}
-	err = withWriter(ctx, e, "account", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
+	err = withWriter(ctx, e, t.Log, "account", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
 		core, err := store.NewCore(tx, store.SchemaCore)
 		if err != nil {
 			return err
@@ -384,6 +475,12 @@ func AccountEnd(ctx context.Context, e Env, slug string, lastDate *time.Time) in
 
 // Import reads one statement from standard input and imports it into the account.
 func Import(ctx context.Context, e Env, slug, format, name string) int {
+	return e.withTelemetry(ctx, "import", func(ctx context.Context, t cliTelemetry) int {
+		return importStatement(ctx, e, t, slug, format, name)
+	})
+}
+
+func importStatement(ctx context.Context, e Env, t cliTelemetry, slug, format, name string) int {
 	if format != FormatHalifaxPDF && format != FormatManualCSV {
 		return e.fail(fmt.Errorf("--format must be %s or %s", FormatHalifaxPDF, FormatManualCSV))
 	}
@@ -399,7 +496,7 @@ func Import(ctx context.Context, e Env, slug, format, name string) int {
 	}
 	code := ExitOK
 	var message string
-	err = withWriter(ctx, e, "import", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
+	err = withWriter(ctx, e, t.Log, "import", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
 		core, err := store.NewCore(tx, store.SchemaCore)
 		if err != nil {
 			return err
@@ -479,6 +576,12 @@ func Import(ctx context.Context, e Env, slug, format, name string) int {
 
 // LoadCapture loads capture directories written before the service existed.
 func LoadCapture(ctx context.Context, e Env, dirs []string) int {
+	return e.withTelemetry(ctx, "load-capture", func(ctx context.Context, t cliTelemetry) int {
+		return loadCapture(ctx, e, t, dirs)
+	})
+}
+
+func loadCapture(ctx context.Context, e Env, t cliTelemetry, dirs []string) int {
 	if err := e.Cfg.Require("load-capture"); err != nil {
 		return e.fail(err)
 	}
@@ -490,7 +593,7 @@ func LoadCapture(ctx context.Context, e Env, dirs []string) int {
 		return e.fail(err)
 	}
 	defer st.Close()
-	res, err := capture.Load(ctx, st, NewLedger(e.Cfg.Timezone, e.logger()), dirs, e.now)
+	res, err := capture.Load(ctx, st, NewLedger(e.Cfg.Timezone, t.Log), dirs, e.now)
 	if err != nil {
 		return e.fail(err)
 	}
@@ -506,6 +609,10 @@ func LoadCapture(ctx context.Context, e Env, dirs []string) int {
 
 // Coverage prints the coverage view.
 func Coverage(ctx context.Context, e Env, asJSON bool) int {
+	return e.withTelemetry(ctx, "coverage", func(ctx context.Context, _ cliTelemetry) int { return coverage(ctx, e, asJSON) })
+}
+
+func coverage(ctx context.Context, e Env, asJSON bool) int {
 	if err := e.Cfg.Require("coverage"); err != nil {
 		return e.fail(err)
 	}

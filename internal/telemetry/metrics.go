@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -26,6 +27,7 @@ type Metrics struct {
 	unresolved      metric.Int64Gauge
 	optionalReads   metric.Int64Counter
 	cardsUnlisted   metric.Int64Gauge
+	processStart    metric.Int64Gauge
 }
 
 // NewMetrics creates every instrument on meter.
@@ -62,6 +64,7 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 	gauge(&m.unresolved, semconv.MetricMandatesUnresolved, "1", "Mandates whose account is not known")
 	counter(&m.optionalReads, semconv.MetricTrueLayerOptionalReads, "TrueLayer reads whose answer never reaches the ledger, by endpoint and result")
 	gauge(&m.cardsUnlisted, semconv.MetricTrueLayerCardsUnlisted, "1", "Card accounts the newest card list left out")
+	gauge(&m.processStart, semconv.MetricProcessStartTime, "s", "Unix time serve started")
 	if err != nil {
 		return nil, err
 	}
@@ -163,3 +166,57 @@ func (m *Metrics) DumpSucceeded(ctx context.Context, at time.Time) {
 
 // Up records the liveness gauge as 1. The caller sends it every minute.
 func (m *Metrics) Up(ctx context.Context) { m.up.Record(ctx, 1) }
+
+// ProcessStarted records when serve started, as Unix seconds. The gauge keeps its last value
+// across collections, so a change in the value is a restart.
+func (m *Metrics) ProcessStarted(ctx context.Context, at time.Time) {
+	m.processStart.Record(ctx, at.Unix())
+}
+
+// selfMetrics counts the telemetry pipeline's own trouble: failed exports and span attributes
+// the allow-list removed. Setup builds it before the meter provider exists (the metric exporter
+// it wraps is an input to that provider), so it is bound to a meter afterwards; until then it
+// counts nothing.
+type selfMetrics struct {
+	ins atomic.Pointer[selfInstruments]
+}
+
+type selfInstruments struct {
+	failures metric.Int64Counter
+	dropped  metric.Int64Counter
+}
+
+// newSelfMetrics creates the instruments on meter.
+func newSelfMetrics(meter metric.Meter) (*selfMetrics, error) {
+	s := &selfMetrics{}
+	return s, s.bind(meter)
+}
+
+func (s *selfMetrics) bind(meter metric.Meter) error {
+	failures, err := meter.Int64Counter(semconv.MetricTelemetryExportFailures,
+		metric.WithDescription("Telemetry exports that failed, by signal"))
+	if err != nil {
+		return fmt.Errorf("create %s: %w", semconv.MetricTelemetryExportFailures, err)
+	}
+	dropped, err := meter.Int64Counter(semconv.MetricTelemetrySpanAttributesDropped,
+		metric.WithDescription("Span attributes the exporter allow-list removed, by key"))
+	if err != nil {
+		return fmt.Errorf("create %s: %w", semconv.MetricTelemetrySpanAttributesDropped, err)
+	}
+	s.ins.Store(&selfInstruments{failures: failures, dropped: dropped})
+	return nil
+}
+
+// SpanAttributeDropped counts a span attribute key the exporter removed.
+func (s *selfMetrics) SpanAttributeDropped(ctx context.Context, key string) {
+	if ins := s.ins.Load(); ins != nil {
+		ins.dropped.Add(ctx, 1, metric.WithAttributes(attribute.String(semconv.AttrKey, key)))
+	}
+}
+
+// ExportFailed counts a failed export of signal (traces, metrics or logs).
+func (s *selfMetrics) ExportFailed(ctx context.Context, signal string) {
+	if ins := s.ins.Load(); ins != nil {
+		ins.failures.Add(ctx, 1, metric.WithAttributes(attribute.String(semconv.AttrSignal, signal)))
+	}
+}

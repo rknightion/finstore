@@ -123,7 +123,9 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 	if err := cfg.Require("serve"); err != nil {
 		return err
 	}
-	providers, err := telemetry.Setup(ctx, cfg)
+	providers, err := telemetry.Setup(ctx, cfg, telemetry.Identity{
+		Role: telemetry.RoleServe, Version: e.Version, InstanceID: telemetry.ServeInstanceID,
+	})
 	if err != nil {
 		return err
 	}
@@ -137,6 +139,9 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 	if err != nil {
 		return err
 	}
+	// A restart shows as a change in this gauge's value: serve's series keep their labels across
+	// restarts, so there is no new series to see.
+	metrics.ProcessStarted(ctx, e.now())
 
 	st, err := store.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -241,7 +246,7 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
 	}
-	srv := web.NewHTTPServer(cfg.ListenAddr, pages.Handler())
+	srv := web.NewHTTPServer(cfg.ListenAddr, telemetry.HTTPHandler(pages.Handler(), providers))
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 	if hooks.Listening != nil {
