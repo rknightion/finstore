@@ -567,7 +567,9 @@ metric value, a label or a log field; the log handler drops any field that is no
 |---|---|---|
 | `finstore.sync.last_success.time` | `source` | Unix time of the last successful scheduled sync |
 | `finstore.sync.runs` (counter) | `source`, `kind`, `outcome` | Runs finished |
-| `finstore.bank.requests` (counter) | `source`, `endpoint`, `status_class` | Bank requests made |
+| `finstore.bank.requests` (counter) | `source`, `endpoint`, `status_class` | Bank requests made. `status_class` is `2xx`, `4xx` and so on, or `none` for a request with no usable response. `none` here and `no_response` on `finstore.bank.request.duration` below mean the same thing; the two names differ because the counter's value is older and its published values do not change |
+| `finstore.bank.request.duration` (histogram, seconds) | `source`, `endpoint`, `status_class` | Duration of each bank attempt, retries included, with buckets from 50 ms to 30 s. An attempt with no usable HTTP response has `status_class` `no_response`: none arrived (a transport failure or a timeout), its body could not be read (it was cut off or over the 64 MiB limit) even though a status arrived, or the status was outside 100 to 599. The call then fails with the category `network` or `timeout`, as it does for the counter's `none` |
+| `finstore.bank.retries` (counter) | `source`, `endpoint`, `reason` | Bank calls repeated, by `reason`: `rate_limited`, `server_error`, `timeout` or `network`. A token call is never repeated after a transport failure or a 5xx, so it never counts here for those |
 | `finstore.truelayer.optional_reads` (counter) | `source`, `endpoint`, `result` | TrueLayer reads whose answer never reaches the ledger (pending transactions, Monzo's card list, `/info`), by result: `ok`, `unsupported`, `refused`, `rate_limited` or `failed` |
 | `finstore.truelayer.cards_unlisted` | `source` | How many card accounts that have not ended the newest card list left out |
 | `finstore.consent.state` | `source`, `state` | 1 for the current state, 0 for the others |
@@ -634,6 +636,20 @@ TrueLayer connections share, it is `unknown` until the attempt the `state` belon
 read, and stays `unknown` when the request ends before that (a missing parameter, the bank's error,
 an unusable or unreadable attempt). A `state` issued for another source, such as Monzo's, shows
 that source with the outcome `refused`.
+
+Every call to a bank is two levels of span. A call is one `bank {METHOD} {template}` span (for
+example `bank GET /accounts`) with `finstore.source`, `url.template`, the method and, when the call
+fails, `error.type` (the failure category) and `finstore.bank.code` (the bank's error code, only
+when it is a well-formed code string). Each attempt, including the first, is a `{METHOD}
+{template}` child span with `server.address`, `server.port`, `http.response.status_code` (absent
+when no response came), `error.type` on a failed attempt and `url.full`, which is the scheme, host,
+base path and the allow-list's path template with no query. From the second attempt of a call
+`http.request.resend_count` is the number of attempts before it, so a 429 then a 200 reads as one
+call span, two attempt spans, and one `finstore.bank.retries` count with `reason` `rate_limited`. A
+template such as `/data/v1/accounts/{id}/transactions` names the endpoint: a concrete path holds an
+id from a bank response, so it never appears in a span, and neither does a query, a header or a
+body. finstore sends no trace header to a bank, and a bank sees the same request with telemetry on
+or off.
 
 One allow-list at the exporter is the only redaction layer for spans. A span attribute whose key is
 not on it is dropped and counted (`finstore.telemetry.span_attributes.dropped`); `url.full` is kept

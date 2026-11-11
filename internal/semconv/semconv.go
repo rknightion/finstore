@@ -103,6 +103,19 @@ const (
 	AttrKey = "key"
 )
 
+// StatusClassNoResponse is the status_class of a bank attempt with no usable HTTP response: none
+// arrived (a transport failure or a timeout), its body could not be read, or its status was
+// outside 100 to 599. finstore.bank.requests calls the same thing "none".
+const StatusClassNoResponse = "no_response"
+
+// Values of AttrReason: why a bank call was retried.
+const (
+	RetryReasonRateLimited = "rate_limited"
+	RetryReasonServerError = "server_error"
+	RetryReasonTimeout     = "timeout"
+	RetryReasonNetwork     = "network"
+)
+
 // Signal values for AttrSignal.
 const (
 	SignalTraces  = "traces"
@@ -160,6 +173,10 @@ const (
 	SpanCaptureDirectory  = "capture.directory"
 	SpanCaptureFetch      = "capture.fetch"
 )
+
+// SpanBankCallPrefix starts the name of a logical bank call's span: "bank GET /accounts". An
+// attempt's span is named "GET /accounts", with no prefix.
+const SpanBankCallPrefix = "bank "
 
 // SpanCommandPrefix starts the name of a CLI command's root span: "finstore account add".
 const SpanCommandPrefix = "finstore "

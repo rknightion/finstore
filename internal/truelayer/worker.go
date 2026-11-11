@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/rknightion/finstore/internal/bankhttp"
 	"github.com/rknightion/finstore/internal/consent"
@@ -75,6 +76,8 @@ type Options struct {
 	// Sleep pauses the auth client between retries of a rate-limited token call; nil means a real
 	// timer.
 	Sleep func(ctx context.Context, d time.Duration) error
+	// Tracer makes the spans of bank calls; nil means none.
+	Tracer trace.Tracer
 }
 
 // ErrCallbackRefused is returned by HandleCallback for a state value that is unknown, expired,
@@ -156,7 +159,9 @@ func New(opts Options, st *store.Store, proj Projector, m *telemetry.Metrics, lo
 		return nil, err
 	}
 	source := Source(opts.Connection)
-	authOpts := []bankhttp.Option{bankhttp.WithTokenPath(bankhttp.TrueLayerAuthTokenPath), bankhttp.WithClock(opts.Now)}
+	telemetryOpt := bankhttp.WithTelemetry(opts.Tracer, source, m.BankObserver(source))
+	authOpts := []bankhttp.Option{bankhttp.WithTokenPath(bankhttp.TrueLayerAuthTokenPath), bankhttp.WithClock(opts.Now),
+		telemetryOpt}
 	if opts.Sleep != nil {
 		authOpts = append(authOpts, bankhttp.WithSleep(opts.Sleep))
 	}
@@ -166,7 +171,7 @@ func New(opts Options, st *store.Store, proj Projector, m *telemetry.Metrics, lo
 	}
 	apiBank, err := bankhttp.New(opts.APIURL, bankhttp.TrueLayerAPIRules(),
 		bankhttp.WithRecorder(recorder{q: st.DB(), source: source, metrics: m}),
-		bankhttp.WithClock(opts.Now), bankhttp.WithoutRetries())
+		bankhttp.WithClock(opts.Now), bankhttp.WithoutRetries(), telemetryOpt)
 	if err != nil {
 		return nil, err
 	}
