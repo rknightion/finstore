@@ -36,7 +36,7 @@ func TestLoadDefaults(t *testing.T) {
 
 func TestLoadParsesValues(t *testing.T) {
 	c, err := Load(env(map[string]string{
-		EnvAllowedEmails:     " A@Example.test, ,b@EXAMPLE.test ",
+		EnvAllowedEmails:     " A@Example.com, ,b@EXAMPLE.COM ",
 		EnvMonzoSyncInterval: "15m",
 		EnvMonzoWindow:       "90s",
 		EnvMonzoNightlyAt:    "23:05",
@@ -48,7 +48,7 @@ func TestLoadParsesValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(c.AllowedEmails, "|"); got != "a@example.test|b@example.test" {
+	if got := strings.Join(c.AllowedEmails, "|"); got != "a@example.com|b@example.com" {
 		t.Errorf("emails = %q", got)
 	}
 	if c.MonzoSyncInterval != 15*time.Minute || c.MonzoWindow != 90*time.Second ||
@@ -98,7 +98,7 @@ func TestRequire(t *testing.T) {
 		EnvAppPassword:          "x",
 		EnvOwnerPassword:        "x",
 		EnvPublicURL:            "x",
-		EnvAllowedEmails:        "a@example.test",
+		EnvAllowedEmails:        "a@example.com",
 		EnvMonzoClientID:        "x",
 		EnvMonzoClientSecret:    "x",
 	}
@@ -175,7 +175,7 @@ func TestSecretsAreRedacted(t *testing.T) {
 		EnvOwnerPassword:        "SECRET-MARKER-ownerpw",
 		EnvMonzoClientSecret:    "SECRET-MARKER-client",
 		EnvOTLPToken:            "SECRET-MARKER-token",
-		EnvAllowedEmails:        "SECRET-MARKER-email@example.test",
+		EnvAllowedEmails:        "SECRET-MARKER-email@example.com",
 	}
 	c, err := Load(env(secrets))
 	if err != nil {

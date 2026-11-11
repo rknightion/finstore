@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	allowedEmail = "owner@example.test"
+	allowedEmail = "owner@example.com"
 	authHeader   = "X-Auth-Request-Email"
 )
 
@@ -112,11 +112,11 @@ func ptr[T any](v T) *T { return &v }
 func TestPagesAnswer404ToAnyoneNotOnTheAllowList(t *testing.T) {
 	cases := map[string]map[string]string{
 		"no header":       {},
-		"other address":   {authHeader: "someone@example.test"},
+		"other address":   {authHeader: "someone@example.com"},
 		"empty":           {authHeader: ""},
-		"prefix of entry": {authHeader: "owner@example.tes"},
+		"prefix of entry": {authHeader: allowedEmail[:len(allowedEmail)-1]},
 		"entry as suffix": {authHeader: "x" + allowedEmail},
-		"list of two":     {authHeader: allowedEmail + ",someone@example.test"},
+		"list of two":     {authHeader: allowedEmail + ",someone@example.com"},
 	}
 	for name, header := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -141,7 +141,7 @@ func TestPagesAnswer404ToAnyoneNotOnTheAllowList(t *testing.T) {
 
 func TestAllowListIgnoresCaseAndSpacing(t *testing.T) {
 	h := newServer(t, &fakeConn{}, &fakeReader{}, nil)
-	rec := do(h, http.MethodGet, "/", map[string]string{authHeader: " Owner@Example.Test "})
+	rec := do(h, http.MethodGet, "/", map[string]string{authHeader: " Owner@Example.com "})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET / = %d, want 200", rec.Code)
 	}
@@ -152,7 +152,7 @@ func TestTwoAuthHeaderLinesAreRefused(t *testing.T) {
 	h := newServer(t, &fakeConn{}, &fakeReader{}, nil)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Add(authHeader, allowedEmail)
-	req.Header.Add(authHeader, "someone@example.test")
+	req.Header.Add(authHeader, "someone@example.com")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {

@@ -26,7 +26,7 @@ import (
 
 // Every value in this file is made up.
 const (
-	ownerEmail  = "owner@example.test"
+	ownerEmail  = "owner@example.com"
 	descMarker  = "DESCRIPTION-MARKER-7731"
 	merchMarker = "MERCHANT-MARKER-5512"
 	accountID   = "acc_e2e_current"
