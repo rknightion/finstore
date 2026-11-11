@@ -483,11 +483,14 @@ type HistoryStatus struct {
 }
 
 // ConsentHistory returns, for each source whose current consent is active, whether a connect run
-// (TrueLayer) or backfill run (Monzo) ended ok at or after the consent's approval.
+// (TrueLayer), backfill run (Monzo) or capture run (load-capture, which loads a captured full
+// history; only one that stored at least one response, so a reload of responses already held does
+// not count) ended ok at or after the consent's approval.
 func ConsentHistory(ctx context.Context, q DBTX) ([]HistoryStatus, error) {
 	rows, err := q.Query(ctx, `SELECT c.source, EXISTS (
 			SELECT 1 FROM sync.run r
-			WHERE r.source = c.source AND r.kind IN ('connect', 'backfill') AND r.outcome = 'ok'
+			WHERE r.source = c.source AND r.kind IN ('connect', 'backfill', 'capture') AND r.outcome = 'ok'
+			  AND (r.kind <> 'capture' OR r.rows_seen > 0)
 			  AND r.finished_at >= c.approved_at)
 		FROM sync.consent c
 		WHERE c.is_current AND c.state = 'active' AND c.approved_at IS NOT NULL

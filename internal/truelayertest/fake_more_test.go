@@ -155,3 +155,52 @@ func TestFailWithStatusAndCode(t *testing.T) {
 		t.Errorf("429: %d", st)
 	}
 }
+
+// SetSCAWindow makes the two mandate reads answer 403 sca_exceeded once the window after the code
+// exchange has passed, and nothing else; ClearSCAWindow undoes it.
+func TestSCAWindowRefusesOnlyTheMandateReadsAfterTheWindow(t *testing.T) {
+	f, c := setup(t)
+	f.SetSCAWindow(lloyds, 10*time.Minute)
+	f.RegisterCode(lloyds, "code-a")
+	access, _ := c.exchange("code-a")
+	accountID := func() string {
+		_, d := c.do("GET", "/data/v1/accounts", nil, access)
+		return list(d)[0]["account_id"].(string)
+	}
+	id := accountID()
+	for _, path := range []string{"/standing_orders", "/direct_debits"} {
+		if st, _ := c.do("GET", "/data/v1/accounts/"+id+path, nil, access); st != 200 {
+			t.Errorf("%s inside the window: %d", path, st)
+		}
+	}
+	f.Advance(11 * time.Minute)
+	id = accountID()
+	for _, path := range []string{"/standing_orders", "/direct_debits"} {
+		st, doc := c.do("GET", "/data/v1/accounts/"+id+path, nil, access)
+		desc, _ := doc["error_description"].(string)
+		if st != 403 || doc["error"] != "sca_exceeded" || !strings.Contains(desc, "SCA exemption has expired") {
+			t.Errorf("%s after the window: %d %v", path, st, doc)
+		}
+	}
+	for _, path := range []string{"/balance", "/transactions?from=2024-08-01&to=2026-11-11"} {
+		if st, _ := c.do("GET", "/data/v1/accounts/"+id+path, nil, access); st != 200 {
+			t.Errorf("%s is not a mandate read: %d", path, st)
+		}
+	}
+	f.ClearSCAWindow(lloyds)
+	if st, _ := c.do("GET", "/data/v1/accounts/"+id+"/direct_debits", nil, access); st != 200 {
+		t.Errorf("after ClearSCAWindow: %d", st)
+	}
+	// A window of zero refuses every read, and a new code exchange restarts the window.
+	f.SetSCAWindow(lloyds, 0)
+	if st, _ := c.do("GET", "/data/v1/accounts/"+id+"/direct_debits", nil, access); st != 403 {
+		t.Errorf("zero window: %d", st)
+	}
+	f.SetSCAWindow(lloyds, time.Hour)
+	f.RegisterCode(lloyds, "code-b")
+	access, _ = c.exchange("code-b")
+	id = accountID()
+	if st, _ := c.do("GET", "/data/v1/accounts/"+id+"/direct_debits", nil, access); st != 200 {
+		t.Errorf("after a fresh exchange: %d", st)
+	}
+}

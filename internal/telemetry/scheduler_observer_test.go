@@ -148,10 +148,10 @@ func TestSchedulerObserverRecordsRunsDurationAndLastOK(t *testing.T) {
 	if !ok {
 		t.Fatalf("no %s; have %v", semconv.MetricSchedulerJobRuns, got)
 	}
-	if n, _ := sumPoint(t, runs, map[string]string{"job": "hourly", "outcome": "ok"}); n != 2 {
+	if n, _ := sumPoint(t, runs, map[string]string{semconv.AttrJob: "hourly", "outcome": "ok"}); n != 2 {
 		t.Errorf("ok runs = %d, want 2", n)
 	}
-	if n, _ := sumPoint(t, runs, map[string]string{"job": "hourly", "outcome": "error"}); n != 1 {
+	if n, _ := sumPoint(t, runs, map[string]string{semconv.AttrJob: "hourly", "outcome": "error"}); n != 1 {
 		t.Errorf("error runs = %d, want 1", n)
 	}
 
@@ -177,13 +177,13 @@ func TestSchedulerObserverRecordsRunsDurationAndLastOK(t *testing.T) {
 	if !ok {
 		t.Fatalf("no %s", semconv.MetricSchedulerJobLastOK)
 	}
-	if v, found := gaugePoint(t, last, map[string]string{"job": "hourly"}); !found || v != 0 {
+	if v, found := gaugePoint(t, last, map[string]string{semconv.AttrJob: "hourly"}); !found || v != 0 {
 		t.Errorf("last_ok after an error = %d (found %v), want 0", v, found)
 	}
 	// The last run decides: an ok run after the error sets it back to 1.
 	_, finish := obs.Start(context.Background(), "hourly")
 	finish(semconv.JobOK)
-	if v, _ := gaugePoint(t, read()[semconv.MetricSchedulerJobLastOK], map[string]string{"job": "hourly"}); v != 1 {
+	if v, _ := gaugePoint(t, read()[semconv.MetricSchedulerJobLastOK], map[string]string{semconv.AttrJob: "hourly"}); v != 1 {
 		t.Errorf("last_ok after an ok run = %d, want 1", v)
 	}
 
@@ -240,10 +240,10 @@ func TestAPanickingJobYieldsOutcomePanicOneRunAndLastOKZero(t *testing.T) {
 		t.Errorf("a panicked run is not marked failed")
 	}
 	got := collectFrom(t, reader)
-	if n, _ := sumPoint(t, got[semconv.MetricSchedulerJobRuns], map[string]string{"job": "boom", "outcome": "panic"}); n != 1 {
+	if n, _ := sumPoint(t, got[semconv.MetricSchedulerJobRuns], map[string]string{semconv.AttrJob: "boom", "outcome": "panic"}); n != 1 {
 		t.Errorf("panic runs = %d, want 1", n)
 	}
-	if v, found := gaugePoint(t, got[semconv.MetricSchedulerJobLastOK], map[string]string{"job": "boom"}); !found || v != 0 {
+	if v, found := gaugePoint(t, got[semconv.MetricSchedulerJobLastOK], map[string]string{semconv.AttrJob: "boom"}); !found || v != 0 {
 		t.Errorf("last_ok = %d (found %v), want 0", v, found)
 	}
 	for _, s := range mem.GetSpans() {
@@ -295,14 +295,14 @@ func TestACancelledRunLeavesLastOKAloneAndIsNoFailure(t *testing.T) {
 	finish(semconv.JobCancelled)
 
 	got := read()
-	if v, found := gaugePoint(t, got[semconv.MetricSchedulerJobLastOK], map[string]string{"job": "hourly"}); !found || v != 1 {
+	if v, found := gaugePoint(t, got[semconv.MetricSchedulerJobLastOK], map[string]string{semconv.AttrJob: "hourly"}); !found || v != 1 {
 		t.Errorf("last_ok after a cancelled run = %d (found %v), want the earlier 1", v, found)
 	}
 	runs := got[semconv.MetricSchedulerJobRuns]
-	if n, _ := sumPoint(t, runs, map[string]string{"job": "hourly", "outcome": "cancelled"}); n != 1 {
+	if n, _ := sumPoint(t, runs, map[string]string{semconv.AttrJob: "hourly", "outcome": "cancelled"}); n != 1 {
 		t.Errorf("cancelled runs = %d, want 1", n)
 	}
-	if n, found := sumPoint(t, runs, map[string]string{"job": "hourly", "outcome": "error"}); found || n != 0 {
+	if n, found := sumPoint(t, runs, map[string]string{semconv.AttrJob: "hourly", "outcome": "error"}); found || n != 0 {
 		t.Errorf("a cancelled run counted as an error run: %d", n)
 	}
 	var cancelled tracetest.SpanStub
@@ -348,14 +348,14 @@ func TestAJobCancelledByShutdownReportsCancelledNotError(t *testing.T) {
 		t.Fatalf("spans = %+v, want one cancelled span that is not failed", spans)
 	}
 	got := collectFrom(t, reader)
-	if n, _ := sumPoint(t, got[semconv.MetricSchedulerJobRuns], map[string]string{"job": "long", "outcome": "cancelled"}); n != 1 {
+	if n, _ := sumPoint(t, got[semconv.MetricSchedulerJobRuns], map[string]string{semconv.AttrJob: "long", "outcome": "cancelled"}); n != 1 {
 		t.Errorf("cancelled runs = %d, want 1", n)
 	}
-	if n, found := sumPoint(t, got[semconv.MetricSchedulerJobRuns], map[string]string{"job": "long", "outcome": "error"}); found || n != 0 {
+	if n, found := sumPoint(t, got[semconv.MetricSchedulerJobRuns], map[string]string{semconv.AttrJob: "long", "outcome": "error"}); found || n != 0 {
 		t.Errorf("shutdown counted an error run: %d", n)
 	}
 	if lastOK, ok := got[semconv.MetricSchedulerJobLastOK]; ok {
-		if v, found := gaugePoint(t, lastOK, map[string]string{"job": "long"}); found {
+		if v, found := gaugePoint(t, lastOK, map[string]string{semconv.AttrJob: "long"}); found {
 			t.Errorf("last_ok = %d for a job that only ever ran into shutdown, want no point", v)
 		}
 	}

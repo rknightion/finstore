@@ -14,7 +14,8 @@ import (
 )
 
 // RunScheduled runs one scheduled sync: /me, /accounts, and for each account (Monzo pots
-// excluded) its standing orders and direct debits, and for Lloyds its transactions for the last
+// excluded) its standing orders and direct debits (a 403 sca_exceeded on those two keeps what is
+// stored and does not make the run partial, see mandateRead), and for Lloyds its transactions for the last
 // SyncDays days and then its balance; for Lloyds with the cards scope in /me, the same for each
 // credit card; then the optional reads (pending transactions, the Monzo card list, /info once a
 // local day). It holds the writer lock for the run and catches the projection up at the end. It
@@ -168,7 +169,7 @@ func (w *Worker) steps(ctx context.Context, runID int64, kind string, tally *run
 		}
 		actx := withFetch(ctx, fid)
 		for _, tmpl := range []string{pathStandingOrders, pathDirectDebits} {
-			if err := w.step(actx, tally, func(ctx context.Context) error { return w.api.read(ctx, tmpl, a) }); err != nil {
+			if err := w.mandateRead(actx, tally, kind, tmpl, a); err != nil {
 				return err
 			}
 		}
@@ -196,6 +197,23 @@ func (w *Worker) steps(ctx context.Context, runID int64, kind string, tally *run
 		optional = append(optional, more...)
 	}
 	return w.optionalReads(ctx, lctx, optional, granted)
+}
+
+// mandateRead reads one account's standing orders or direct debits, a ledger read (step) with one
+// exception. A scheduled sync (never a connect) that a bank refuses with 403 sca_exceeded, because
+// the resource is only readable shortly after the owner authenticates, has nothing to store: the
+// mandates already stored stay as they are, the run is not made partial, the consent is untouched
+// and the refusal is counted as optional_reads{sca_required} and logged at info level. Such a bank
+// refuses every scheduled sync, so the mandates it holds are refreshed only at a connect.
+func (w *Worker) mandateRead(ctx context.Context, tally *runTally, kind, template string, a listedAccount) error {
+	err := w.api.read(ctx, template, a)
+	if err != nil && kind == KindSync && isSCAExceeded(err) {
+		w.metrics.OptionalRead(ctx, w.source, template, semconv.ResultSCARequired)
+		w.log.InfoContext(ctx, "truelayer mandate read needs a fresh authentication",
+			semconv.LogEndpoint, template, semconv.LogErrorCategory, semconv.ResultSCARequired)
+		return nil
+	}
+	return w.step(ctx, tally, func(context.Context) error { return err })
 }
 
 // optionalRead is one optional read waiting for the end of the ledger reads, with the context
