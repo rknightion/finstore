@@ -215,7 +215,12 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "This link is not valid. Start again from the status page.", http.StatusBadRequest)
 		return
 	}
-	err := s.conn.HandleCallback(r.Context(), state, code)
+	// The exchange spends the code and replaces the previous connection at the bank, so it must
+	// finish and be stored even if the browser goes away half way: the request's cancellation is
+	// not passed on.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), callbackTimeout)
+	defer cancel()
+	err := s.conn.HandleCallback(ctx, state, code)
 	switch {
 	case err == nil:
 		http.Redirect(w, r, "/", http.StatusSeeOther)
@@ -262,6 +267,8 @@ type page struct {
 const (
 	dash       = "none"
 	timeLayout = "2006-01-02 15:04"
+	// callbackTimeout bounds a callback's exchange. It is below the server's write timeout.
+	callbackTimeout = 75 * time.Second
 )
 
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {

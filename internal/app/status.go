@@ -101,8 +101,9 @@ func (p *statusPublisher) run(ctx context.Context) error {
 			continue
 		}
 		p.m.ReconciliationMismatch(ctx, c.AccountSlug, c.ReconciliationState == store.StateMismatch)
-		if expects[c.AccountSlug] && c.LatestDate != nil {
-			p.m.ImportLast(ctx, c.AccountSlug, *c.LatestDate)
+		// The same date the view's "import due" rule uses, so the alert and the page agree.
+		if expects[c.AccountSlug] && c.LatestStatementDate != nil {
+			p.m.ImportLast(ctx, c.AccountSlug, *c.LatestStatementDate)
 		}
 	}
 	return nil

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/rknightion/finstore/internal/config"
 	"github.com/rknightion/finstore/internal/ledger"
 	"github.com/rknightion/finstore/internal/monzo"
 	"github.com/rknightion/finstore/internal/scheduler"
@@ -20,6 +21,10 @@ import (
 const (
 	statusInterval  = time.Minute
 	shutdownTimeout = 20 * time.Second
+	// A scheduled run that has not finished in this long is abandoned; its pages are stored, no
+	// completion row is written, and the next run starts afresh.
+	hourlyRunLimit  = 15 * time.Minute
+	nightlyRunLimit = 45 * time.Minute
 )
 
 // Hooks lets a test observe and adjust a running server. Every field is optional.
@@ -83,7 +88,7 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 		return err
 	}
 	defer st.Close()
-	if err := checkProjection(ctx, st); err != nil {
+	if err := checkProjection(ctx, st, cfg.Timezone); err != nil {
 		return err
 	}
 
@@ -138,12 +143,20 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 	sched := scheduler.New(e.now, log)
 	if !hooks.NoSchedule {
 		sched.Every("status", statusInterval, 0, status.run)
-		// The jitter keeps a restart loop from hitting the bank at every start.
-		sched.Every(monzo.KindHourly, cfg.MonzoSyncInterval, time.Minute, func(ctx context.Context) error {
-			return worker.RunScheduled(ctx, monzo.KindHourly)
-		})
+		// The jitter keeps a restart loop from hitting the bank at every start. Each run has a
+		// deadline: a run holds the writer lock, and a bank that answers slowly enough could
+		// otherwise keep it, and every import and command waiting behind it, for hours.
+		bounded := func(kind string, limit time.Duration) scheduler.Job {
+			return func(ctx context.Context) error {
+				ctx, cancel := context.WithTimeout(ctx, limit)
+				defer cancel()
+				return worker.RunScheduled(ctx, kind)
+			}
+		}
+		sched.Every(monzo.KindHourly, cfg.MonzoSyncInterval, min(time.Minute, cfg.MonzoSyncInterval/10),
+			bounded(monzo.KindHourly, hourlyRunLimit))
 		sched.Daily(monzo.KindNightly, cfg.MonzoNightlyAt.Hour, cfg.MonzoNightlyAt.Minute, cfg.Timezone,
-			func(ctx context.Context) error { return worker.RunScheduled(ctx, monzo.KindNightly) })
+			bounded(monzo.KindNightly, nightlyRunLimit))
 	}
 	schedErr := make(chan error, 1)
 	schedCtx, stopSched := context.WithCancel(ctx)
@@ -173,7 +186,7 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 
 // checkProjection refuses to serve a database whose normalised record was built by code that
 // read stored data differently: the operator must run migrate, and renormalise when it says so.
-func checkProjection(ctx context.Context, st *store.Store) error {
+func checkProjection(ctx context.Context, st *store.Store, zone *time.Location) error {
 	core, err := store.NewCore(st.DB(), store.SchemaCore)
 	if err != nil {
 		return err
@@ -185,6 +198,12 @@ func checkProjection(ctx context.Context, st *store.Store) error {
 	if state.NormaliserRev != ledger.NormaliserRev {
 		return fmt.Errorf("the stored record was built by normaliser revision %d and this version is %d: run `finstore migrate`, then `finstore renormalise`",
 			state.NormaliserRev, ledger.NormaliserRev)
+	}
+	// A transaction's day depends on the zone, so a record built in one zone cannot be added to
+	// in another without mixing the two.
+	if state.Zone != nil && *state.Zone != zone.String() {
+		return fmt.Errorf("the stored record was built with the time zone %s and %s is %s: run `finstore renormalise`, or set the zone back",
+			*state.Zone, config.EnvTimezone, zone)
 	}
 	return nil
 }

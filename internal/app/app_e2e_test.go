@@ -160,9 +160,9 @@ func TestServiceEndToEnd(t *testing.T) {
 		config.EnvAllowedEmails:        ownerEmail,
 		config.EnvMonzoClientID:        monzotest.DefaultClientID,
 		config.EnvMonzoClientSecret:    monzotest.DefaultClientSecret,
-		"FINSTORE_MONZO_API_URL":       srv.URL,
-		"FINSTORE_MONZO_AUTH_URL":      "https://auth.example.test/",
-		"FINSTORE_LOG_LEVEL":           "debug",
+		config.EnvMonzoAPIURL:          srv.URL,
+		config.EnvMonzoAuthURL:         "https://auth.example.test/",
+		config.EnvLogLevel:             "debug",
 	}
 	cfg, err := config.Load(func(k string) string { return env[k] })
 	if err != nil {
@@ -176,16 +176,19 @@ func TestServiceEndToEnd(t *testing.T) {
 		},
 	}
 
-	// serve refuses a database that has not been set up, with advice and not a stack of SQL.
-	if code, _ := w.command(nil, func(ctx context.Context, e app.Env) int { return app.Serve(ctx, e, &app.Hooks{NoSchedule: true}) }); code != app.ExitError {
-		t.Fatalf("serve on an empty database: exit %d, want %d", code, app.ExitError)
-	}
-
 	if code, _ := w.command(nil, app.Bootstrap); code != app.ExitOK {
 		t.Fatalf("bootstrap exit %d: %s", code, w.stderr.String())
 	}
 	if code, _ := w.command(nil, app.Bootstrap); code != app.ExitOK {
 		t.Fatalf("bootstrap is not safe to run again: exit %d: %s", code, w.stderr.String())
+	}
+
+	// serve refuses a database whose tables have not been created, and says what to run.
+	if code, _ := w.command(nil, func(ctx context.Context, e app.Env) int { return app.Serve(ctx, e, &app.Hooks{NoSchedule: true}) }); code != app.ExitError {
+		t.Fatalf("serve before migrate: exit %d, want %d", code, app.ExitError)
+	}
+	if advice := w.stderr.String(); !strings.Contains(advice, "finstore migrate") {
+		t.Fatalf("serve before migrate does not say to run migrate: %q", advice)
 	}
 	if code, _ := w.command(nil, app.Migrate); code != app.ExitOK {
 		t.Fatalf("migrate exit %d: %s", code, w.stderr.String())
@@ -396,6 +399,47 @@ func TestServiceEndToEnd(t *testing.T) {
 	if n := w.queryInt(`SELECT count(*) FROM raw.import_file`); n != rawBefore+1 {
 		t.Fatalf("a rejected file must still be kept: %d files, want %d", n, rawBefore+1)
 	}
+	// The rejected file given again is still rejected: it was stored, never imported.
+	if code, _ := w.command(strings.NewReader(broken), func(ctx context.Context, e app.Env) int {
+		return app.Import(ctx, e, "bank-joint", app.FormatManualCSV, "broken.csv")
+	}); code != app.ExitRejected {
+		t.Fatalf("a rejected file given again: exit %d, want %d (it must not read as already imported)", code, app.ExitRejected)
+	}
+	if n := w.queryInt(`SELECT count(*) FROM raw.import_file`); n != rawBefore+1 {
+		t.Fatalf("the repeated file was stored again: %d files, want %d", n, rawBefore+1)
+	}
+
+	// A file given with the wrong format is rejected, and can then be imported with the right one.
+	if code, _ := w.command(nil, func(ctx context.Context, e app.Env) int {
+		return app.AccountAdd(ctx, e, app.AccountSpec{Slug: "bank-savings", Type: "savings", Currency: "GBP", Name: "made-up savings"})
+	}); code != app.ExitOK {
+		t.Fatalf("account add exit %d: %s", code, w.stderr.String())
+	}
+	sound := "date,type,amount,balance_after,description\n" +
+		month.Format(time.DateOnly) + ",PAY,10.00,10.00,made-up\n" +
+		month.AddDate(0, 0, 1).Format(time.DateOnly) + ",PAY,15.00,25.00,made-up\n"
+	importCSV := func(format string) (int, string) {
+		return w.command(strings.NewReader(sound), func(ctx context.Context, e app.Env) int {
+			return app.Import(ctx, e, "bank-savings", format, "savings.csv")
+		})
+	}
+	if code, _ := importCSV(app.FormatHalifaxPDF); code != app.ExitRejected {
+		t.Fatalf("a CSV given as a PDF: exit %d, want %d", code, app.ExitRejected)
+	}
+	if code, out := importCSV(app.FormatManualCSV); code != app.ExitOK || !strings.Contains(out, "2 new") {
+		t.Fatalf("the same file with the right format: exit %d, output %q: %s", code, out, w.stderr.String())
+	}
+	if got := w.coverage()["bank-savings"]; got.TransactionCount != 2 || got.ReconciliationState != store.StateReconciled {
+		t.Fatalf("bank-savings after its import: %+v", got)
+	}
+
+	// A difference can be accepted only on an account an API feeds.
+	if code, _ := w.command(nil, func(ctx context.Context, e app.Env) int {
+		return app.AcceptDifference(ctx, e, "bank-joint", "made-up reason")
+	}); code != app.ExitError {
+		t.Fatalf("accept-difference on a statement-fed account: exit %d, want %d", code, app.ExitError)
+	}
+
 	joint := w.coverage()["bank-joint"]
 	if joint.TransactionCount != 3 || joint.ReconciliationState != store.StateReconciled || joint.Feed != "file" {
 		t.Fatalf("bank-joint after the imports: %+v", joint)
@@ -411,7 +455,7 @@ func TestServiceEndToEnd(t *testing.T) {
 	if code, _ := w.command(nil, func(ctx context.Context, e app.Env) int { return app.Renormalise(ctx, e, false) }); code != app.ExitOK {
 		t.Fatalf("renormalise exit %d: %s", code, w.stderr.String())
 	}
-	if got := w.coverage(); got["monzo-current"].TransactionCount != 250 || got["bank-joint"].TransactionCount != 3 {
+	if got := w.coverage(); got["monzo-current"].TransactionCount != 250 || got["bank-joint"].TransactionCount != 3 || got["bank-savings"].TransactionCount != 2 {
 		t.Fatalf("after the rebuild: %+v", got)
 	}
 	if err := w.worker.RunScheduled(context.Background(), monzo.KindNightly); err != nil {
@@ -452,6 +496,17 @@ func TestServiceEndToEnd(t *testing.T) {
 	}
 	if code := check(); code != app.ExitOK {
 		t.Fatalf("healthcheck against the running server: exit %d", code)
+	}
+	// A server bound to one address is checked at that address, not at an assumed loopback.
+	bound := w.cfg
+	bound.ListenAddr = w.addr
+	if code := app.Healthcheck(context.Background(), app.Env{Cfg: bound, Stdout: io.Discard, Stderr: io.Discard}); code != app.ExitOK {
+		t.Fatalf("healthcheck with the server's own address: exit %d", code)
+	}
+	elsewhere := w.cfg
+	elsewhere.ListenAddr = "127.0.0.2:" + port
+	if code := app.Healthcheck(context.Background(), app.Env{Cfg: elsewhere, Stdout: io.Discard, Stderr: io.Discard}); code != app.ExitError {
+		t.Fatalf("healthcheck for an address the server is not bound to: exit %d, want %d", code, app.ExitError)
 	}
 	if code := stopServer(); code != app.ExitOK {
 		t.Fatalf("serve exit %d: %s", code, w.stderr.String())

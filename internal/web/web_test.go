@@ -32,6 +32,8 @@ type fakeConn struct {
 	callbackErr    error
 	gotState       string
 	gotCode        string
+	// onCallback, when set, runs inside HandleCallback with its context.
+	onCallback func(ctx context.Context)
 }
 
 func (f *fakeConn) AuthoriseURL(context.Context) (string, error) {
@@ -39,9 +41,12 @@ func (f *fakeConn) AuthoriseURL(context.Context) (string, error) {
 	return "https://auth.bank.test/?client_id=c&state=s", f.authoriseErr
 }
 
-func (f *fakeConn) HandleCallback(_ context.Context, state, code string) error {
+func (f *fakeConn) HandleCallback(ctx context.Context, state, code string) error {
 	f.callbackCalls++
 	f.gotState, f.gotCode = state, code
+	if f.onCallback != nil {
+		f.onCallback(ctx)
+	}
 	return f.callbackErr
 }
 
@@ -379,5 +384,31 @@ func TestUnknownPathsAre404(t *testing.T) {
 		if rec := do(h, http.MethodGet, target, signedIn(nil)); rec.Code != http.StatusNotFound {
 			t.Errorf("GET %s = %d, want 404", target, rec.Code)
 		}
+	}
+}
+
+// The exchange replaces the previous connection at the bank the moment it is sent. If the browser
+// closing the tab cancelled it, the new token would be issued and never stored.
+func TestCallbackIsNotCancelledWhenTheBrowserGoesAway(t *testing.T) {
+	conn := &fakeConn{}
+	h := newServer(t, conn, &fakeReader{}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	var cancelled bool
+	var hasDeadline bool
+	conn.onCallback = func(inner context.Context) {
+		cancel() // the client disconnects while the exchange is in flight
+		cancelled = inner.Err() != nil
+		_, hasDeadline = inner.Deadline()
+	}
+	req := httptest.NewRequest(http.MethodGet, "/callback/monzo?code=c&state=s", nil).WithContext(ctx)
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if conn.callbackCalls != 1 {
+		t.Fatalf("callback calls = %d, want 1", conn.callbackCalls)
+	}
+	if cancelled {
+		t.Fatal("the connector's context was cancelled with the request")
+	}
+	if !hasDeadline {
+		t.Fatal("the connector's context has no deadline, so a hung exchange would never end")
 	}
 }

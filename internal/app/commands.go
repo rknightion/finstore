@@ -56,7 +56,24 @@ const (
 	feedAPI      = "api"
 	runKindFile  = "import"
 	maxImportLen = 32 << 20
+	// rejectionRepeated is the run category for a file that was rejected before and is given again.
+	rejectionRepeated = "rejected_before"
 )
+
+// rejectionText says in the operator's terms why the projection refused a file. The categories
+// are the ledger's; none carries anything from the file.
+func rejectionText(category string) string {
+	switch category {
+	case "check_failed":
+		return "the file could not be read as this format, or failed one of its checks (the rows, the totals and the balances must agree)."
+	case "account_mismatch":
+		return "the sort code and account number in the file are not the ones in the statements already imported into this account."
+	case "unknown_format":
+		return "this version does not know the format."
+	default:
+		return "the file was refused (" + category + ")."
+	}
+}
 
 // Env is what a command runs with.
 type Env struct {
@@ -281,6 +298,9 @@ func AcceptDifference(ctx context.Context, e Env, slug, reason string) int {
 		} else if err != nil {
 			return err
 		}
+		if account.Feed != feedAPI {
+			return fmt.Errorf("account %s is fed by statement files: a gap between two statements closes when the missing statement is imported, and cannot be accepted", slug)
+		}
 		rec, err := core.GetReconciliation(ctx, account.ID)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			return err
@@ -353,15 +373,30 @@ func Import(ctx context.Context, e Env, slug, format, name string) int {
 		if err != nil {
 			return err
 		}
-		_, existed, err := store.InsertImportFile(ctx, tx, store.ImportFile{
+		seq, existed, err := store.InsertImportFile(ctx, tx, store.ImportFile{
 			AccountSlug: slug, Format: format, FileName: name, ImportedAt: e.now(), Body: body,
 		})
 		if err != nil {
 			return err
 		}
 		if existed {
-			message = "already imported: this exact file was imported before"
-			return store.FinishRun(ctx, tx, runID, store.RunResult{FinishedAt: e.now(), Outcome: "ok"})
+			// The same bytes were stored before. Whether they were imported is another matter:
+			// a file that was rejected then is still rejected now.
+			statements, err := core.ListStatements(ctx, account.ID)
+			if err != nil {
+				return err
+			}
+			result := store.RunResult{FinishedAt: e.now(), Outcome: "ok"}
+			if slices.ContainsFunc(statements, func(s store.Statement) bool { return s.RawSeq == seq }) {
+				message = "already imported: this exact file was imported before"
+			} else {
+				category := rejectionRepeated
+				result.Outcome, result.ErrorCategory = "failed", &category
+				code = ExitRejected
+				message = "rejected: this exact file was given before and rejected, so nothing was imported. " +
+					"If the reader has been corrected since, `finstore renormalise` reads the stored file again."
+			}
+			return store.FinishRun(ctx, tx, runID, result)
 		}
 		stats, err := l.CatchUp(ctx, tx, store.SchemaCore)
 		if err != nil {
@@ -370,9 +405,12 @@ func Import(ctx context.Context, e Env, slug, format, name string) int {
 		result := store.RunResult{FinishedAt: e.now(), Outcome: "ok", RowsSeen: stats.TransactionsCreated}
 		if stats.FilesRejected > 0 {
 			category := "check_failed"
+			if len(stats.Rejections) > 0 {
+				category = stats.Rejections[len(stats.Rejections)-1]
+			}
 			result.Outcome, result.ErrorCategory = "failed", &category
 			code = ExitRejected
-			message = "rejected: the file failed a check, so nothing was imported. The file itself is kept."
+			message = "rejected: " + rejectionText(category) + " Nothing was imported. The file itself is kept."
 		} else {
 			message = fmt.Sprintf("imported: %d new transactions, %d changed", stats.TransactionsCreated, stats.TransactionsChanged)
 		}
@@ -467,13 +505,18 @@ func date(t *time.Time) string {
 // Healthcheck asks the local server for /healthz. It is the container's health check, so it
 // needs no database settings.
 func Healthcheck(ctx context.Context, e Env) int {
-	_, port, err := net.SplitHostPort(e.Cfg.ListenAddr)
+	host, port, err := net.SplitHostPort(e.Cfg.ListenAddr)
 	if err != nil {
 		return e.fail(errors.New("FINSTORE_LISTEN_ADDR is not host:port"))
 	}
+	// A server bound to every address answers on loopback; one bound to a single address answers
+	// only there.
+	if ip := net.ParseIP(host); host == "" || (ip != nil && ip.IsUnspecified()) {
+		host = "127.0.0.1"
+	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+net.JoinHostPort("127.0.0.1", port)+"/healthz", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+net.JoinHostPort(host, port)+"/healthz", nil)
 	if err != nil {
 		return e.fail(err)
 	}
