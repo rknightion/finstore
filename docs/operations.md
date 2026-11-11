@@ -110,12 +110,14 @@ Formats:
 
 - **`halifax-pdf`**: the PDF statement the Halifax app produces. The reader checks that the rows
   add up to the statement's totals, that each row's running balance follows from the previous one,
-  and that the last balance equals the statement's closing balance. A file that fails any check is
-  rejected whole.
+  that the last balance equals the statement's closing balance, that the rows are in date order,
+  and that every row is dated inside the statement's printed period. A file that fails any check
+  is rejected whole.
 - **`manual-csv`**: for anything typed up by hand, such as a mortgage. UTF-8, with the header
   `date,type,amount,balance_after,description`. `date` is `YYYY-MM-DD`; `amount` and
   `balance_after` are decimal pounds; `amount` is signed, and each `balance_after` must equal the
-  previous one plus `amount`. Rows are oldest first.
+  previous one plus `amount`. Rows are oldest first, and a file whose dates go backwards is
+  rejected.
 
 Importing a statement that overlaps one already imported is safe: rows are matched and stored once.
 That is how a part-month statement followed by the full month works. Statements can be imported in
@@ -244,8 +246,9 @@ docker compose run --rm finstore-admin migrate
 docker compose up -d finstore
 ```
 
-Then reconnect Monzo from the status page. The restored database has no tokens, so at its first
-sync the service marks the connection as lost; reconnecting brings it back. Nothing else is lost.
+Then reconnect Monzo from the status page. The restored database has no tokens, so the service
+marks the connection as lost as soon as it starts; reconnecting brings it back. Nothing else is
+lost.
 
 ## Updating
 
