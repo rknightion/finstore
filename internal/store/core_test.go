@@ -114,8 +114,22 @@ func TestDisappearance(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// SetDisappeared reads the account and the period from the fetch's core.fetch_period row.
+	if err := core.PutFetchPeriod(ctx, store.FetchPeriod{FetchID: 41, AccountID: acc.ID, PeriodStart: start, PeriodEnd: end}); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := core.GetFetchPeriod(ctx, 41); err != nil || !p.PeriodStart.Equal(start) || !p.PeriodEnd.Equal(end) || p.AccountID != acc.ID {
+		t.Fatalf("fetch period %+v, %v", p, err)
+	}
+	if _, err := core.GetFetchPeriod(ctx, 42); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("missing fetch period: %v", err)
+	}
 	at := end.Add(time.Hour)
-	res, err := core.SetDisappeared(ctx, acc.ID, start, end, []uuid.UUID{in1.ID}, at)
+	// A fetch with no period row changes nothing.
+	if res, err := core.SetDisappeared(ctx, 42, nil, at); err != nil || len(res.Disappeared)+len(res.Returned) != 0 {
+		t.Fatalf("fetch with no period: %+v, %v", res, err)
+	}
+	res, err := core.SetDisappeared(ctx, 41, []uuid.UUID{in1.ID}, at)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,10 +140,10 @@ func TestDisappearance(t *testing.T) {
 		t.Errorf("a disappeared transaction still counts %d", res.Disappeared[0].EffectiveAmount())
 	}
 	// Again with the same result: nothing changes.
-	if res, err := core.SetDisappeared(ctx, acc.ID, start, end, []uuid.UUID{in1.ID}, at); err != nil || len(res.Disappeared)+len(res.Returned) != 0 {
+	if res, err := core.SetDisappeared(ctx, 41, []uuid.UUID{in1.ID}, at); err != nil || len(res.Disappeared)+len(res.Returned) != 0 {
 		t.Fatalf("repeat: %+v, %v", res, err)
 	}
-	res, err = core.SetDisappeared(ctx, acc.ID, start, end, []uuid.UUID{in1.ID, in2.ID}, at.Add(time.Hour))
+	res, err = core.SetDisappeared(ctx, 41, []uuid.UUID{in1.ID, in2.ID}, at.Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,6 +153,39 @@ func TestDisappearance(t *testing.T) {
 	got, err := core.GetTransaction(ctx, outside.ID)
 	if err != nil || got.DisappearedAt != nil {
 		t.Fatalf("a transaction outside the period was touched: %+v %v", got, err)
+	}
+}
+
+// LiveTransactionRows gives each row's current content: the version the row mirrors, not a
+// late-loaded older version that has the highest version number.
+func TestLiveTransactionRowsReadTheCurrentVersionNotALateOlderOne(t *testing.T) {
+	c := newCluster(t)
+	ctx := context.Background()
+	core := mustCore(t, openStore(t, c.app).DB(), store.SchemaCore)
+	acc := testAccount("lloyds-joint", "joint", "api")
+	if err := core.UpsertAccount(ctx, acc); err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Date(2030, 1, 5, 12, 0, 0, 0, time.UTC)
+	tx := testTxn(acc, "r1", -100, t0)
+	for i, v := range []struct {
+		content string
+		seen    time.Time
+	}{
+		{`{"v":"first"}`, t0},
+		{`{"v":"current"}`, t0.Add(time.Hour)},
+		{`{"v":"older, loaded late"}`, t0.Add(-time.Hour)},
+	} {
+		if _, err := core.ApplyTransaction(ctx, tx, []byte(v.content), []byte(v.content), v.seen, int64(i+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := core.LiveTransactionRows(ctx, acc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || string(rows[0].Content) != `{"v": "current"}` {
+		t.Fatalf("rows %+v, want the current version's content", rows)
 	}
 }
 

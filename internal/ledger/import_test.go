@@ -211,8 +211,8 @@ func TestStatementForAnotherBankAccountIsRejectedLiveAndOnReplay(t *testing.T) {
 	e.importFile("halifax-current", "halifax-pdf", halifaxPDF(time.January, 40000, halifaxRows(time.January), "11-22-33", "1234 5678"))
 	e.catchUp()
 	accID := wantAccountID(ledger.SourceManual, "halifax-current")
-	if a := e.account("halifax-current"); a.FileRef == nil || *a.FileRef != "112233 12345678" {
-		t.Fatalf("file_ref %v, want the first statement's", a.FileRef)
+	if a := e.account("halifax-current"); a.BankRef == nil || *a.BankRef != "112233 12345678" {
+		t.Fatalf("bank_ref %v, want the first statement's", a.BankRef)
 	}
 
 	e.importFile("halifax-current", "halifax-pdf", halifaxPDF(time.February, 50000, halifaxRows(time.February), "11-22-33", "87654321"))
@@ -226,8 +226,8 @@ func TestStatementForAnotherBankAccountIsRejectedLiveAndOnReplay(t *testing.T) {
 	if err != nil || len(stmts) != 1 {
 		t.Fatalf("statements %+v, %v", stmts, err)
 	}
-	if a := e.account("halifax-current"); *a.FileRef != "112233 12345678" {
-		t.Fatalf("a rejected statement changed file_ref to %s", *a.FileRef)
+	if a := e.account("halifax-current"); *a.BankRef != "112233 12345678" {
+		t.Fatalf("a rejected statement changed bank_ref to %s", *a.BankRef)
 	}
 	logged := e.logs.String()
 	if !strings.Contains(logged, "account_mismatch") || strings.Contains(logged, "87654321") || strings.Contains(logged, "12345678") {
@@ -238,8 +238,8 @@ func TestStatementForAnotherBankAccountIsRejectedLiveAndOnReplay(t *testing.T) {
 		t.Fatalf("rebuild differs: %+v", diffs)
 	}
 	e.renormalise(false)
-	if a := e.account("halifax-current"); a.FileRef == nil || *a.FileRef != "112233 12345678" {
-		t.Fatalf("file_ref after rebuild %v", a.FileRef)
+	if a := e.account("halifax-current"); a.BankRef == nil || *a.BankRef != "112233 12345678" {
+		t.Fatalf("bank_ref after rebuild %v", a.BankRef)
 	}
 	if n := e.countTxns(accID); n != 2 {
 		t.Fatalf("%d transactions after rebuild, want 2", n)

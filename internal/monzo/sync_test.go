@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/rknightion/finstore/internal/consent"
+	"github.com/rknightion/finstore/internal/ledger"
 	"github.com/rknightion/finstore/internal/monzotest"
 	"github.com/rknightion/finstore/internal/semconv"
 	"github.com/rknightion/finstore/internal/store"
@@ -128,6 +129,30 @@ func TestScheduledRunFetchesItsPeriodForOpenAccountsAndCompletesTheFetch(t *test
 	}
 	if calls := h.proj.calls(); len(calls) != 3 {
 		t.Fatalf("projector called %d times, want once per run", len(calls))
+	}
+}
+
+// The sort code and account number Monzo lists for an account become its bank reference in core,
+// so a mandate from another source can find the account.
+func TestAccountsListedWithSortCodeAndNumberGetABankRef(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil, nil)
+	now := h.fake.Now()
+	h.fake.AddAccount(monzotest.Account{ID: "acc_test_joint", Type: "uk_retail_joint", Created: now.AddDate(-1, 0, 0),
+		SortCode: "99-00-01", AccountNumber: "87654321"})
+	h.fake.AddAccount(monzotest.Account{ID: "acc_test_flex", Type: "uk_monzo_flex", Created: now.AddDate(-1, 0, 0)})
+	h.connect(nil)
+	c, err := store.NewCore(h.st.DB(), store.SchemaCore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joint, err := c.GetAccount(context.Background(), ledger.AccountID(Source, "acc_test_joint"))
+	if err != nil || joint.BankRef == nil || *joint.BankRef != "990001 87654321" {
+		t.Fatalf("joint account %+v, %v", joint, err)
+	}
+	flex, err := c.GetAccount(context.Background(), ledger.AccountID(Source, "acc_test_flex"))
+	if err != nil || flex.BankRef != nil {
+		t.Fatalf("flex account %+v, %v; want no bank reference", flex, err)
 	}
 }
 

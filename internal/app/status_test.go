@@ -94,9 +94,17 @@ func TestStatusPublisherReportsTheDatabasesState(t *testing.T) {
 	})
 	statement := "date,type,amount,balance_after,description\n" +
 		"2030-03-01,PAY,10.00,10.00,made-up\n2030-03-09,PAY,15.00,25.00,made-up\n"
-	for _, slug := range []string{"bank-joint", "bank-loan"} {
+	// A third that expects imports but has ended: the account that continues it is fed another
+	// way, so it is never import due.
+	run("", func(ctx context.Context, e Env) int {
+		return AccountAdd(ctx, e, AccountSpec{Slug: "bank-old", Type: "joint", Currency: "GBP", Name: "made-up", ExpectsImports: true})
+	})
+	for _, slug := range []string{"bank-joint", "bank-loan", "bank-old"} {
 		run(statement, func(ctx context.Context, e Env) int { return Import(ctx, e, slug, FormatManualCSV, "made-up.csv") })
 	}
+	run("", func(ctx context.Context, e Env) int {
+		return AccountEnd(ctx, e, "bank-old", ptrTime(time.Date(2030, 3, 9, 0, 0, 0, 0, time.UTC)))
+	})
 
 	st, err := store.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -187,6 +195,9 @@ func TestStatusPublisherReportsTheDatabasesState(t *testing.T) {
 	if _, ok := value(semconv.MetricImportLastTime, map[string]string{"account": "bank-loan"}); ok {
 		t.Error("an account that expects no imports has an import time, so it would raise \"import due\"")
 	}
+	if _, ok := value(semconv.MetricImportLastTime, map[string]string{"account": "bank-old"}); ok {
+		t.Error("an ended account has an import time, so it would raise \"import due\"")
+	}
 
 	// The job also retires connect attempts whose hour has passed.
 	var outcome *string
@@ -197,3 +208,5 @@ func TestStatusPublisherReportsTheDatabasesState(t *testing.T) {
 		t.Errorf("the overdue connect attempt has outcome %v, want expired", outcome)
 	}
 }
+
+func ptrTime(t time.Time) *time.Time { return &t }

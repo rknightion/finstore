@@ -75,9 +75,12 @@ func cleanValue(v any) any {
 
 func sanitiseResult(r Result) Result {
 	out := Result{
-		Accounts: make([]AccountRec, len(r.Accounts)),
-		Txns:     sanitiseTxns(r.Txns),
-		Balances: sanitiseBalances(r.Balances),
+		Accounts:       make([]AccountRec, len(r.Accounts)),
+		Txns:           sanitiseTxns(r.Txns),
+		Balances:       sanitiseBalances(r.Balances),
+		StandingOrders: make([]StandingOrderRec, len(r.StandingOrders)),
+		DirectDebits:   make([]DirectDebitRec, len(r.DirectDebits)),
+		MandateLists:   make([]MandateList, len(r.MandateLists)),
 	}
 	for i, a := range r.Accounts {
 		a.SourceKey = cleanText(a.SourceKey)
@@ -85,7 +88,25 @@ func sanitiseResult(r Result) Result {
 		a.Currency = cleanText(a.Currency)
 		a.Name = cleanText(a.Name)
 		a.ParentSourceKey = cleanText(a.ParentSourceKey)
+		a.BankRef = cleanText(a.BankRef)
 		out.Accounts[i] = a
+	}
+	for i, m := range r.StandingOrders {
+		for _, f := range []*string{&m.BankRef, &m.MandateKey, &m.Payee, &m.Reference, &m.Frequency, &m.Status, &m.Currency} {
+			*f = cleanText(*f)
+		}
+		m.Content = cleanJSON(m.Content)
+		out.StandingOrders[i] = m
+	}
+	for i, m := range r.DirectDebits {
+		for _, f := range []*string{&m.BankRef, &m.MandateKey, &m.Name, &m.Status, &m.Currency} {
+			*f = cleanText(*f)
+		}
+		m.Content = cleanJSON(m.Content)
+		out.DirectDebits[i] = m
+	}
+	for i, l := range r.MandateLists {
+		out.MandateLists[i] = MandateList{Kind: cleanText(l.Kind), BankRef: cleanText(l.BankRef)}
 	}
 	return out
 }

@@ -112,8 +112,8 @@ func TestReplayFromEmptyGivesTheIncrementalCore(t *testing.T) {
 	if r := e.recon(wantAccountID(ledger.SourceManual, "bank-current")); r.BreakCount != 0 || !sameDay(r.ReconciledThrough, date("2030-11-10")) {
 		t.Fatalf("bank-current reconciliation %+v", r)
 	}
-	if a := e.account("halifax-current"); a.FileRef == nil || *a.FileRef != "112233 12345678" {
-		t.Fatalf("halifax-current file_ref %v", a.FileRef)
+	if a := e.account("halifax-current"); a.BankRef == nil || *a.BankRef != "112233 12345678" {
+		t.Fatalf("halifax-current bank_ref %v", a.BankRef)
 	}
 }
 
@@ -179,4 +179,46 @@ func TestRenormaliseSwapRebuildsCoreAndTheViewsStillAnswer(t *testing.T) {
 	e.balance(9, "acc_1", 1050)
 	e.balance(9, "acc_1", 1050)
 	e.catchUp()
+}
+
+// A core built by the previous revision has another shape (here: no bank_ref, ended_on,
+// failed_on or fetch_period). Renormalise must not catch that core up with this revision's code:
+// with a row not yet projected, both --verify and the swap still succeed, and the swap projects
+// the row.
+func TestRenormaliseOverAnOlderRevisionCoreSkipsTheLiveCatchUp(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.accounts(fAcc{ID: "acc_1", Type: "current", BankRef: refA})
+	e.catchUp()
+	if _, err := e.owner.DB().Exec(ctx, `DROP VIEW agent.accounts, agent.transactions, agent.balances, agent.coverage,
+		agent.standing_orders, agent.direct_debits CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE core.account RENAME COLUMN bank_ref TO file_ref`,
+		`ALTER TABLE core.account DROP COLUMN ended_on`,
+		`ALTER TABLE core.reconciliation DROP COLUMN failed_on`,
+		`DROP TABLE core.fetch_period`,
+	} {
+		if _, err := e.owner.DB().Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.owner.DB().Exec(ctx, `UPDATE core.projection_state SET normaliser_rev = $1`, ledger.NormaliserRev-1); err != nil {
+		t.Fatal(err)
+	}
+	// Stored after the old binary's last catch-up: never projected into the old core.
+	e.accounts(fAcc{ID: "acc_2", Type: "current", BankRef: refB})
+
+	if diffs := e.renormalise(true); len(diffs) == 0 {
+		t.Fatal("verify over a reshaped core reported no difference")
+	}
+	e.renormalise(false)
+	if a := e.account("fake-current-2"); a.BankRef == nil || *a.BankRef != refB {
+		t.Fatalf("the unprojected account after the swap: %+v", a)
+	}
+	ps, err := e.core().GetProjectionState(ctx)
+	if err != nil || ps.NormaliserRev != ledger.NormaliserRev || ps.LastSeq != e.maxRawSeq() {
+		t.Fatalf("projection state %+v, %v", ps, err)
+	}
 }

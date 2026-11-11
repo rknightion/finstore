@@ -161,6 +161,28 @@ func InsertImportFile(ctx context.Context, q DBTX, f ImportFile) (seq int64, exi
 	return seq, true, nil
 }
 
+// OperatorEntriesBefore returns the operator entries of kind whose payload names slug (its
+// "slug" field) and whose seq is below beforeSeq, newest first. The projection reads only rows
+// before the one it is applying, so replay sees what the live path saw.
+func OperatorEntriesBefore(ctx context.Context, q DBTX, kind, slug string, beforeSeq int64) ([]OperatorEntry, error) {
+	rows, err := q.Query(ctx, `SELECT seq, kind, payload, entered_at FROM raw.operator_entry
+		WHERE kind = $1 AND payload->>'slug' = $2 AND seq < $3 ORDER BY seq DESC`, kind, slug, beforeSeq)
+	if err != nil {
+		return nil, fmt.Errorf("store: operator entries: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (OperatorEntry, error) {
+		var e OperatorEntry
+		var payload []byte
+		err := r.Scan(&e.Seq, &e.Kind, &payload, &e.EnteredAt)
+		e.Payload = payload
+		return e, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: operator entries: %w", err)
+	}
+	return out, nil
+}
+
 // InsertOperatorEntry stores e and returns its seq.
 func InsertOperatorEntry(ctx context.Context, q DBTX, e OperatorEntry) (int64, error) {
 	var seq int64
@@ -248,6 +270,28 @@ func PreviousResponseInRun(ctx context.Context, q DBTX, runID int64, accountKey,
 		return APIResponse{}, false, fmt.Errorf("store: previous response in run: %w", err)
 	}
 	return r, true, nil
+}
+
+// CountCallsToday counts the responses stored for source and the templated endpoint whose request
+// named bankRef (params->>'bank_ref'; an empty bankRef counts the calls that named none, such as
+// an account list) and that were fetched on day's calendar day in day's location. Every attempt
+// is stored, a refused one (429) included, so this is the number of calls made that day.
+func CountCallsToday(ctx context.Context, q DBTX, source, endpoint, bankRef string, day time.Time) (int, error) {
+	y, m, d := day.Date()
+	start := time.Date(y, m, d, 0, 0, 0, 0, day.Location())
+	end := time.Date(y, m, d+1, 0, 0, 0, 0, day.Location())
+	var ref *string
+	if bankRef != "" {
+		ref = &bankRef
+	}
+	var n int
+	err := q.QueryRow(ctx, `SELECT count(*) FROM raw.api_response
+		WHERE source = $1 AND endpoint = $2 AND params->>'bank_ref' IS NOT DISTINCT FROM $3::text
+		  AND fetched_at >= $4 AND fetched_at < $5`, source, endpoint, ref, start, end).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("store: count calls today: %w", err)
+	}
+	return n, nil
 }
 
 // MaxRawSeq returns the largest key in any raw table, or 0 when raw is empty.

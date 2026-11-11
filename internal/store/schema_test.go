@@ -165,6 +165,42 @@ func TestMigrateReportsRenormaliseRequired(t *testing.T) {
 	}
 }
 
+// A binary whose core shape differs from the stored core's (a revision that renamed a column)
+// migrates without touching the views, which would not compile against the old core, and asks for
+// a renormalise; the swap then recreates the views on the new core.
+func TestMigrateWithAnotherRevisionLeavesTheViewsForTheSwap(t *testing.T) {
+	c := newCluster(t)
+	ctx := context.Background()
+	owner := openStore(t, c.owner)
+	// Make the stored core look like one built by an older binary: a column under its old name.
+	if _, err := owner.DB().Exec(ctx, `DROP VIEW agent.accounts CASCADE;
+		ALTER TABLE core.account RENAME COLUMN bank_ref TO old_ref`); err != nil {
+		t.Fatal(err)
+	}
+	// A table a migration added alongside the revision change, not yet granted to anyone.
+	if _, err := owner.DB().Exec(ctx, `CREATE TABLE raw.made_up_new (x int)`); err != nil {
+		t.Fatal(err)
+	}
+	err := store.Migrate(ctx, c.owner, testRev+1)
+	if !errors.Is(err, store.ErrRenormaliseRequired) {
+		t.Fatalf("Migrate over an older core: want ErrRenormaliseRequired, got %v", err)
+	}
+	// The grants are applied even though the views are left for the swap.
+	if _, err := connAs(t, c.super, store.RoleApp).Exec(ctx, `SELECT 1 FROM raw.made_up_new`); err != nil {
+		t.Fatalf("finstore_app reading a table added with the revision change: %v", err)
+	}
+	if err := store.CreateCoreNext(ctx, owner.DB(), testRev+1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SwapCore(ctx, owner.DB(), testRev+1); err != nil {
+		t.Fatalf("SwapCore: %v", err)
+	}
+	if err := store.Migrate(ctx, c.owner, testRev+1); err != nil {
+		t.Fatalf("Migrate after the swap: %v", err)
+	}
+	assertAgentBoundary(t, c.super)
+}
+
 func durableTables(t *testing.T, conn *pgx.Conn) map[string][]string {
 	t.Helper()
 	rows, err := conn.Query(context.Background(),
@@ -184,7 +220,7 @@ func durableTables(t *testing.T, conn *pgx.Conn) map[string][]string {
 }
 
 var agentViews = []string{"accounts", "transactions", "transaction_history", "balances", "coverage", "sync_status",
-	"pot_transactions", "pot_reconciliation"}
+	"pot_transactions", "pot_reconciliation", "standing_orders", "direct_debits"}
 
 // assertAgentBoundary checks that finstore_agent can read every agent view and no table.
 func assertAgentBoundary(t *testing.T, superURL string) {

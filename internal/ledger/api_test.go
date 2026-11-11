@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -344,5 +345,86 @@ func TestAccountAddCreatesFileAccountAndRebuildRecreatesIt(t *testing.T) {
 	}
 	if got := e.account("bank-current"); !reflect.DeepEqual(got, want) {
 		t.Fatalf("after rebuild\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func (e *env) fetchPeriod(fetchID int64) (store.FetchPeriod, bool) {
+	e.t.Helper()
+	p, err := e.core().GetFetchPeriod(context.Background(), fetchID)
+	if errors.Is(err, store.ErrNotFound) {
+		return store.FetchPeriod{}, false
+	}
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return p, true
+}
+
+// An hourly fetch's period starts part-way through a day. The period is recorded as instants, so
+// a row created earlier that day, which the fetch did not list, is not marked disappeared.
+func TestCompletedPeriodIsRecordedAsInstantsAndAMidDayStartLeavesEarlierRowsAlone(t *testing.T) {
+	e := newEnv(t)
+	e.accounts(fAcc{ID: "acc_1", Type: "current"})
+	morning := time.Date(2030, 1, 5, 8, 0, 0, 0, time.UTC)
+	e.respond(e.fetch(1, "acc_1", nil), "/transactions", body(fBody{Transactions: []json.RawMessage{txn("tx_morning", "acc_1", -100, morning)}}))
+	hour := &period{time.Date(2030, 1, 5, 14, 0, 0, 0, time.UTC), time.Date(2030, 1, 5, 15, 0, 0, 0, time.UTC)}
+	f := e.fetch(2, "acc_1", hour)
+	e.respond(f, "/transactions", body(fBody{Transactions: []json.RawMessage{txn("tx_afternoon", "acc_1", -5, hour.start.Add(time.Minute))}}))
+	e.complete(f)
+	e.catchUp()
+	p, ok := e.fetchPeriod(f)
+	if !ok || !p.PeriodStart.Equal(hour.start) || !p.PeriodEnd.Equal(hour.end) || p.AccountID != wantAccountID(fakeSource, "acc_1") {
+		t.Fatalf("fetch period %+v (recorded %v), want the raw period unchanged", p, ok)
+	}
+	if got := e.txn(wantTxnID(wantAccountID(fakeSource, "acc_1"), fakeSource, "tx_morning")); got.DisappearedAt != nil {
+		t.Fatalf("a row created earlier in the day was marked disappeared: %+v", got)
+	}
+	// A fetch with no period records none.
+	g := e.fetch(3, "acc_1", nil)
+	e.complete(g)
+	e.catchUp()
+	if _, ok := e.fetchPeriod(g); ok {
+		t.Fatal("a fetch with no period recorded one")
+	}
+}
+
+// For a source whose history may start later than asked (TrueLayer), the completed period starts
+// at the earliest row returned, so a shorter history on a later consent marks no older row
+// disappeared; a response with no rows covers the period asked for.
+func TestDateOnlySourcePeriodStartsAtItsEarliestRow(t *testing.T) {
+	e := lloydsEnv(t)
+	acc := wantAccountID(lloydsSource, refA)
+	asked := &period{time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2030, 4, 1, 0, 0, 0, 0, time.UTC)}
+	first := e.fetchAs(lloydsSource, 2, refA, asked)
+	e.respondAs(first, lloydsSource, "/transactions", 200, body(fBody{Transactions: []json.RawMessage{
+		lloydsRow("old", "2030-01-15", -100, "0"), lloydsRow("new", "2030-02-10", -100, "0")}}))
+	e.complete(first)
+	e.catchUp()
+	if p, ok := e.fetchPeriod(first); !ok || !p.PeriodStart.Equal(date("2030-01-15")) || !p.PeriodEnd.Equal(asked.end) {
+		t.Fatalf("first period %+v", p)
+	}
+
+	// A later consent returns history from February only.
+	shorter := e.fetchAs(lloydsSource, 3, refA, asked)
+	e.respondAs(shorter, lloydsSource, "/transactions", 200, body(fBody{Transactions: []json.RawMessage{
+		lloydsRow("new", "2030-02-10", -100, "0")}}))
+	e.complete(shorter)
+	if st := e.catchUp(); st.Disappeared != 0 {
+		t.Fatalf("a shorter history marked rows disappeared: %+v", st)
+	}
+	if p, ok := e.fetchPeriod(shorter); !ok || !p.PeriodStart.Equal(date("2030-02-10")) {
+		t.Fatalf("shorter period %+v", p)
+	}
+	if got := e.txn(wantTxnID(acc, lloydsSource, "old")); got.DisappearedAt != nil {
+		t.Fatalf("the older row disappeared: %+v", got)
+	}
+
+	// An empty account's response covers what was asked for.
+	empty := e.fetchAs(lloydsSource, 4, refA, asked)
+	e.respondAs(empty, lloydsSource, "/transactions", 200, body(fBody{}))
+	e.complete(empty)
+	e.catchUp()
+	if p, ok := e.fetchPeriod(empty); !ok || !p.PeriodStart.Equal(asked.start) {
+		t.Fatalf("empty period %+v", p)
 	}
 }

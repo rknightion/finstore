@@ -46,6 +46,10 @@ func TestCoverageGaps(t *testing.T) {
 			if _, err := store.InsertFetchComplete(ctx, q, store.FetchComplete{FetchID: id, CompletedAt: time.Now(), Pages: 1}); err != nil {
 				t.Fatal(err)
 			}
+			// The ledger records each completed fetch's period in core.fetch_period, which coverage reads.
+			if err := core.PutFetchPeriod(ctx, store.FetchPeriod{FetchID: id, AccountID: api.ID, PeriodStart: from, PeriodEnd: to}); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	fetch(mid(-30), mid(-20), true)
@@ -81,6 +85,9 @@ func TestCoverageGaps(t *testing.T) {
 		}
 		if complete {
 			if _, err := store.InsertFetchComplete(ctx, q, store.FetchComplete{FetchID: id, CompletedAt: time.Now(), Pages: 1}); err != nil {
+				t.Fatal(err)
+			}
+			if err := core.PutFetchPeriod(ctx, store.FetchPeriod{FetchID: id, AccountID: resumed.ID, PeriodStart: from, PeriodEnd: to}); err != nil {
 				t.Fatal(err)
 			}
 		}

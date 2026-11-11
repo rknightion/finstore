@@ -23,6 +23,9 @@ const (
 	GapNoCompletedFetch   = "no completed fetch covers this period"
 	GapNoFile             = "no file covers these days"
 	GapImportDue          = "import due"
+	// GapSharedBankRef is followed by the slug of the other account: two accounts of different
+	// sources share a bank reference and neither has ended.
+	GapSharedBankRef = "bank reference shared with "
 )
 
 // Gap is one entry of agent.coverage's gaps. Dates are midnight UTC values of calendar days.
@@ -51,6 +54,9 @@ type CoverageRow struct {
 	// transaction or balance snapshot date), the date the import-due rule uses; nil for an API
 	// account and for a file account with no statement.
 	LatestStatementDate *time.Time `json:"latest_statement_date"`
+	// FailedOn is, for a running_balance account, the earliest day whose rows do not add up to
+	// their running balances; nil otherwise.
+	FailedOn *time.Time `json:"failed_on"`
 }
 
 // SyncStatusRow is a row of agent.sync_status.
@@ -68,7 +74,7 @@ type SyncStatusRow struct {
 // Coverage reads agent.coverage, ordered by account slug.
 func Coverage(ctx context.Context, q DBTX) ([]CoverageRow, error) {
 	rows, err := q.Query(ctx, `SELECT account_slug, feed, earliest_date, latest_date, transaction_count,
-		reconciliation_state, reconciled_through, last_diff_minor, gaps, latest_statement_date
+		reconciliation_state, reconciled_through, last_diff_minor, gaps, latest_statement_date, failed_on
 		FROM agent.coverage ORDER BY account_slug`)
 	if err != nil {
 		return nil, fmt.Errorf("store: read coverage: %w", err)
@@ -77,7 +83,7 @@ func Coverage(ctx context.Context, q DBTX) ([]CoverageRow, error) {
 		var c CoverageRow
 		var gaps []byte
 		if err := r.Scan(&c.AccountSlug, &c.Feed, &c.EarliestDate, &c.LatestDate, &c.TransactionCount,
-			&c.ReconciliationState, &c.ReconciledThrough, &c.LastDiffMinor, &gaps, &c.LatestStatementDate); err != nil {
+			&c.ReconciliationState, &c.ReconciledThrough, &c.LastDiffMinor, &gaps, &c.LatestStatementDate, &c.FailedOn); err != nil {
 			return c, err
 		}
 		var err error

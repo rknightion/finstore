@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/rknightion/finstore/internal/app"
 	"github.com/rknightion/finstore/internal/config"
@@ -38,6 +39,7 @@ commands:
   account add                 create an account fed by statement files
   account list                list accounts
   account accept-difference   record a known balance difference as accepted
+  account end                 end an account at a date, or clear its end
   import                      import one statement from standard input
   load-capture                load API responses captured before the service existed
   coverage [--json]           print what is held for each account, and the gaps
@@ -157,7 +159,7 @@ func runAccount(ctx context.Context, env app.Env, args []string,
 	flags func(string) *flag.FlagSet, parse func(*flag.FlagSet, []string) bool,
 ) int {
 	if len(args) == 0 {
-		_, _ = fmt.Fprintln(env.Stderr, "finstore account: expected add, list or accept-difference")
+		_, _ = fmt.Fprintln(env.Stderr, "finstore account: expected add, list, accept-difference or end")
 		return exitUsage
 	}
 	switch args[0] {
@@ -190,6 +192,27 @@ func runAccount(ctx context.Context, env app.Env, args []string,
 			return exitUsage
 		}
 		return app.AcceptDifference(ctx, env, *slug, *reason)
+	case "end":
+		fs := flags("account end")
+		slug := fs.String("slug", "", "slug of the account")
+		lastDate := fs.String("last-date", "", "the last day the account has transactions on, YYYY-MM-DD")
+		clear := fs.Bool("clear", false, "remove the account's end instead")
+		if !parse(fs, args[1:]) {
+			return exitUsage
+		}
+		if *slug == "" || (*lastDate == "") == !*clear {
+			_, _ = fmt.Fprintln(env.Stderr, "finstore account end: --slug and exactly one of --last-date and --clear are required")
+			return exitUsage
+		}
+		if *clear {
+			return app.AccountEnd(ctx, env, *slug, nil)
+		}
+		d, err := time.Parse(time.DateOnly, *lastDate)
+		if err != nil {
+			_, _ = fmt.Fprintln(env.Stderr, "finstore account end: --last-date must be YYYY-MM-DD")
+			return exitUsage
+		}
+		return app.AccountEnd(ctx, env, *slug, &d)
 	default:
 		_, _ = fmt.Fprintf(env.Stderr, "finstore account: unknown subcommand %q\n", args[0])
 		return exitUsage

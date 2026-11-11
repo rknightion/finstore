@@ -161,7 +161,8 @@ func normaliseAccounts(body []byte, loc *time.Location) (ledger.Result, error) {
 		if cur == "" {
 			cur = defaultCurrency
 		}
-		rec := ledger.AccountRec{SourceKey: id, Type: typ, Currency: cur, Name: str(a, "description")}
+		rec := ledger.AccountRec{SourceKey: id, Type: typ, Currency: cur, Name: str(a, "description"),
+			BankRef: ledger.BankRef(str(a, "sort_code"), str(a, "account_number"))}
 		if t, ok := parseTime(str(a, "created")); ok {
 			rec.OpenedOn = dayOf(t, loc)
 		}

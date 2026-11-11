@@ -69,7 +69,12 @@ type Account struct {
 	ExpectsImports bool
 	OpenedOn       *time.Time // a date
 	Closed         bool
-	FileRef        *string // a file-fed account's statement identifier; nil until an import sets it
+	// BankRef is the account's bank reference (sort code and account number, digits only, joined
+	// by a space); nil until a source or a statement sets it.
+	BankRef *string
+	// EndedOn is the last day the account has transactions on (a date), set by an account_end
+	// operator entry; nil while the account has no end.
+	EndedOn *time.Time
 }
 
 // Transaction is a core.transaction row. It always mirrors the latest version.
@@ -165,7 +170,7 @@ type BalanceSnapshot struct {
 // Reconciliation is a core.reconciliation row: an account's current reconciliation state.
 type Reconciliation struct {
 	AccountID         uuid.UUID
-	Method            string // monzo_absolute | file_continuity | balances_only | none
+	Method            string // monzo_absolute | running_balance | file_continuity | balances_only | none
 	RunningSumMinor   int64
 	LastCheckAt       *time.Time
 	LastCheckOK       *bool
@@ -176,6 +181,8 @@ type Reconciliation struct {
 	KnownException    *string
 	// AcceptedDiffMinor is the difference the operator accepted with KnownException.
 	AcceptedDiffMinor *int64
+	// FailedOn is, for running_balance, the earliest day that does not add up (a date).
+	FailedOn *time.Time
 }
 
 // FileGap is a core.file_gap row: two imported files that do not join up.
@@ -195,25 +202,27 @@ type ProjectionState struct {
 	Zone *string
 }
 
-const accountColumns = `id, source, source_key, slug, type, feed, currency, name, parent_id, expects_imports, opened_on, closed, file_ref`
+const accountColumns = `id, source, source_key, slug, type, feed, currency, name, parent_id, expects_imports, opened_on, closed,
+	bank_ref, ended_on`
 
 func scanAccount(r pgx.CollectableRow) (Account, error) {
 	var a Account
 	err := r.Scan(&a.ID, &a.Source, &a.SourceKey, &a.Slug, &a.Type, &a.Feed, &a.Currency, &a.Name,
-		&a.ParentID, &a.ExpectsImports, &a.OpenedOn, &a.Closed, &a.FileRef)
+		&a.ParentID, &a.ExpectsImports, &a.OpenedOn, &a.Closed, &a.BankRef, &a.EndedOn)
 	return a, err
 }
 
 // UpsertAccount inserts a, or replaces every column of the row with a's id.
 func (c Core) UpsertAccount(ctx context.Context, a Account) error {
 	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.account (`+accountColumns+`)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		ON CONFLICT (id) DO UPDATE SET source = EXCLUDED.source, source_key = EXCLUDED.source_key,
 		  slug = EXCLUDED.slug, type = EXCLUDED.type, feed = EXCLUDED.feed, currency = EXCLUDED.currency,
 		  name = EXCLUDED.name, parent_id = EXCLUDED.parent_id, expects_imports = EXCLUDED.expects_imports,
-		  opened_on = EXCLUDED.opened_on, closed = EXCLUDED.closed, file_ref = EXCLUDED.file_ref`),
+		  opened_on = EXCLUDED.opened_on, closed = EXCLUDED.closed, bank_ref = EXCLUDED.bank_ref,
+		  ended_on = EXCLUDED.ended_on`),
 		a.ID, a.Source, a.SourceKey, a.Slug, a.Type, a.Feed, a.Currency, a.Name, a.ParentID,
-		a.ExpectsImports, a.OpenedOn, a.Closed, a.FileRef)
+		a.ExpectsImports, a.OpenedOn, a.Closed, a.BankRef, a.EndedOn)
 	if err != nil {
 		return fmt.Errorf("store: upsert account: %w", err)
 	}
@@ -456,30 +465,72 @@ type DisappearanceResult struct {
 	Returned    []TransactionState // disappeared_at cleared; state after the change
 }
 
-// SetDisappeared applies a fetch of accountID's transactions over [periodStart, periodEnd) that
-// completed at at: every transaction of the account whose created_at lies in the period, is not
-// in present, has no disappeared_at, and was last seen no later than at gets disappeared_at = at;
-// every transaction of the account that is in present and disappeared no later than at has it
-// cleared. A fetch from an old capture loaded late therefore never overrides a later sighting or
-// a later disappearance. Rows already in the right state are untouched. The result lets the
-// caller adjust the running sum.
-func (c Core) SetDisappeared(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time, present []uuid.UUID, at time.Time) (DisappearanceResult, error) {
+// FetchPeriod is a core.fetch_period row: the period, as instants, that one completed fetch of
+// an account's transactions proved complete.
+type FetchPeriod struct {
+	FetchID     int64
+	AccountID   uuid.UUID
+	PeriodStart time.Time
+	PeriodEnd   time.Time
+}
+
+// PutFetchPeriod inserts p, or replaces the row of p's fetch.
+func (c Core) PutFetchPeriod(ctx context.Context, p FetchPeriod) error {
+	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.fetch_period (fetch_id, account_id, period_start, period_end)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (fetch_id) DO UPDATE SET account_id = EXCLUDED.account_id,
+		  period_start = EXCLUDED.period_start, period_end = EXCLUDED.period_end`),
+		p.FetchID, p.AccountID, p.PeriodStart, p.PeriodEnd)
+	if err != nil {
+		return fmt.Errorf("store: put fetch period: %w", err)
+	}
+	return nil
+}
+
+// GetFetchPeriod returns the period recorded for fetchID, or ErrNotFound.
+func (c Core) GetFetchPeriod(ctx context.Context, fetchID int64) (FetchPeriod, error) {
+	var p FetchPeriod
+	err := c.q.QueryRow(ctx, c.sql(`SELECT fetch_id, account_id, period_start, period_end FROM core.fetch_period
+		WHERE fetch_id = $1`), fetchID).Scan(&p.FetchID, &p.AccountID, &p.PeriodStart, &p.PeriodEnd)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return FetchPeriod{}, ErrNotFound
+	}
+	if err != nil {
+		return FetchPeriod{}, fmt.Errorf("store: get fetch period: %w", err)
+	}
+	return p, nil
+}
+
+// SetDisappeared applies the completed fetch fetchID, whose account and period [period_start,
+// period_end) are its core.fetch_period row (PutFetchPeriod), as completed at at: every
+// transaction of the account whose created_at lies in the period, is not in present, has no
+// disappeared_at, and was last seen no later than at gets disappeared_at = at; every transaction
+// of the account that is in present and disappeared no later than at has it cleared. A fetch
+// from an old capture loaded late therefore never overrides a later sighting or a later
+// disappearance. Rows already in the right state are untouched, and a fetch with no period row
+// changes nothing. The comparison is between instants, so a period that starts part-way through
+// a day leaves that day's earlier rows alone. The result lets the caller adjust the running sum.
+func (c Core) SetDisappeared(ctx context.Context, fetchID int64, present []uuid.UUID, at time.Time) (DisappearanceResult, error) {
 	if present == nil {
 		present = []uuid.UUID{}
 	}
 	rows, err := c.q.Query(ctx, c.sql(`
-		WITH gone AS (
-		  UPDATE core.transaction SET disappeared_at = $5
-		  WHERE account_id = $1 AND created_at >= $2 AND created_at < $3
-		    AND disappeared_at IS NULL AND last_seen_at <= $5 AND NOT (id = ANY($4))
-		  RETURNING id, account_id, amount_minor, status, version_count, current_hash, disappeared_at, true AS gone
+		WITH p AS (
+		  SELECT account_id, period_start, period_end FROM core.fetch_period WHERE fetch_id = $1
+		), gone AS (
+		  UPDATE core.transaction t SET disappeared_at = $3
+		  FROM p
+		  WHERE t.account_id = p.account_id AND t.created_at >= p.period_start AND t.created_at < p.period_end
+		    AND t.disappeared_at IS NULL AND t.last_seen_at <= $3 AND NOT (t.id = ANY($2))
+		  RETURNING t.id, t.account_id, t.amount_minor, t.status, t.version_count, t.current_hash, t.disappeared_at, true AS gone
 		), back AS (
-		  UPDATE core.transaction SET disappeared_at = NULL
-		  WHERE account_id = $1 AND id = ANY($4) AND disappeared_at <= $5
-		  RETURNING id, account_id, amount_minor, status, version_count, current_hash, disappeared_at, false AS gone
+		  UPDATE core.transaction t SET disappeared_at = NULL
+		  FROM p
+		  WHERE t.account_id = p.account_id AND t.id = ANY($2) AND t.disappeared_at <= $3
+		  RETURNING t.id, t.account_id, t.amount_minor, t.status, t.version_count, t.current_hash, t.disappeared_at, false AS gone
 		)
 		SELECT * FROM gone UNION ALL SELECT * FROM back ORDER BY id`),
-		accountID, periodStart, periodEnd, present, at)
+		fetchID, present, at)
 	if err != nil {
 		return DisappearanceResult{}, fmt.Errorf("store: set disappeared: %w", err)
 	}
@@ -540,14 +591,14 @@ func (c Core) LatestBalanceSnapshot(ctx context.Context, accountID uuid.UUID) (B
 }
 
 const reconciliationColumns = `account_id, method, running_sum_minor, last_check_at, last_check_ok, last_diff_minor,
-	last_pass_at, reconciled_through, break_count, known_exception, accepted_diff_minor`
+	last_pass_at, reconciled_through, break_count, known_exception, accepted_diff_minor, failed_on`
 
 // GetReconciliation returns the account's reconciliation row, or ErrNotFound.
 func (c Core) GetReconciliation(ctx context.Context, accountID uuid.UUID) (Reconciliation, error) {
 	var r Reconciliation
 	err := c.q.QueryRow(ctx, c.sql(`SELECT `+reconciliationColumns+` FROM core.reconciliation WHERE account_id = $1`), accountID).
 		Scan(&r.AccountID, &r.Method, &r.RunningSumMinor, &r.LastCheckAt, &r.LastCheckOK, &r.LastDiffMinor,
-			&r.LastPassAt, &r.ReconciledThrough, &r.BreakCount, &r.KnownException, &r.AcceptedDiffMinor)
+			&r.LastPassAt, &r.ReconciledThrough, &r.BreakCount, &r.KnownException, &r.AcceptedDiffMinor, &r.FailedOn)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Reconciliation{}, ErrNotFound
 	}
@@ -560,15 +611,15 @@ func (c Core) GetReconciliation(ctx context.Context, accountID uuid.UUID) (Recon
 // PutReconciliation inserts r or replaces every column of the account's row.
 func (c Core) PutReconciliation(ctx context.Context, r Reconciliation) error {
 	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.reconciliation (`+reconciliationColumns+`)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (account_id) DO UPDATE SET method = EXCLUDED.method,
 		  running_sum_minor = EXCLUDED.running_sum_minor, last_check_at = EXCLUDED.last_check_at,
 		  last_check_ok = EXCLUDED.last_check_ok, last_diff_minor = EXCLUDED.last_diff_minor,
 		  last_pass_at = EXCLUDED.last_pass_at, reconciled_through = EXCLUDED.reconciled_through,
 		  break_count = EXCLUDED.break_count, known_exception = EXCLUDED.known_exception,
-		  accepted_diff_minor = EXCLUDED.accepted_diff_minor`),
+		  accepted_diff_minor = EXCLUDED.accepted_diff_minor, failed_on = EXCLUDED.failed_on`),
 		r.AccountID, r.Method, r.RunningSumMinor, r.LastCheckAt, r.LastCheckOK, r.LastDiffMinor,
-		r.LastPassAt, r.ReconciledThrough, r.BreakCount, r.KnownException, r.AcceptedDiffMinor)
+		r.LastPassAt, r.ReconciledThrough, r.BreakCount, r.KnownException, r.AcceptedDiffMinor, r.FailedOn)
 	if err != nil {
 		return fmt.Errorf("store: put reconciliation: %w", err)
 	}
@@ -739,4 +790,375 @@ func (c Core) SetLastSeq(ctx context.Context, seq int64) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// Mandate kinds: the tables core.standing_order and core.direct_debit.
+const (
+	MandateStandingOrder = "standing_order"
+	MandateDirectDebit   = "direct_debit"
+)
+
+// ErrBadMandateKind is returned for a kind outside MandateStandingOrder and MandateDirectDebit.
+var ErrBadMandateKind = errors.New("store: mandate kind must be standing_order or direct_debit")
+
+// mandateTables returns the row table and the version table of kind, and the version table's
+// key column. The names are constants, so they are safe to put in a statement.
+func mandateTables(kind string) (table, versionTable, idColumn string, err error) {
+	switch kind {
+	case MandateStandingOrder:
+		return "core.standing_order", "core.standing_order_version", "standing_order_id", nil
+	case MandateDirectDebit:
+		return "core.direct_debit", "core.direct_debit_version", "direct_debit_id", nil
+	}
+	return "", "", "", fmt.Errorf("%w: %q", ErrBadMandateKind, kind)
+}
+
+// MandateState is the version state of a stored mandate.
+type MandateState struct {
+	VersionCount  int
+	CurrentHash   []byte
+	FirstSeenAt   time.Time
+	LastSeenAt    time.Time
+	DisappearedAt *time.Time
+}
+
+// StandingOrder is a core.standing_order row. It mirrors its latest version. Dates are dates.
+type StandingOrder struct {
+	ID               uuid.UUID
+	AccountID        *uuid.UUID // nil while no account has BankRef
+	BankRef          string
+	Source           string
+	MandateKey       string
+	Payee            *string
+	Reference        *string
+	Frequency        *string
+	Status           *string
+	FirstDate        *time.Time
+	FirstAmountMinor *int64
+	NextDate         *time.Time
+	NextAmountMinor  *int64
+	FinalDate        *time.Time
+	FinalAmountMinor *int64
+	Currency         *string
+	MandateState
+}
+
+// DirectDebit is a core.direct_debit row. It mirrors its latest version. Dates are dates.
+type DirectDebit struct {
+	ID                  uuid.UUID
+	AccountID           *uuid.UUID // nil while no account has BankRef
+	BankRef             string
+	Source              string
+	MandateKey          string
+	Name                *string
+	Status              *string
+	PreviousDate        *time.Time
+	PreviousAmountMinor *int64
+	Currency            *string
+	MandateState
+}
+
+// MandateVersion is a row of core.standing_order_version or core.direct_debit_version.
+type MandateVersion struct {
+	MandateID   uuid.UUID
+	VersionNo   int
+	Content     json.RawMessage
+	ContentHash []byte
+	SeenAt      time.Time
+	RawSeq      int64
+}
+
+const standingOrderColumns = `id, account_id, bank_ref, source, mandate_key, payee, reference, frequency, status,
+	first_date, first_amount_minor, next_date, next_amount_minor, final_date, final_amount_minor, currency,
+	version_count, current_hash, first_seen_at, last_seen_at, disappeared_at`
+
+const directDebitColumns = `id, account_id, bank_ref, source, mandate_key, name, status, previous_date,
+	previous_amount_minor, currency, version_count, current_hash, first_seen_at, last_seen_at, disappeared_at`
+
+// GetStandingOrder returns the standing order with id, or ErrNotFound.
+func (c Core) GetStandingOrder(ctx context.Context, id uuid.UUID) (StandingOrder, error) {
+	var s StandingOrder
+	err := c.q.QueryRow(ctx, c.sql(`SELECT `+standingOrderColumns+` FROM core.standing_order WHERE id = $1`), id).
+		Scan(&s.ID, &s.AccountID, &s.BankRef, &s.Source, &s.MandateKey, &s.Payee, &s.Reference, &s.Frequency, &s.Status,
+			&s.FirstDate, &s.FirstAmountMinor, &s.NextDate, &s.NextAmountMinor, &s.FinalDate, &s.FinalAmountMinor,
+			&s.Currency, &s.VersionCount, &s.CurrentHash, &s.FirstSeenAt, &s.LastSeenAt, &s.DisappearedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return StandingOrder{}, ErrNotFound
+	}
+	if err != nil {
+		return StandingOrder{}, fmt.Errorf("store: get standing order: %w", err)
+	}
+	return s, nil
+}
+
+// GetDirectDebit returns the direct debit with id, or ErrNotFound.
+func (c Core) GetDirectDebit(ctx context.Context, id uuid.UUID) (DirectDebit, error) {
+	var d DirectDebit
+	err := c.q.QueryRow(ctx, c.sql(`SELECT `+directDebitColumns+` FROM core.direct_debit WHERE id = $1`), id).
+		Scan(&d.ID, &d.AccountID, &d.BankRef, &d.Source, &d.MandateKey, &d.Name, &d.Status, &d.PreviousDate,
+			&d.PreviousAmountMinor, &d.Currency, &d.VersionCount, &d.CurrentHash, &d.FirstSeenAt, &d.LastSeenAt,
+			&d.DisappearedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DirectDebit{}, ErrNotFound
+	}
+	if err != nil {
+		return DirectDebit{}, fmt.Errorf("store: get direct debit: %w", err)
+	}
+	return d, nil
+}
+
+// ListMandateVersions returns the versions of the mandate of kind with id, in version order.
+func (c Core) ListMandateVersions(ctx context.Context, kind string, id uuid.UUID) ([]MandateVersion, error) {
+	_, versions, idColumn, err := mandateTables(kind)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := c.q.Query(ctx, c.sql(`SELECT `+idColumn+`, version_no, content, content_hash, seen_at, raw_seq
+		FROM `+versions+` WHERE `+idColumn+` = $1 ORDER BY version_no`), id)
+	if err != nil {
+		return nil, fmt.Errorf("store: list mandate versions: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (MandateVersion, error) {
+		var v MandateVersion
+		var content []byte
+		err := r.Scan(&v.MandateID, &v.VersionNo, &content, &v.ContentHash, &v.SeenAt, &v.RawSeq)
+		v.Content = content
+		return v, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: list mandate versions: %w", err)
+	}
+	return out, nil
+}
+
+// ApplyStandingOrder is the version logic of ApplyTransaction for a standing order: s carries the
+// business columns and the resolved account (its MandateState is ignored); content and hash are
+// the version's. The row's account follows every record applied, so a mandate stored with no
+// account takes one as soon as a record of it resolves. disappeared_at is kept: only a mandate
+// list (SetMandatesDisappeared) sets or clears it.
+func (c Core) ApplyStandingOrder(ctx context.Context, s StandingOrder, content json.RawMessage, hash []byte, seenAt time.Time, rawSeq int64) (ApplyOutcome, error) {
+	return c.applyMandate(ctx, MandateStandingOrder, s.ID, s.AccountID, func(st MandateState) error {
+		_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.standing_order (`+standingOrderColumns+`)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+			ON CONFLICT (id) DO UPDATE SET account_id = EXCLUDED.account_id, payee = EXCLUDED.payee,
+			  reference = EXCLUDED.reference, frequency = EXCLUDED.frequency, status = EXCLUDED.status,
+			  first_date = EXCLUDED.first_date, first_amount_minor = EXCLUDED.first_amount_minor,
+			  next_date = EXCLUDED.next_date, next_amount_minor = EXCLUDED.next_amount_minor,
+			  final_date = EXCLUDED.final_date, final_amount_minor = EXCLUDED.final_amount_minor,
+			  currency = EXCLUDED.currency, version_count = EXCLUDED.version_count,
+			  current_hash = EXCLUDED.current_hash, first_seen_at = EXCLUDED.first_seen_at,
+			  last_seen_at = EXCLUDED.last_seen_at, disappeared_at = EXCLUDED.disappeared_at`),
+			s.ID, s.AccountID, s.BankRef, s.Source, s.MandateKey, s.Payee, s.Reference, s.Frequency, s.Status,
+			s.FirstDate, s.FirstAmountMinor, s.NextDate, s.NextAmountMinor, s.FinalDate, s.FinalAmountMinor,
+			s.Currency, st.VersionCount, st.CurrentHash, st.FirstSeenAt, st.LastSeenAt, st.DisappearedAt)
+		if err != nil {
+			return fmt.Errorf("store: upsert standing order: %w", err)
+		}
+		return nil
+	}, content, hash, seenAt, rawSeq)
+}
+
+// ApplyDirectDebit is ApplyStandingOrder for a direct debit.
+func (c Core) ApplyDirectDebit(ctx context.Context, d DirectDebit, content json.RawMessage, hash []byte, seenAt time.Time, rawSeq int64) (ApplyOutcome, error) {
+	return c.applyMandate(ctx, MandateDirectDebit, d.ID, d.AccountID, func(st MandateState) error {
+		_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.direct_debit (`+directDebitColumns+`)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+			ON CONFLICT (id) DO UPDATE SET account_id = EXCLUDED.account_id, name = EXCLUDED.name,
+			  status = EXCLUDED.status, previous_date = EXCLUDED.previous_date,
+			  previous_amount_minor = EXCLUDED.previous_amount_minor, currency = EXCLUDED.currency,
+			  version_count = EXCLUDED.version_count, current_hash = EXCLUDED.current_hash,
+			  first_seen_at = EXCLUDED.first_seen_at, last_seen_at = EXCLUDED.last_seen_at,
+			  disappeared_at = EXCLUDED.disappeared_at`),
+			d.ID, d.AccountID, d.BankRef, d.Source, d.MandateKey, d.Name, d.Status, d.PreviousDate,
+			d.PreviousAmountMinor, d.Currency, st.VersionCount, st.CurrentHash, st.FirstSeenAt, st.LastSeenAt,
+			st.DisappearedAt)
+		if err != nil {
+			return fmt.Errorf("store: upsert direct debit: %w", err)
+		}
+		return nil
+	}, content, hash, seenAt, rawSeq)
+}
+
+// applyMandate runs the version logic of ApplyTransaction over a mandate table: write is called
+// with the row's new version state to insert or rewrite the row with its business columns.
+func (c Core) applyMandate(ctx context.Context, kind string, id uuid.UUID, accountID *uuid.UUID, write func(MandateState) error,
+	content json.RawMessage, hash []byte, seenAt time.Time, rawSeq int64,
+) (ApplyOutcome, error) {
+	table, versions, idColumn, err := mandateTables(kind)
+	if err != nil {
+		return "", err
+	}
+	insertVersion := func(no int) error {
+		if _, err := c.q.Exec(ctx, c.sql(`INSERT INTO `+versions+` (`+idColumn+`, version_no, content, content_hash, seen_at, raw_seq)
+			VALUES ($1, $2, $3, $4, $5, $6)`), id, no, string(content), hash, seenAt, rawSeq); err != nil {
+			return fmt.Errorf("store: insert %s version: %w", kind, err)
+		}
+		return nil
+	}
+	var prev MandateState
+	err = c.q.QueryRow(ctx, c.sql(`SELECT version_count, current_hash, first_seen_at, last_seen_at, disappeared_at
+		FROM `+table+` WHERE id = $1 FOR UPDATE`), id).
+		Scan(&prev.VersionCount, &prev.CurrentHash, &prev.FirstSeenAt, &prev.LastSeenAt, &prev.DisappearedAt)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		if err := write(MandateState{VersionCount: 1, CurrentHash: hash, FirstSeenAt: seenAt, LastSeenAt: seenAt}); err != nil {
+			return "", err
+		}
+		if err := insertVersion(1); err != nil {
+			return "", err
+		}
+		return TransactionCreated, nil
+	case err != nil:
+		return "", fmt.Errorf("store: get %s state: %w", kind, err)
+	}
+	if bytes.Equal(prev.CurrentHash, hash) {
+		if _, err := c.q.Exec(ctx, c.sql(`UPDATE `+table+` SET account_id = $2,
+			first_seen_at = least(first_seen_at, $3), last_seen_at = greatest(last_seen_at, $3) WHERE id = $1`),
+			id, accountID, seenAt); err != nil {
+			return "", fmt.Errorf("store: touch %s: %w", kind, err)
+		}
+		return TransactionUnchanged, nil
+	}
+	first := prev.FirstSeenAt
+	if seenAt.Before(first) {
+		first = seenAt
+	}
+	no := prev.VersionCount + 1
+	if err := insertVersion(no); err != nil {
+		return "", err
+	}
+	if seenAt.Before(prev.LastSeenAt) {
+		if _, err := c.q.Exec(ctx, c.sql(`UPDATE `+table+` SET version_count = $2, first_seen_at = $3, account_id = $4
+			WHERE id = $1`), id, no, first, accountID); err != nil {
+			return "", fmt.Errorf("store: count older %s version: %w", kind, err)
+		}
+		return TransactionOlderVersion, nil
+	}
+	if err := write(MandateState{VersionCount: no, CurrentHash: hash, FirstSeenAt: first, LastSeenAt: seenAt,
+		DisappearedAt: prev.DisappearedAt}); err != nil {
+		return "", err
+	}
+	return TransactionChanged, nil
+}
+
+// SetMandatesDisappeared applies a complete list of source's mandates of kind for bankRef, seen at
+// at: every such mandate not in present, not already disappeared and last seen no later than at
+// gets disappeared_at = at; every one in present that disappeared no later than at has it
+// cleared. It returns how many disappeared and how many returned.
+func (c Core) SetMandatesDisappeared(ctx context.Context, kind, source, bankRef string, present []uuid.UUID, at time.Time) (disappeared, returned int, err error) {
+	table, _, _, err := mandateTables(kind)
+	if err != nil {
+		return 0, 0, err
+	}
+	if present == nil {
+		present = []uuid.UUID{}
+	}
+	err = c.q.QueryRow(ctx, c.sql(`
+		WITH gone AS (
+		  UPDATE `+table+` SET disappeared_at = $4
+		  WHERE source = $1 AND bank_ref = $2 AND NOT (id = ANY($3)) AND disappeared_at IS NULL AND last_seen_at <= $4
+		  RETURNING id
+		), back AS (
+		  UPDATE `+table+` SET disappeared_at = NULL
+		  WHERE source = $1 AND bank_ref = $2 AND id = ANY($3) AND disappeared_at <= $4
+		  RETURNING id
+		)
+		SELECT (SELECT count(*) FROM gone), (SELECT count(*) FROM back)`),
+		source, bankRef, present, at).Scan(&disappeared, &returned)
+	if err != nil {
+		return 0, 0, fmt.Errorf("store: set %s disappeared: %w", kind, err)
+	}
+	return disappeared, returned, nil
+}
+
+// AccountsByBankRef returns the accounts with bankRef and no end date, ordered by slug.
+func (c Core) AccountsByBankRef(ctx context.Context, bankRef string) ([]Account, error) {
+	rows, err := c.q.Query(ctx, c.sql(`SELECT `+accountColumns+` FROM core.account
+		WHERE bank_ref = $1 AND ended_on IS NULL ORDER BY slug`), bankRef)
+	if err != nil {
+		return nil, fmt.Errorf("store: accounts by bank reference: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, scanAccount)
+	if err != nil {
+		return nil, fmt.Errorf("store: accounts by bank reference: %w", err)
+	}
+	return out, nil
+}
+
+// SharedBankRefs returns every account that shares its bank reference with an account of another
+// source while neither has an end date, mapped to the slug of the first such other account by
+// slug.
+func (c Core) SharedBankRefs(ctx context.Context) (map[uuid.UUID]string, error) {
+	rows, err := c.q.Query(ctx, c.sql(`SELECT DISTINCT ON (a.id) a.id, b.slug
+		FROM core.account a
+		JOIN core.account b ON b.bank_ref = a.bank_ref AND b.source <> a.source AND b.ended_on IS NULL
+		WHERE a.bank_ref IS NOT NULL AND a.ended_on IS NULL
+		ORDER BY a.id, b.slug`))
+	if err != nil {
+		return nil, fmt.Errorf("store: shared bank references: %w", err)
+	}
+	out := map[uuid.UUID]string{}
+	var id uuid.UUID
+	var slug string
+	if _, err := pgx.ForEachRow(rows, []any{&id, &slug}, func() error {
+		out[id] = slug
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("store: shared bank references: %w", err)
+	}
+	return out, nil
+}
+
+// ListReconciliations returns every reconciliation row, ordered by account id.
+func (c Core) ListReconciliations(ctx context.Context) ([]Reconciliation, error) {
+	rows, err := c.q.Query(ctx, c.sql(`SELECT `+reconciliationColumns+` FROM core.reconciliation ORDER BY account_id`))
+	if err != nil {
+		return nil, fmt.Errorf("store: list reconciliations: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Reconciliation, error) {
+		var x Reconciliation
+		err := r.Scan(&x.AccountID, &x.Method, &x.RunningSumMinor, &x.LastCheckAt, &x.LastCheckOK, &x.LastDiffMinor,
+			&x.LastPassAt, &x.ReconciledThrough, &x.BreakCount, &x.KnownException, &x.AcceptedDiffMinor, &x.FailedOn)
+		return x, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: list reconciliations: %w", err)
+	}
+	return out, nil
+}
+
+// DayRow is one transaction as the running_balance check reads it: its day, its amount and the
+// content of its latest version.
+type DayRow struct {
+	TxnDate     time.Time // a date
+	AmountMinor int64
+	Content     json.RawMessage
+}
+
+// LiveTransactionRows returns the account's transactions that have not disappeared and are not
+// declined, with their latest version's content, ordered by day, then source key.
+func (c Core) LiveTransactionRows(ctx context.Context, accountID uuid.UUID) ([]DayRow, error) {
+	// The current version is the newest one with the row's hash: an older version loaded late has
+	// a higher version number but is not what the row mirrors.
+	rows, err := c.q.Query(ctx, c.sql(`SELECT t.txn_date, t.amount_minor, v.content
+		FROM core.transaction t
+		CROSS JOIN LATERAL (SELECT content FROM core.transaction_version
+		  WHERE transaction_id = t.id AND content_hash = t.current_hash
+		  ORDER BY version_no DESC LIMIT 1) v
+		WHERE t.account_id = $1 AND t.disappeared_at IS NULL AND t.status <> 'declined'
+		ORDER BY t.txn_date, t.source_key`), accountID)
+	if err != nil {
+		return nil, fmt.Errorf("store: live transaction rows: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (DayRow, error) {
+		var d DayRow
+		var content []byte
+		err := r.Scan(&d.TxnDate, &d.AmountMinor, &content)
+		d.Content = content
+		return d, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: live transaction rows: %w", err)
+	}
+	return out, nil
 }

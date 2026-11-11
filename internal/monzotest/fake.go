@@ -47,6 +47,10 @@ type Account struct {
 	Description string
 	Created     time.Time
 	Closed      bool
+	// SortCode and AccountNumber are listed when set, as Monzo lists them for current, joint and
+	// business accounts.
+	SortCode      string
+	AccountNumber string
 }
 
 // Merchant is the object embedded in a transaction when expand[]=merchant is
@@ -572,10 +576,14 @@ func (f *Fake) listAccounts(typ string) reply {
 		if typ != "" && a.Type != typ {
 			continue
 		}
-		out = append(out, map[string]any{
+		obj := map[string]any{
 			"id": a.ID, "type": a.Type, "description": a.Description,
 			"created": ts(a.Created), "closed": a.Closed,
-		})
+		}
+		if a.SortCode != "" || a.AccountNumber != "" {
+			obj["sort_code"], obj["account_number"] = a.SortCode, a.AccountNumber
+		}
+		out = append(out, obj)
 	}
 	return reply{status: http.StatusOK, body: map[string]any{"accounts": out}}
 }

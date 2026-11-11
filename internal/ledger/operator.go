@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/rknightion/finstore/internal/store"
 )
@@ -14,7 +15,17 @@ const (
 	EntryAccountAdd = "account_add"
 	// EntryAcceptDifference accepts a reconciliation difference. Payload: AcceptDifference.
 	EntryAcceptDifference = "accept_difference"
+	// EntryAccountEnd ends an account at a date, or clears its end. Payload: AccountEnd.
+	EntryAccountEnd = "account_end"
 )
+
+// AccountEnd is the payload of an account_end operator entry: the account has no transactions
+// after LastDate (YYYY-MM-DD). A null LastDate clears the end. A later entry for the same account
+// replaces an earlier one.
+type AccountEnd struct {
+	Slug     string  `json:"slug"`
+	LastDate *string `json:"last_date"`
+}
 
 // AccountAdd is the payload of an account_add operator entry.
 type AccountAdd struct {
@@ -39,6 +50,8 @@ func (a *applier) operatorEntry(ctx context.Context, e *store.OperatorEntry) err
 		return a.accountAdd(ctx, e.Payload)
 	case EntryAcceptDifference:
 		return a.acceptDifference(ctx, e.Payload)
+	case EntryAccountEnd:
+		return a.accountEnd(ctx, e.Payload, e.EnteredAt)
 	}
 	return unparseable("unknown_entry")
 }
@@ -102,5 +115,46 @@ func (a *applier) acceptDifference(ctx context.Context, payload []byte) error {
 	if rec.LastDiffMinor != nil {
 		evaluate(&rec)
 	}
-	return a.core.PutReconciliation(ctx, rec)
+	if err := a.core.PutReconciliation(ctx, rec); err != nil {
+		return err
+	}
+	// The reason replaced known_exception; a shared bank reference that still holds is reported
+	// again in its place.
+	return a.checkSharedBankRefs(ctx)
+}
+
+// accountEnd sets or clears the account's ended_on. A later entry for the same account replaces
+// an earlier one. A file-fed account's continuity is recomputed (statements after the end no
+// longer count), and shared bank references are checked again, since an ended account shares its
+// reference with no one.
+func (a *applier) accountEnd(ctx context.Context, payload []byte, at time.Time) error {
+	var p AccountEnd
+	if err := json.Unmarshal(payload, &p); err != nil || p.Slug == "" {
+		return unparseable("bad_payload")
+	}
+	var ended *time.Time
+	if p.LastDate != nil {
+		d, err := time.Parse(time.DateOnly, *p.LastDate)
+		if err != nil {
+			return unparseable("bad_payload")
+		}
+		ended = &d
+	}
+	acc, err := a.core.GetAccountBySlug(ctx, p.Slug)
+	if errors.Is(err, store.ErrNotFound) {
+		return unparseable("unknown_account")
+	}
+	if err != nil {
+		return err
+	}
+	acc.EndedOn = ended
+	if err := a.core.UpsertAccount(ctx, acc); err != nil {
+		return err
+	}
+	if acc.Feed == feedFile {
+		if err := a.recomputeContinuity(ctx, acc, at); err != nil {
+			return err
+		}
+	}
+	return a.checkSharedBankRefs(ctx)
 }

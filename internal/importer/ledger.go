@@ -3,7 +3,6 @@ package importer
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/rknightion/finstore/internal/ledger"
 )
@@ -59,7 +58,7 @@ func (Normaliser) NormaliseFile(f ledger.File) (ledger.FileResult, error) {
 	}
 	if st.Format == FormatHalifaxPDF {
 		res.FirstDate, res.LastDate, res.PeriodExact = st.PeriodStart, st.PeriodEnd, true
-		res.AccountRef = accountRef(st.SortCode, st.AccountNumber)
+		res.AccountRef = ledger.BankRef(st.SortCode, st.AccountNumber)
 	}
 	for _, r := range st.Rows {
 		content, err := json.Marshal(rowContent{Balance: r.Balance, Date: r.Date.Format("2006-01-02"),
@@ -82,22 +81,4 @@ func (Normaliser) NormaliseFile(f ledger.File) (ledger.FileResult, error) {
 			BalanceMinor: r.Balance})
 	}
 	return res, nil
-}
-
-// accountRef is the sort code and account number with every non-digit removed, joined by a
-// space, or empty when both are.
-func accountRef(sortCode, accountNumber string) string {
-	digits := func(s string) string {
-		return strings.Map(func(r rune) rune {
-			if r >= '0' && r <= '9' {
-				return r
-			}
-			return -1
-		}, s)
-	}
-	sc, an := digits(sortCode), digits(accountNumber)
-	if sc == "" && an == "" {
-		return ""
-	}
-	return sc + " " + an
 }
