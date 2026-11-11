@@ -5,8 +5,8 @@ and how to recover. `deploy/` holds a working example of everything named here.
 
 ## What runs
 
-One container runs `finstore serve`: an HTTP server with a status page, a scheduler, and the Monzo
-worker. One container runs PostgreSQL 18. A host timer dumps the database to a file for your backup
+One container runs `finstore serve`: an HTTP server with a status page, a scheduler, the Monzo
+worker and, when TrueLayer is configured, a worker for each TrueLayer connection. One container runs PostgreSQL 18. A host timer dumps the database to a file for your backup
 tool. Nothing else is needed.
 
 The service must not be reachable from the public internet. It expects something in front that
@@ -17,10 +17,12 @@ Tailscale sidecar for that; a reverse proxy with single sign-on works too.
 
 1. Copy `deploy/docker-compose.yaml`, `deploy/ts/tailscale-serve.json` (into `ts/`),
    `deploy/finstore.env.example` (as `finstore.env`), `deploy/owner.env.example` (as `owner.env`)
-   and `deploy/ts.env.example` (as `ts.env`). Set every `CHANGE-ME` value. Keep the env files at
-   mode 600.
+   and `deploy/ts.env.example` (as `ts.env`). Set every `CHANGE-ME` value. The TrueLayer pair
+   (`FINSTORE_TRUELAYER_CLIENT_ID` and `FINSTORE_TRUELAYER_CLIENT_SECRET`) ships empty and may stay
+   empty: set both only to enable TrueLayer. Keep the env files at mode 600.
 2. Register an OAuth client at <https://developers.monzo.com>: confidential, with the redirect URL
-   `<FINSTORE_PUBLIC_URL>/callback/monzo`. Put its id and secret in `finstore.env`.
+   `<FINSTORE_PUBLIC_URL>/callback/monzo`. Put its id and secret in `finstore.env`. For the
+   optional TrueLayer connections, see [Connecting through TrueLayer](#connecting-through-truelayer).
 3. Start the database, create the roles and the schemas, then start the service:
 
    ```sh
@@ -60,7 +62,7 @@ restricted to your private network:
 | Route | Sign-in | Why |
 |---|---|---|
 | Everything | Required. The proxy passes the signed-in address in `FINSTORE_AUTH_HEADER` | The pages check that address against `FINSTORE_ALLOWED_EMAILS` |
-| Path prefix `/callback/` | None | Monzo's email link may open in a browser with no session, and a login redirect in the middle of the callback can lose the authorisation code |
+| Path prefix `/callback/` | None | Monzo's email link may open in a browser with no session, and a login redirect in the middle of the callback can lose the authorisation code. TrueLayer's `/callback/truelayer` is under the same prefix |
 
 The callback acts only on a single-use value from a connect flow that a signed-in user started
 within the last hour.
@@ -93,6 +95,46 @@ Three things about Monzo shape this flow:
 After the first minutes, Monzo serves only the last 90 days. The service syncs the last 7 days every
 hour and the last 89 days every night, so a host that was down for less than 90 days catches up by
 itself.
+
+## Connecting through TrueLayer
+
+TrueLayer's Data API adds two connections, each its own source with its own consent:
+
+- **`truelayer:ob-lloyds`**: the Lloyds accounts, their transactions, balances, standing orders
+  and direct debits. Its accounts are `lloyds-joint`, `lloyds-current` and so on, and are checked
+  by running balance (see [How the data is checked](#how-the-data-is-checked)).
+- **`truelayer:ob-monzo`**: standing orders and direct debits for the Monzo accounts finstore
+  already holds from Monzo's own API. It creates no account: each mandate attaches to the Monzo
+  account with the same [bank reference](#bank-references), so connect Monzo first. Pots are
+  skipped.
+
+To turn them on, create a TrueLayer Data API client with the redirect URI
+`<FINSTORE_PUBLIC_URL>/callback/truelayer` and set `FINSTORE_TRUELAYER_CLIENT_ID` and
+`FINSTORE_TRUELAYER_CLIENT_SECRET` (both or neither: one without the other stops the service at
+start). Leave `FINSTORE_TRUELAYER_AUTH_URL` and `FINSTORE_TRUELAYER_API_URL` at their defaults
+unless you use TrueLayer's sandbox. With neither credential set, the service runs Monzo only and
+the status page shows no TrueLayer section.
+
+**Connecting.** Each connection has its own section on the status page. Press "Connect Lloyds
+(TrueLayer)" or "Connect Monzo (TrueLayer)", approve at the bank, and the browser comes back to
+`/callback/truelayer`. There is no approval wait: the consent is active as soon as you are back, and
+the connect-time fetch runs at once (for Lloyds, every transaction since 2024-08-01, then the
+balance). If the Lloyds history call fails, the connect run ends `partial` with `history_failed`;
+reconnect to fetch it again. Declining at the bank changes nothing.
+
+**Syncing.** Each connection syncs at 06:20 and 18:20 in `FINSTORE_TIMEZONE`, each up to five
+minutes late at random: accounts and mandates, and for Lloyds the last 35 days of transactions and
+the balance. TrueLayer allows four calls a day to each endpoint for each account. The service counts
+its own calls in `raw.api_response` and skips a fifth (the run ends `partial` with `rate_limited`);
+a connect day uses three. A `raw.api_response` row with status 0 and no body records a call that got
+no whole response (a transport failure): it may still have reached the bank, so it counts toward the
+daily limit.
+
+**Reconnecting.** finstore holds three consents, each on its own 90-day clock: Monzo's own and the
+two TrueLayer ones. The status page lists them together, so renew all three in one sitting. A
+reconnect is a fresh connect: the old consent becomes `replaced` and the new one active, and Lloyds
+refetches its full history. A consent ends `lost` when TrueLayer refuses a token refresh or a data
+call; reconnect from the status page.
 
 ## Accounts that no API reaches
 
@@ -187,7 +229,7 @@ mismatch in `agent.coverage`, with a gap naming the other account, until one of 
 |---|---|---|
 | `finstore bootstrap` | superuser | Creates the roles `finstore_owner`, `finstore_app` and `finstore_agent`, sets the two passwords, creates the schemas. Safe to run again |
 | `finstore migrate` | owner | Applies the migrations and the grants. Says so when a `renormalise` is required |
-| `finstore serve` | app | The HTTP server, the scheduler and the Monzo worker |
+| `finstore serve` | app | The HTTP server, the scheduler, the Monzo worker and, when TrueLayer is configured, the two TrueLayer workers |
 | `finstore account add`, `finstore account list` | app | Create and list file-fed accounts |
 | `finstore account end --slug S --last-date YYYY-MM-DD`, `finstore account end --slug S --clear` | app | Ends an account at a date, or removes its end. See [Ending an account](#ending-an-account) |
 | `finstore account accept-difference --slug S --reason TEXT` | app | For an account an API feeds: records that its current balance difference is known and accepted, so it stops counting as a mismatch. A different difference later counts again. A statement-fed account is refused: its gaps close when the missing statement is imported |
@@ -222,6 +264,9 @@ Environment variables only.
 | `FINSTORE_MONZO_NIGHTLY_AT` | `serve` | `03:20` | Local time of the 89-day sync |
 | `FINSTORE_MONZO_BACKFILL_CONCURRENCY` | `serve` | `6` | Ranges fetched at once during the full-history fetch |
 | `FINSTORE_MONZO_WINDOW` | `serve` | `240s` | How long after the email link the full-history fetch runs |
+| `FINSTORE_TRUELAYER_CLIENT_ID`, `FINSTORE_TRUELAYER_CLIENT_SECRET` | `serve` | none | The TrueLayer Data API client. Both or neither: with neither, TrueLayer is off. See [Connecting through TrueLayer](#connecting-through-truelayer) |
+| `FINSTORE_TRUELAYER_AUTH_URL` | `serve` | `https://auth.truelayer.com` | TrueLayer's auth server: the auth link and the token call |
+| `FINSTORE_TRUELAYER_API_URL` | `serve` | `https://api.truelayer.com` | TrueLayer's Data API |
 | `FINSTORE_TIMEZONE` | all | `Europe/London` | Zone for a transaction's day and for the nightly time. Changing it after data is stored needs a `renormalise`, or days are mixed between the two zones |
 | `FINSTORE_DUMP_STATUS_FILE` | `serve` | empty | The dump script's status file; the dump metric is off when empty |
 | `FINSTORE_OTLP_ENDPOINT`, `FINSTORE_OTLP_INSTANCE_ID`, `FINSTORE_OTLP_TOKEN` | `serve` | empty | OTLP over HTTP with basic auth; export is off when the endpoint is empty |
@@ -423,7 +468,8 @@ metric value, a label or a log field; the log handler drops any field that is no
 | `finstore.dump.last_success.time` | none | Unix time from the dump status file |
 | `finstore.up` | none | 1, sent every minute |
 
-Alerts worth having: no successful sync for 3 hours; consent ending within 14 days; consent `lost`
+Alerts worth having: no successful sync for 3 hours (13 hours for a `truelayer:` source, which syncs
+twice a day); consent ending within 14 days; consent `lost`
 or `expired`; a reconciliation mismatch lasting 90 minutes; newest import older than 35 days; dump
 older than 14 hours; `finstore.up` absent for an hour.
 
@@ -431,7 +477,9 @@ older than 14 hours; `finstore.up` absent for an hour.
 
 | Symptom | Cause | What to do |
 |---|---|---|
-| Consent `lost` | Monzo ended the consent, a token refresh was rejected, or nobody approved within a day | Reconnect from the status page |
+| Consent `lost` | Monzo ended the consent, a token refresh was rejected, or nobody approved within a day; for a TrueLayer source, TrueLayer refused a refresh or a data call, or the token was missing at start (`token_missing`, after a database restore) | Reconnect from the status page |
+| A TrueLayer run ends `partial` with `rate_limited` | A fifth call of the day to one endpoint for one account was skipped, or TrueLayer answered 429 | Nothing: the next day's syncs catch up. Do not reconnect and sync by hand several times in a day |
+| A Lloyds connect run ends `partial` with `history_failed` | The full-history call failed, or the service stopped before it ran | Reconnect from the status page |
 | Coverage shows "the Monzo window closed before this range was fetched" | The five minutes ran out | Reconnect: unfinished ranges are fetched first |
 | Coverage shows "no completed fetch covers this period" | The service was down or disconnected for more than 90 days | Reconnect: the full-history fetch fills it |
 | A Monzo account shows `mismatch` | The stored transactions do not add up to the bank's balance | A sync usually clears it. If it lasts, compare `raw` with `core` and run `renormalise --verify`. A closed account with a difference that will never change can be accepted with `account accept-difference` |

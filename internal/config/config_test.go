@@ -168,14 +168,16 @@ func TestRequireNamesOnlyFirstMissing(t *testing.T) {
 
 func TestSecretsAreRedacted(t *testing.T) {
 	secrets := map[string]string{
-		EnvDatabaseURL:          "SECRET-MARKER-db",
-		EnvOwnerDatabaseURL:     "SECRET-MARKER-owner",
-		EnvSuperuserDatabaseURL: "SECRET-MARKER-super",
-		EnvAppPassword:          "SECRET-MARKER-apppw",
-		EnvOwnerPassword:        "SECRET-MARKER-ownerpw",
-		EnvMonzoClientSecret:    "SECRET-MARKER-client",
-		EnvOTLPToken:            "SECRET-MARKER-token",
-		EnvAllowedEmails:        "SECRET-MARKER-email@example.com",
+		EnvDatabaseURL:           "SECRET-MARKER-db",
+		EnvOwnerDatabaseURL:      "SECRET-MARKER-owner",
+		EnvSuperuserDatabaseURL:  "SECRET-MARKER-super",
+		EnvAppPassword:           "SECRET-MARKER-apppw",
+		EnvOwnerPassword:         "SECRET-MARKER-ownerpw",
+		EnvMonzoClientSecret:     "SECRET-MARKER-client",
+		EnvTrueLayerClientID:     "client-id-test",
+		EnvTrueLayerClientSecret: "SECRET-MARKER-truelayer",
+		EnvOTLPToken:             "SECRET-MARKER-token",
+		EnvAllowedEmails:         "SECRET-MARKER-email@example.com",
 	}
 	c, err := Load(env(secrets))
 	if err != nil {
@@ -192,6 +194,49 @@ func TestSecretsAreRedacted(t *testing.T) {
 	for name, out := range outputs {
 		if strings.Contains(out, "SECRET-MARKER") {
 			t.Errorf("%s output leaks a secret: %s", name, out)
+		}
+	}
+	if !strings.Contains(c.String(), "truelayer_client_secret=[redacted]") {
+		t.Errorf("String does not say the TrueLayer secret is set: %s", c.String())
+	}
+}
+
+func TestTrueLayerDefaultsAndBothOrNeither(t *testing.T) {
+	c, err := Load(env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TrueLayerEnabled() {
+		t.Error("TrueLayer enabled with neither setting")
+	}
+	if c.TrueLayerAuthURL != "https://auth.truelayer.com" || c.TrueLayerAPIURL != "https://api.truelayer.com" {
+		t.Errorf("TrueLayer URL defaults wrong: %q %q", c.TrueLayerAuthURL, c.TrueLayerAPIURL)
+	}
+	if !strings.Contains(c.String(), "truelayer_client_secret=unset") {
+		t.Errorf("String does not say the TrueLayer secret is unset: %s", c.String())
+	}
+	c, err = Load(env(map[string]string{
+		EnvTrueLayerClientID: "client-id-test", EnvTrueLayerClientSecret: "secret-test",
+		EnvTrueLayerAuthURL: "https://auth.truelayer.test", EnvTrueLayerAPIURL: "https://api.truelayer.test",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.TrueLayerEnabled() || c.TrueLayerClientID != "client-id-test" || c.TrueLayerClientSecret != "secret-test" ||
+		c.TrueLayerAuthURL != "https://auth.truelayer.test" || c.TrueLayerAPIURL != "https://api.truelayer.test" {
+		t.Errorf("TrueLayer settings not read: %v", c)
+	}
+	for name, only := range map[string]string{"id only": EnvTrueLayerClientID, "secret only": EnvTrueLayerClientSecret} {
+		_, err := Load(env(map[string]string{only: "SECRET-MARKER-half"}))
+		if err == nil {
+			t.Errorf("%s: Load accepted half of the TrueLayer credentials", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), EnvTrueLayerClientID) || !strings.Contains(err.Error(), EnvTrueLayerClientSecret) {
+			t.Errorf("%s: error does not name both settings: %v", name, err)
+		}
+		if strings.Contains(err.Error(), "SECRET-MARKER") {
+			t.Errorf("%s: error carries the value: %v", name, err)
 		}
 	}
 }

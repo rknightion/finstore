@@ -1,4 +1,5 @@
-// Package web serves the status page, the Monzo connect flow and the health route.
+// Package web serves the status page, the connect flow of each configured bank connection and the
+// health route.
 //
 // The pages show states, dates and counts only: never a transaction, a balance or a payee. The
 // service sits behind a proxy that signs users in and passes the signed-in address in a header;
@@ -22,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rknightion/finstore/internal/consent"
 	"github.com/rknightion/finstore/internal/semconv"
 	"github.com/rknightion/finstore/internal/store"
 )
@@ -39,6 +41,31 @@ type Reader interface {
 	Ping(ctx context.Context) error
 	SyncStatus(ctx context.Context) ([]store.SyncStatusRow, error)
 	Coverage(ctx context.Context) ([]store.CoverageRow, error)
+	// ConnectAttemptSource returns the source of the live attempt with this state hash without
+	// consuming it, or store.ErrAttemptUnusable for an unknown, expired or used one.
+	ConnectAttemptSource(ctx context.Context, stateSHA256 []byte, now time.Time) (string, error)
+}
+
+// Source is one bank connection the pages offer: a section on the status page, a connect route
+// and a callback.
+type Source struct {
+	// Name is the source name as sync.consent and agent.sync_status hold it.
+	Name string
+	// Label names the connection on the page.
+	Label string
+	// ConnectPath is the POST route that starts a connect attempt; CallbackPath is where the bank
+	// sends the browser back. Sources that share a callback path are told apart by the source of
+	// the attempt the state belongs to, read before anything consumes it.
+	ConnectPath, CallbackPath string
+	// AuthURL is the bank's login URL; a submitted connect form may redirect to its origin.
+	AuthURL string
+	// ConnectNotice is shown above the connect button before a consent exists, ReconnectNotice
+	// after. Either may be empty.
+	ConnectNotice, ReconnectNotice string
+	Connector                      Connector
+	// IsRefusal reports whether an error from Connector.HandleCallback means the state value was
+	// unknown, expired or already used.
+	IsRefusal func(error) bool
 }
 
 // Options configures a Server.
@@ -47,11 +74,8 @@ type Options struct {
 	AllowedEmails []string
 	// AuthHeader names the request header carrying the signed-in address.
 	AuthHeader string
-	// BankAuthURL is the bank's login URL; a submitted connect form may redirect to its origin.
-	BankAuthURL string
-	// IsRefusal reports whether an error from Connector.HandleCallback means the state value was
-	// unknown, expired or already used.
-	IsRefusal func(error) bool
+	// Sources are the configured connections, in the order the status page shows them.
+	Sources []Source
 	// Location is the zone times are shown in.
 	Location *time.Location
 	Now      func() time.Time
@@ -61,9 +85,10 @@ type Options struct {
 // Server holds the HTTP handlers.
 type Server struct {
 	opts Options
-	conn Connector
 	read Reader
 	csp  string
+	// callbacks maps each callback path to the sources that share it, by name.
+	callbacks map[string]map[string]Source
 }
 
 //go:embed status.html
@@ -76,15 +101,15 @@ var statusTmpl = template.Must(template.New("status").Parse(statusHTML))
 
 // New builds a Server. It refuses an empty allow-list: a service with nobody allowed is a
 // misconfiguration, not a locked-down service.
-func New(opts Options, conn Connector, read Reader) (*Server, error) {
+func New(opts Options, read Reader) (*Server, error) {
 	if len(opts.AllowedEmails) == 0 {
 		return nil, errors.New("web: the allow-list is empty")
 	}
 	if opts.AuthHeader == "" {
 		return nil, errors.New("web: no auth header name")
 	}
-	if opts.IsRefusal == nil {
-		opts.IsRefusal = func(error) bool { return false }
+	if len(opts.Sources) == 0 {
+		return nil, errors.New("web: no sources")
 	}
 	if opts.Location == nil {
 		opts.Location = time.UTC
@@ -95,18 +120,40 @@ func New(opts Options, conn Connector, read Reader) (*Server, error) {
 	if opts.Log == nil {
 		opts.Log = slog.New(slog.DiscardHandler)
 	}
-	formAction := "'self'"
-	if opts.BankAuthURL != "" {
-		u, err := url.Parse(opts.BankAuthURL)
-		if err != nil || u.Scheme == "" || u.Host == "" {
-			return nil, errors.New("web: the bank login URL is not an absolute URL")
+	opts.Sources = slices.Clone(opts.Sources) // defaults are filled in below
+	origins := []string{"'self'"}
+	names, routes := map[string]bool{}, map[string]bool{}
+	callbacks := map[string]map[string]Source{}
+	for i, src := range opts.Sources {
+		switch {
+		case src.Name == "" || src.Label == "" || src.Connector == nil:
+			return nil, fmt.Errorf("web: source %d lacks a name, a label or a connector", i)
+		case !strings.HasPrefix(src.ConnectPath, "/") || !strings.HasPrefix(src.CallbackPath, "/"):
+			return nil, fmt.Errorf("web: source %d lacks a connect or callback path", i)
+		case names[src.Name] || routes[src.ConnectPath]:
+			return nil, fmt.Errorf("web: source %d repeats a name or a connect path", i)
 		}
-		formAction += " " + u.Scheme + "://" + u.Host
+		names[src.Name], routes[src.ConnectPath] = true, true
+		u, err := url.Parse(src.AuthURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return nil, fmt.Errorf("web: source %d's bank login URL is not an absolute URL", i)
+		}
+		if origin := u.Scheme + "://" + u.Host; !slices.Contains(origins, origin) {
+			origins = append(origins, origin)
+		}
+		if src.IsRefusal == nil {
+			src.IsRefusal = func(error) bool { return false }
+			opts.Sources[i] = src
+		}
+		if callbacks[src.CallbackPath] == nil {
+			callbacks[src.CallbackPath] = map[string]Source{}
+		}
+		callbacks[src.CallbackPath][src.Name] = src
 	}
 	sum := sha256.Sum256([]byte(statusCSS))
 	csp := fmt.Sprintf("default-src 'none'; style-src 'sha256-%s'; form-action %s; frame-ancestors 'none'; base-uri 'none'",
-		base64.StdEncoding.EncodeToString(sum[:]), formAction)
-	return &Server{opts: opts, conn: conn, read: read, csp: csp}, nil
+		base64.StdEncoding.EncodeToString(sum[:]), strings.Join(origins, " "))
+	return &Server{opts: opts, read: read, csp: csp, callbacks: callbacks}, nil
 }
 
 // Handler returns the routes.
@@ -114,8 +161,20 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /healthz", s.logged("/healthz", http.HandlerFunc(s.healthz)))
 	mux.Handle("GET /{$}", s.logged("/", s.allowed(http.HandlerFunc(s.status))))
-	mux.Handle("POST /connect/monzo", s.logged("/connect/monzo", s.allowed(http.HandlerFunc(s.connect))))
-	mux.Handle("GET /callback/monzo", s.logged("/callback/monzo", http.HandlerFunc(s.callback)))
+	for _, src := range s.opts.Sources {
+		mux.Handle("POST "+src.ConnectPath, s.logged(src.ConnectPath, s.allowed(s.connect(src))))
+	}
+	for path, group := range s.callbacks {
+		var h http.Handler
+		if len(group) == 1 {
+			for _, src := range group {
+				h = s.callback(src)
+			}
+		} else {
+			h = s.sharedCallback(group)
+		}
+		mux.Handle("GET "+path, s.logged(path, h))
+	}
 	return s.headers(mux)
 }
 
@@ -188,48 +247,107 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok\n"))
 }
 
-// connect starts a connect attempt. It accepts only a same-origin form post, so another site
-// cannot start one from the signed-in user's browser.
-func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Sec-Fetch-Site") != "same-origin" {
-		// Not 403: the proxy in front may rewrite a 403 into a login redirect.
-		http.Error(w, "This request must come from the status page.", http.StatusBadRequest)
-		return
-	}
-	target, err := s.conn.AuthoriseURL(r.Context())
-	if err != nil {
-		s.opts.Log.ErrorContext(r.Context(), "connect attempt not started",
-			semconv.LogSource, "monzo", semconv.LogOutcome, "error")
-		http.Error(w, "The connection could not be started. Try again.", http.StatusInternalServerError)
-		return
-	}
-	http.Redirect(w, r, target, http.StatusSeeOther)
+// connect starts a connect attempt for src. It accepts only a same-origin form post, so another
+// site cannot start one from the signed-in user's browser.
+func (s *Server) connect(src Source) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Sec-Fetch-Site") != "same-origin" {
+			// Not 403: the proxy in front may rewrite a 403 into a login redirect.
+			http.Error(w, "This request must come from the status page.", http.StatusBadRequest)
+			return
+		}
+		target, err := src.Connector.AuthoriseURL(r.Context())
+		if err != nil {
+			s.opts.Log.ErrorContext(r.Context(), "connect attempt not started",
+				semconv.LogSource, src.Name, semconv.LogOutcome, "error")
+			http.Error(w, "The connection could not be started. Try again.", http.StatusInternalServerError)
+			return
+		}
+		http.Redirect(w, r, target, http.StatusSeeOther)
+	})
 }
 
-// callback completes a connect attempt. Nothing here is behind the sign-in, so it acts only on a
-// valid single-use state value and says nothing about why a value was refused.
-func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	state, code := q.Get("state"), q.Get("code")
-	if state == "" || code == "" {
-		http.Error(w, "This link is not valid. Start again from the status page.", http.StatusBadRequest)
-		return
-	}
-	// The exchange spends the code and replaces the previous connection at the bank, so it must
-	// finish and be stored even if the browser goes away half way: the request's cancellation is
-	// not passed on.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), callbackTimeout)
-	defer cancel()
-	err := s.conn.HandleCallback(ctx, state, code)
+const (
+	msgInvalidLink = "This link is not valid. Start again from the status page."
+	msgRefused     = "This link is not valid or has already been used. Start again from the status page."
+)
+
+// callback completes a connect attempt of src, the only source on its callback path. Nothing here
+// is behind the sign-in, so it acts only on a valid single-use state value and says nothing about
+// why a value was refused.
+func (s *Server) callback(src Source) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		state, code := q.Get("state"), q.Get("code")
+		if state == "" || code == "" {
+			http.Error(w, msgInvalidLink, http.StatusBadRequest)
+			return
+		}
+		ctx, cancel := callbackContext(r)
+		defer cancel()
+		s.complete(ctx, w, r, src, state, code)
+	})
+}
+
+// sharedCallback completes a connect attempt of one of the sources in group, which share the
+// callback path. It reads the source of the attempt the state belongs to without consuming it and
+// refuses, with no effect, a state that is unknown, expired, used or issued for a source outside
+// the group; only then does it hand the state to that source's connector, which consumes it. A
+// bank's error redirect (?error=, sent when the owner declines or the bank fails) changes nothing:
+// the attempt expires unused.
+func (s *Server) sharedCallback(group map[string]Source) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if q.Has("error") {
+			// The error code is the bank's text, so neither the page nor the log repeats it.
+			http.Error(w, "The bank did not give access, so nothing changed. Start again from the status page.",
+				http.StatusBadRequest)
+			return
+		}
+		state, code := q.Get("state"), q.Get("code")
+		if state == "" || code == "" {
+			http.Error(w, msgInvalidLink, http.StatusBadRequest)
+			return
+		}
+		ctx, cancel := callbackContext(r)
+		defer cancel()
+		name, err := s.read.ConnectAttemptSource(ctx, consent.HashState(state), s.opts.Now())
+		switch {
+		case errors.Is(err, store.ErrAttemptUnusable):
+			http.Error(w, msgRefused, http.StatusBadRequest)
+			return
+		case err != nil:
+			s.opts.Log.ErrorContext(r.Context(), "connect attempt not read", semconv.LogOutcome, "error")
+			http.Error(w, "The connection could not be completed. Try the link again.", http.StatusServiceUnavailable)
+			return
+		}
+		src, ok := group[name]
+		if !ok {
+			http.Error(w, msgRefused, http.StatusBadRequest)
+			return
+		}
+		s.complete(ctx, w, r, src, state, code)
+	})
+}
+
+// callbackContext bounds a callback's exchange. The exchange spends the code and replaces the
+// previous connection at the bank, so it must finish and be stored even if the browser goes away
+// half way: the request's cancellation is not passed on.
+func callbackContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(r.Context()), callbackTimeout)
+}
+
+// complete hands state and code to src's connector and answers with the outcome.
+func (s *Server) complete(ctx context.Context, w http.ResponseWriter, r *http.Request, src Source, state, code string) {
+	err := src.Connector.HandleCallback(ctx, state, code)
 	switch {
 	case err == nil:
 		http.Redirect(w, r, "/", http.StatusSeeOther)
-	case s.opts.IsRefusal(err):
-		http.Error(w, "This link is not valid or has already been used. Start again from the status page.",
-			http.StatusBadRequest)
+	case src.IsRefusal(err):
+		http.Error(w, msgRefused, http.StatusBadRequest)
 	default:
 		s.opts.Log.ErrorContext(r.Context(), "connect attempt not completed",
-			semconv.LogSource, "monzo", semconv.LogOutcome, "error")
+			semconv.LogSource, src.Name, semconv.LogOutcome, "error")
 		http.Error(w, "The connection could not be completed. Start again from the status page.",
 			http.StatusBadGateway)
 	}
@@ -237,6 +355,9 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 
 type pageSource struct {
 	Name         string
+	Label        string
+	ConnectPath  string
+	Notice       string
 	ConsentState string
 	ApprovedAt   string
 	ExpiresAt    string
@@ -290,39 +411,41 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		Zone:      s.opts.Location.String(),
 	}
 	imports := map[string]*time.Time{}
+	rows := map[string]store.SyncStatusRow{}
 	for _, src := range sources {
 		for slug, at := range src.LastImportAt {
 			imports[slug] = at
 		}
-		if src.Source != "monzo" {
-			continue
-		}
+		rows[src.Source] = src
+	}
+	// One section per configured source, in the configured order: a source with no consent or run
+	// yet has no row, and a row for a source that is not configured gets no section.
+	for _, cfg := range s.opts.Sources {
+		row := rows[cfg.Name]
 		ps := pageSource{
-			Name:         src.Source,
+			Name:         cfg.Name,
+			Label:        cfg.Label,
+			ConnectPath:  cfg.ConnectPath,
+			Notice:       cfg.ConnectNotice,
 			ConsentState: "not connected",
-			ApprovedAt:   s.when(src.ApprovedAt),
-			ExpiresAt:    s.when(src.ExpectedExpiryAt),
+			ApprovedAt:   s.when(row.ApprovedAt),
+			ExpiresAt:    s.when(row.ExpectedExpiryAt),
 			DaysToExpiry: dash,
-			LastSyncOK:   s.when(src.LastSyncOKAt),
+			LastSyncOK:   s.when(row.LastSyncOKAt),
 			LastOutcome:  dash,
 		}
-		if src.ConsentState != nil {
-			ps.ConsentState = strings.ReplaceAll(*src.ConsentState, "_", " ")
+		if row.ConsentState != nil {
+			ps.ConsentState = strings.ReplaceAll(*row.ConsentState, "_", " ")
 			ps.Connected = true
+			ps.Notice = cfg.ReconnectNotice
 		}
-		if src.DaysToExpiry != nil {
-			ps.DaysToExpiry = fmt.Sprint(*src.DaysToExpiry)
+		if row.DaysToExpiry != nil {
+			ps.DaysToExpiry = fmt.Sprint(*row.DaysToExpiry)
 		}
-		if src.LastRunOutcome != nil {
-			ps.LastOutcome = *src.LastRunOutcome
+		if row.LastRunOutcome != nil {
+			ps.LastOutcome = *row.LastRunOutcome
 		}
 		p.Sources = append(p.Sources, ps)
-	}
-	if len(p.Sources) == 0 {
-		p.Sources = []pageSource{{
-			Name: "monzo", ConsentState: "not connected", ApprovedAt: dash, ExpiresAt: dash,
-			DaysToExpiry: dash, LastSyncOK: dash, LastOutcome: dash,
-		}}
 	}
 	for _, c := range coverage {
 		a := pageAccount{

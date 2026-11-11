@@ -16,30 +16,34 @@ import (
 //
 //nolint:gosec // G101 matches the words password, secret and token in names.
 const (
-	EnvDatabaseURL          = "FINSTORE_DATABASE_URL"
-	EnvOwnerDatabaseURL     = "FINSTORE_OWNER_DATABASE_URL"
-	EnvSuperuserDatabaseURL = "FINSTORE_SUPERUSER_DATABASE_URL"
-	EnvAppPassword          = "FINSTORE_APP_PASSWORD"
-	EnvOwnerPassword        = "FINSTORE_OWNER_PASSWORD"
-	EnvListenAddr           = "FINSTORE_LISTEN_ADDR"
-	EnvPublicURL            = "FINSTORE_PUBLIC_URL"
-	EnvAllowedEmails        = "FINSTORE_ALLOWED_EMAILS"
-	EnvAuthHeader           = "FINSTORE_AUTH_HEADER"
-	EnvMonzoClientID        = "FINSTORE_MONZO_CLIENT_ID"
-	EnvMonzoClientSecret    = "FINSTORE_MONZO_CLIENT_SECRET"
-	EnvMonzoAPIURL          = "FINSTORE_MONZO_API_URL"
-	EnvMonzoAuthURL         = "FINSTORE_MONZO_AUTH_URL"
-	EnvMonzoSyncInterval    = "FINSTORE_MONZO_SYNC_INTERVAL"
-	EnvMonzoNightlyAt       = "FINSTORE_MONZO_NIGHTLY_AT"
-	EnvMonzoBackfillConc    = "FINSTORE_MONZO_BACKFILL_CONCURRENCY"
-	EnvMonzoWindow          = "FINSTORE_MONZO_WINDOW"
-	EnvTimezone             = "FINSTORE_TIMEZONE"
-	EnvDumpStatusFile       = "FINSTORE_DUMP_STATUS_FILE"
-	EnvOTLPEndpoint         = "FINSTORE_OTLP_ENDPOINT"
-	EnvOTLPInstanceID       = "FINSTORE_OTLP_INSTANCE_ID"
-	EnvOTLPToken            = "FINSTORE_OTLP_TOKEN"
-	EnvEnvironment          = "FINSTORE_ENVIRONMENT"
-	EnvLogLevel             = "FINSTORE_LOG_LEVEL"
+	EnvDatabaseURL           = "FINSTORE_DATABASE_URL"
+	EnvOwnerDatabaseURL      = "FINSTORE_OWNER_DATABASE_URL"
+	EnvSuperuserDatabaseURL  = "FINSTORE_SUPERUSER_DATABASE_URL"
+	EnvAppPassword           = "FINSTORE_APP_PASSWORD"
+	EnvOwnerPassword         = "FINSTORE_OWNER_PASSWORD"
+	EnvListenAddr            = "FINSTORE_LISTEN_ADDR"
+	EnvPublicURL             = "FINSTORE_PUBLIC_URL"
+	EnvAllowedEmails         = "FINSTORE_ALLOWED_EMAILS"
+	EnvAuthHeader            = "FINSTORE_AUTH_HEADER"
+	EnvMonzoClientID         = "FINSTORE_MONZO_CLIENT_ID"
+	EnvMonzoClientSecret     = "FINSTORE_MONZO_CLIENT_SECRET"
+	EnvMonzoAPIURL           = "FINSTORE_MONZO_API_URL"
+	EnvMonzoAuthURL          = "FINSTORE_MONZO_AUTH_URL"
+	EnvMonzoSyncInterval     = "FINSTORE_MONZO_SYNC_INTERVAL"
+	EnvMonzoNightlyAt        = "FINSTORE_MONZO_NIGHTLY_AT"
+	EnvMonzoBackfillConc     = "FINSTORE_MONZO_BACKFILL_CONCURRENCY"
+	EnvMonzoWindow           = "FINSTORE_MONZO_WINDOW"
+	EnvTrueLayerClientID     = "FINSTORE_TRUELAYER_CLIENT_ID"
+	EnvTrueLayerClientSecret = "FINSTORE_TRUELAYER_CLIENT_SECRET"
+	EnvTrueLayerAuthURL      = "FINSTORE_TRUELAYER_AUTH_URL"
+	EnvTrueLayerAPIURL       = "FINSTORE_TRUELAYER_API_URL"
+	EnvTimezone              = "FINSTORE_TIMEZONE"
+	EnvDumpStatusFile        = "FINSTORE_DUMP_STATUS_FILE"
+	EnvOTLPEndpoint          = "FINSTORE_OTLP_ENDPOINT"
+	EnvOTLPInstanceID        = "FINSTORE_OTLP_INSTANCE_ID"
+	EnvOTLPToken             = "FINSTORE_OTLP_TOKEN"
+	EnvEnvironment           = "FINSTORE_ENVIRONMENT"
+	EnvLogLevel              = "FINSTORE_LOG_LEVEL"
 )
 
 // TimeOfDay is a wall-clock time, in the configured zone, without a date.
@@ -67,6 +71,13 @@ type Config struct {
 	MonzoBackfillConc int
 	MonzoWindow       time.Duration
 
+	// TrueLayer is configured when its client id and secret are both set; Load refuses one
+	// without the other.
+	TrueLayerClientID     string
+	TrueLayerClientSecret string
+	TrueLayerAuthURL      string
+	TrueLayerAPIURL       string
+
 	Timezone       *time.Location
 	DumpStatusFile string
 
@@ -91,23 +102,27 @@ func Load(getenv func(string) string) (Config, error) {
 		return def
 	}
 	c := Config{
-		DatabaseURL:          get(EnvDatabaseURL, ""),
-		OwnerDatabaseURL:     get(EnvOwnerDatabaseURL, ""),
-		SuperuserDatabaseURL: get(EnvSuperuserDatabaseURL, ""),
-		AppPassword:          get(EnvAppPassword, ""),
-		OwnerPassword:        get(EnvOwnerPassword, ""),
-		ListenAddr:           get(EnvListenAddr, ":8080"),
-		PublicURL:            get(EnvPublicURL, ""),
-		AuthHeader:           get(EnvAuthHeader, "X-Auth-Request-Email"),
-		MonzoClientID:        get(EnvMonzoClientID, ""),
-		MonzoClientSecret:    get(EnvMonzoClientSecret, ""),
-		MonzoAPIURL:          get(EnvMonzoAPIURL, "https://api.monzo.com"),
-		MonzoAuthURL:         get(EnvMonzoAuthURL, "https://auth.monzo.com/"),
-		DumpStatusFile:       get(EnvDumpStatusFile, ""),
-		OTLPEndpoint:         get(EnvOTLPEndpoint, ""),
-		OTLPInstanceID:       get(EnvOTLPInstanceID, ""),
-		OTLPToken:            get(EnvOTLPToken, ""),
-		Environment:          get(EnvEnvironment, "dev"),
+		DatabaseURL:           get(EnvDatabaseURL, ""),
+		OwnerDatabaseURL:      get(EnvOwnerDatabaseURL, ""),
+		SuperuserDatabaseURL:  get(EnvSuperuserDatabaseURL, ""),
+		AppPassword:           get(EnvAppPassword, ""),
+		OwnerPassword:         get(EnvOwnerPassword, ""),
+		ListenAddr:            get(EnvListenAddr, ":8080"),
+		PublicURL:             get(EnvPublicURL, ""),
+		AuthHeader:            get(EnvAuthHeader, "X-Auth-Request-Email"),
+		MonzoClientID:         get(EnvMonzoClientID, ""),
+		MonzoClientSecret:     get(EnvMonzoClientSecret, ""),
+		MonzoAPIURL:           get(EnvMonzoAPIURL, "https://api.monzo.com"),
+		MonzoAuthURL:          get(EnvMonzoAuthURL, "https://auth.monzo.com/"),
+		TrueLayerClientID:     get(EnvTrueLayerClientID, ""),
+		TrueLayerClientSecret: get(EnvTrueLayerClientSecret, ""),
+		TrueLayerAuthURL:      get(EnvTrueLayerAuthURL, "https://auth.truelayer.com"),
+		TrueLayerAPIURL:       get(EnvTrueLayerAPIURL, "https://api.truelayer.com"),
+		DumpStatusFile:        get(EnvDumpStatusFile, ""),
+		OTLPEndpoint:          get(EnvOTLPEndpoint, ""),
+		OTLPInstanceID:        get(EnvOTLPInstanceID, ""),
+		OTLPToken:             get(EnvOTLPToken, ""),
+		Environment:           get(EnvEnvironment, "dev"),
 	}
 	for _, e := range strings.Split(getenv(EnvAllowedEmails), ",") {
 		if e = strings.ToLower(strings.TrimSpace(e)); e != "" {
@@ -135,6 +150,9 @@ func Load(getenv func(string) string) (Config, error) {
 	if c.Timezone, err = time.LoadLocation(get(EnvTimezone, "Europe/London")); err != nil {
 		bad(EnvTimezone, errors.New("unknown time zone"))
 	}
+	if (c.TrueLayerClientID == "") != (c.TrueLayerClientSecret == "") {
+		errs = append(errs, fmt.Errorf("%s and %s must be set together, or neither", EnvTrueLayerClientID, EnvTrueLayerClientSecret))
+	}
 	if c.LogLevel, err = parseLevel(get(EnvLogLevel, "info")); err != nil {
 		bad(EnvLogLevel, err)
 	}
@@ -142,6 +160,11 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, fmt.Errorf("invalid configuration: %w", err)
 	}
 	return c, nil
+}
+
+// TrueLayerEnabled reports whether the TrueLayer connections are configured.
+func (c Config) TrueLayerEnabled() bool {
+	return c.TrueLayerClientID != "" && c.TrueLayerClientSecret != ""
 }
 
 // parse errors deliberately drop the text of the input, which could be a value.
@@ -242,10 +265,10 @@ func (c Config) String() string {
 	}
 	return fmt.Sprintf("Config{listen=%q environment=%q log_level=%s sync_interval=%s nightly_at=%02d:%02d "+
 		"backfill_concurrency=%d window=%s otlp_export=%t database_url=%s owner_database_url=%s "+
-		"superuser_database_url=%s app_password=%s owner_password=%s monzo_client_secret=%s otlp_token=%s allowed_emails=%d}",
+		"superuser_database_url=%s app_password=%s owner_password=%s monzo_client_secret=%s truelayer_client_secret=%s otlp_token=%s allowed_emails=%d}",
 		c.ListenAddr, c.Environment, c.LogLevel, c.MonzoSyncInterval, c.MonzoNightlyAt.Hour, c.MonzoNightlyAt.Minute,
 		c.MonzoBackfillConc, c.MonzoWindow, c.OTLPEndpoint != "", set(c.DatabaseURL), set(c.OwnerDatabaseURL),
-		set(c.SuperuserDatabaseURL), set(c.AppPassword), set(c.OwnerPassword), set(c.MonzoClientSecret), set(c.OTLPToken),
+		set(c.SuperuserDatabaseURL), set(c.AppPassword), set(c.OwnerPassword), set(c.MonzoClientSecret), set(c.TrueLayerClientSecret), set(c.OTLPToken),
 		len(c.AllowedEmails))
 }
 

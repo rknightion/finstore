@@ -28,7 +28,7 @@ func TestConnectAttemptIsConsumedOnce(t *testing.T) {
 	results := make([]error, 8)
 	for i := range results {
 		wg.Go(func() {
-			_, results[i] = store.ConsumeConnectAttempt(ctx, q, hash[:], now.Add(time.Minute))
+			_, results[i] = store.ConsumeConnectAttempt(ctx, q, "monzo", hash[:], now.Add(time.Minute))
 		})
 	}
 	wg.Wait()
@@ -46,18 +46,41 @@ func TestConnectAttemptIsConsumedOnce(t *testing.T) {
 	}
 
 	unknown := sha256.Sum256([]byte("never issued"))
-	if _, err := store.ConsumeConnectAttempt(ctx, q, unknown[:], now); !errors.Is(err, store.ErrAttemptUnusable) {
+	if _, err := store.ConsumeConnectAttempt(ctx, q, "monzo", unknown[:], now); !errors.Is(err, store.ErrAttemptUnusable) {
 		t.Fatalf("unknown state: %v", err)
 	}
 	stale := sha256.Sum256([]byte("stale"))
 	if _, err := store.CreateConnectAttempt(ctx, q, "monzo", stale[:], now, now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ConsumeConnectAttempt(ctx, q, stale[:], now.Add(time.Hour)); !errors.Is(err, store.ErrAttemptUnusable) {
+	if _, err := store.ConsumeConnectAttempt(ctx, q, "monzo", stale[:], now.Add(time.Hour)); !errors.Is(err, store.ErrAttemptUnusable) {
 		t.Fatalf("expired state: %v", err)
 	}
 	if n, err := store.ExpireConnectAttempts(ctx, q, now.Add(2*time.Hour)); err != nil || n != 1 {
 		t.Fatalf("ExpireConnectAttempts = %d, %v; want the one unused attempt", n, err)
+	}
+}
+
+// A state presented to another source's callback is refused and left unused, so the right
+// callback can still consume it.
+func TestConnectAttemptOfAnotherSourceIsNotConsumed(t *testing.T) {
+	c := newCluster(t)
+	ctx := context.Background()
+	q := openStore(t, c.app).DB()
+	now := time.Now().UTC()
+	hash := sha256.Sum256([]byte("truelayer-state"))
+	if _, err := store.CreateConnectAttempt(ctx, q, "truelayer:ob-lloyds", hash[:], now, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ConsumeConnectAttempt(ctx, q, "monzo", hash[:], now.Add(time.Minute)); !errors.Is(err, store.ErrAttemptUnusable) {
+		t.Fatalf("consume for another source: %v, want ErrAttemptUnusable", err)
+	}
+	if src, err := store.ConnectAttemptSource(ctx, q, hash[:], now.Add(time.Minute)); err != nil || src != "truelayer:ob-lloyds" {
+		t.Fatalf("after the refusal the attempt reads %q, %v; want it unused", src, err)
+	}
+	a, err := store.ConsumeConnectAttempt(ctx, q, "truelayer:ob-lloyds", hash[:], now.Add(time.Minute))
+	if err != nil || a.Source != "truelayer:ob-lloyds" || a.UsedAt == nil {
+		t.Fatalf("consume for its own source: %+v, %v", a, err)
 	}
 }
 
