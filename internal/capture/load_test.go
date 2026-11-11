@@ -556,10 +556,12 @@ func TestLoadCallsProjectorOnceAfterAllRows(t *testing.T) {
 	}
 }
 
-// A completion row tells the projection "these pages are the whole period". If a fetch's first
-// page was stored by an earlier load and only its second page is new, the new fetch row holds
-// half the period, and completing it would mark the first page's transactions as disappeared.
-func TestLoadWritesNoCompletionForAFetchWhoseEarlierPagesWereAlreadyStored(t *testing.T) {
+// A completion row tells the projection "these pages are the whole period", so the fetch it
+// completes must hold every page. When a capture is loaded while still running and loaded again
+// once finished, the finished fetch is stored whole under a new fetch row. Completing a fetch
+// that held only the new page would mark the first page's transactions as disappeared; writing
+// no completion at all would leave the period reported as a gap for good.
+func TestLoadStoresAFinishedFetchWholeWhenSomeOfItsPagesWereLoadedBefore(t *testing.T) {
 	st := newStore(t)
 	since, before := "2026-01-01T00:00:00Z", "2026-03-01T00:00:00Z"
 	page1 := txPage("acc_made_up", since, before, at(1), `{"transactions":[{"id":"tx_a"}]}`)
@@ -579,11 +581,31 @@ func TestLoadWritesNoCompletionForAFetchWhoseEarlierPagesWereAlreadyStored(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.ResponsesSkipped != 1 || res.ResponsesLoaded != 1 {
-		t.Fatalf("second load: %+v, want 1 skipped and 1 loaded", res)
+	if res.FetchesCompleted != 1 {
+		t.Fatalf("second load: %+v, want the finished fetch completed", res)
 	}
-	if c := count(t, st.DB()); c.completions != 0 {
-		t.Fatalf("a fetch holding only part of its period was completed: %+v", c)
+	// The completed fetch holds both pages.
+	ctx := context.Background()
+	var completed int64
+	for _, row := range rawRows(t, st) {
+		if row.Kind == store.RawFetchComplete {
+			completed = row.FetchComplete.FetchID
+		}
+	}
+	pages, err := store.APIResponsesForFetch(ctx, st.DB(), completed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pages) != 2 {
+		t.Fatalf("the completed fetch holds %d of its 2 pages", len(pages))
+	}
+	// A third load of the finished capture changes nothing.
+	before3 := count(t, st.DB())
+	if _, err := loadAll(t, st, newProjector(t), finished); err != nil {
+		t.Fatal(err)
+	}
+	if after := count(t, st.DB()); after.responses != before3.responses || after.completions != before3.completions || after.fetches != before3.fetches {
+		t.Fatalf("a repeated load changed raw: %+v then %+v", before3, after)
 	}
 }
 

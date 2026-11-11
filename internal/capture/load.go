@@ -263,39 +263,42 @@ func write(ctx context.Context, q store.DBTX, all []*response, complete map[fetc
 }
 
 // writeFetch stores one transactions fetch and, when the capture finished it, its completion row
-// straight after the last page. A fetch whose pages were all stored already writes nothing. A
-// fetch with only some pages stored already gets no completion row: its new fetch row holds part
-// of the period, and a completion over part of a period would mark the rest as disappeared.
+// straight after the last page. A fetch whose pages were all stored already writes nothing.
+//
+// A fetch with only some pages stored already (a capture loaded while it was still running, then
+// loaded again once finished) is stored again whole, under a new fetch row: a completion row
+// speaks for every page of its fetch, so the fetch it completes must hold them all. The pages
+// stored twice are harmless to the projection, which sees the same transactions again.
 func writeFetch(ctx context.Context, q store.DBTX, runID int64, g *fetchGroup, res *Result) error {
 	first, last := g.pages[0], g.pages[len(g.pages)-1]
-	var fetchID int64
-	var created, partial bool
+	held := 0
 	for _, r := range g.pages {
 		skip, err := exists(ctx, q, r)
 		if err != nil {
 			return err
 		}
 		if skip {
-			res.ResponsesSkipped++
-			partial = true
-			continue
+			held++
 		}
-		if !created {
-			account := first.account
-			fetchID, err = store.InsertFetch(ctx, q, store.Fetch{
-				Source: sourceMonzo, Kind: fetchCapture, AccountKey: &account,
-				PeriodStart: &first.since, PeriodEnd: &first.before, RunID: runID, StartedAt: first.fetchedAt,
-			})
-			if err != nil {
-				return err
-			}
-			created = true
-		}
+	}
+	if held == len(g.pages) {
+		res.ResponsesSkipped += held
+		return nil
+	}
+	account := first.account
+	fetchID, err := store.InsertFetch(ctx, q, store.Fetch{
+		Source: sourceMonzo, Kind: fetchCapture, AccountKey: &account,
+		PeriodStart: &first.since, PeriodEnd: &first.before, RunID: runID, StartedAt: first.fetchedAt,
+	})
+	if err != nil {
+		return err
+	}
+	for _, r := range g.pages {
 		if err := insert(ctx, q, fetchID, r, res); err != nil {
 			return err
 		}
 	}
-	if created && g.complete && !partial {
+	if g.complete {
 		if _, err := store.InsertFetchComplete(ctx, q, store.FetchComplete{
 			FetchID: fetchID, CompletedAt: last.fetchedAt, Pages: len(g.pages),
 		}); err != nil {
@@ -307,7 +310,7 @@ func writeFetch(ctx context.Context, q store.DBTX, runID int64, g *fetchGroup, r
 }
 
 func exists(ctx context.Context, q store.DBTX, r *response) (bool, error) {
-	return store.APIResponseExists(ctx, q, r.endpoint, r.fetchedAt, r.sum)
+	return store.APIResponseExists(ctx, q, r.endpoint, r.params, r.fetchedAt, r.sum)
 }
 
 func insert(ctx context.Context, q store.DBTX, fetchID int64, r *response, res *Result) error {
