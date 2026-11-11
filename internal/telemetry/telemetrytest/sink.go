@@ -122,6 +122,7 @@ type Span struct {
 	ParentSpanID  string
 	Attrs         map[string]string
 	Resource      map[string]string
+	Kind          int32 // 1 internal, 2 server, 3 client, 4 producer, 5 consumer
 	StatusCode    int32 // 0 unset, 1 ok, 2 error
 	StatusMessage string
 	Events        int
@@ -151,6 +152,7 @@ func (s *Sink) Spans() []Span {
 						ParentSpanID: hex.EncodeToString(sp.ParentSpanId), Attrs: attrs(sp.Attributes), Resource: res,
 						StatusCode: int32(sp.GetStatus().GetCode()), StatusMessage: sp.GetStatus().GetMessage(),
 						Events: len(sp.Events), Links: len(sp.Links), Dropped: sp.DroppedAttributesCount,
+						Kind: int32(sp.Kind),
 					}
 					for _, l := range sp.Links {
 						x.LinkTraceIDs = append(x.LinkTraceIDs, hex.EncodeToString(l.TraceId))

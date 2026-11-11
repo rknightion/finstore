@@ -143,16 +143,19 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 	// restarts, so there is no new series to see.
 	metrics.ProcessStarted(ctx, e.now())
 
-	st, err := store.Open(ctx, cfg.DatabaseURL)
+	st, err := store.Open(ctx, cfg.DatabaseURL, store.WithTelemetry(providers.TracerProvider, providers.MeterProvider))
 	if err != nil {
 		return err
 	}
 	defer st.Close()
+	if err := metrics.ObserveWriterLock(st.CurrentHold); err != nil {
+		return err
+	}
 	if err := checkProjection(ctx, st, cfg.Timezone); err != nil {
 		return err
 	}
 
-	l := NewLedger(cfg.Timezone, log)
+	l := NewLedger(cfg.Timezone, log, providers.Tracer(semconv.ServiceName))
 	opts := monzo.Options{
 		ClientID: cfg.MonzoClientID, ClientSecret: cfg.MonzoClientSecret,
 		APIURL: cfg.MonzoAPIURL, AuthURL: cfg.MonzoAuthURL, PublicURL: cfg.PublicURL,

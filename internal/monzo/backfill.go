@@ -210,7 +210,7 @@ func (w *Worker) runBackfill(ctx context.Context, consentID int64) error {
 		return nil
 	}
 	deadline := cons.TokenIssuedAt.Add(w.opts.Window)
-	return w.st.HoldWriterLock(ctx, func(ctx context.Context, conn *pgx.Conn) error {
+	return w.st.HoldWriterLock(ctx, store.HolderMonzoBackfill, func(ctx context.Context, conn *pgx.Conn) error {
 		return w.backfillLocked(ctx, conn, cons, deadline)
 	})
 }

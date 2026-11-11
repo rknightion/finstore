@@ -40,7 +40,7 @@ func (w *Worker) RunScheduled(ctx context.Context) error {
 	if lost, err := w.loseIfTokenMissing(ctx, c); err != nil || lost {
 		return err
 	}
-	return w.st.HoldWriterLock(ctx, func(ctx context.Context, conn *pgx.Conn) error {
+	return w.st.HoldWriterLock(ctx, store.HolderTrueLayerSync, func(ctx context.Context, conn *pgx.Conn) error {
 		runID, err := store.StartRun(ctx, w.st.DB(), w.source, KindSync, w.now())
 		if err != nil {
 			return err

@@ -147,8 +147,17 @@ func TestCLICommandsExportSpansAndLogsUnderTheirOwnIdentity(t *testing.T) {
 			continue
 		}
 		found = true
-		if l.TraceID != importSpan.TraceID || l.SpanID != importSpan.SpanID {
-			t.Errorf("log trace %s span %s, want the import's %s %s", l.TraceID, l.SpanID, importSpan.TraceID, importSpan.SpanID)
+		// The record carries the span it was written in: the command's own, or a batch step
+		// beneath it (the warning is logged inside the projection's catch-up span).
+		inImport := l.SpanID == importSpan.SpanID
+		for _, s := range spans {
+			if s.SpanID == l.SpanID && descendsFrom(spans, s, importSpan.SpanID) {
+				inImport = true
+			}
+		}
+		if l.TraceID != importSpan.TraceID || !inImport {
+			t.Errorf("log trace %s span %s, want the import's trace %s and its span %s or one beneath it",
+				l.TraceID, l.SpanID, importSpan.TraceID, importSpan.SpanID)
 		}
 		if l.Resource[semconv.AttrServiceInstanceID] != importSpan.Resource[semconv.AttrServiceInstanceID] {
 			t.Errorf("the log record has another process's instance id: %v", l.Resource)
@@ -270,9 +279,27 @@ func TestServeExportsItsFixedIdentityAndStartTime(t *testing.T) {
 		t.Fatal("serve did not stop")
 	}
 
-	spans := sink.Spans()
+	// The status page's own queries are CLIENT spans beneath its server span (a store opened with
+	// telemetry traces what runs under a span); nothing else is exported, and /healthz made none.
+	var spans, dbSpans []telemetrytest.Span
+	all := sink.Spans()
+	for _, s := range all {
+		if s.Attrs[semconv.SpanDBSystemName] == "" {
+			spans = append(spans, s)
+		} else {
+			dbSpans = append(dbSpans, s)
+		}
+	}
 	if len(spans) != 1 || spans[0].Name != "GET /{$}" || spans[0].Attrs[semconv.SpanHTTPRoute] != "/{$}" {
 		t.Fatalf("spans = %+v, want only the status page's server span", spans)
+	}
+	if len(dbSpans) == 0 {
+		t.Error("the status page's queries made no span")
+	}
+	for _, s := range dbSpans {
+		if s.Kind != 3 || !descendsFrom(all, s, spans[0].SpanID) {
+			t.Errorf("database span %q (kind %d) is not a CLIENT descendant of the server span", s.Name, s.Kind)
+		}
 	}
 	res := spans[0].Resource
 	if res[semconv.AttrServiceInstanceID] != "serve" || res[semconv.AttrServiceVersion] != testVersion ||

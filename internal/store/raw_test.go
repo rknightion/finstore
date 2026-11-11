@@ -111,7 +111,7 @@ func TestRawIteratorAllowsWritesInTheSameTransaction(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	err := app.WithWriterLock(ctx, func(ctx context.Context, tx pgx.Tx) error {
+	err := app.WithWriterLock(ctx, store.HolderTest, func(ctx context.Context, tx pgx.Tx) error {
 		core := mustCore(t, tx, store.SchemaCore)
 		n := 0
 		for r, err := range store.RawRowsAfter(ctx, tx, 0) {

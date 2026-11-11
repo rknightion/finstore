@@ -208,9 +208,9 @@ func TestCatchUpWithAnotherZoneIsRefusedUntilRenormalise(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.l = ledger.New(map[string]ledger.SourceNormaliser{fakeSource: fakeNormaliser{}},
-		map[string]ledger.FileNormaliser{"manual-csv": importer.Normaliser{}}, london, slog.New(slog.DiscardHandler))
+		map[string]ledger.FileNormaliser{"manual-csv": importer.Normaliser{}}, london, slog.New(slog.DiscardHandler), nil)
 	e.accounts(fAcc{ID: "acc_2", Type: "savings"})
-	err = e.app.WithWriterLock(ctx, func(ctx context.Context, tx pgx.Tx) error {
+	err = e.app.WithWriterLock(ctx, store.HolderTest, func(ctx context.Context, tx pgx.Tx) error {
 		_, err := e.l.CatchUp(ctx, tx, store.SchemaCore)
 		return err
 	})

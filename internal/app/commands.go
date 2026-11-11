@@ -162,7 +162,7 @@ func (e Env) fail(err error) int {
 // NewLedger builds the projection with every source and file format the binary knows. Both
 // TrueLayer connections are registered whether or not TrueLayer is configured, so renormalise
 // always reads their stored responses.
-func NewLedger(loc *time.Location, log *slog.Logger) *ledger.Ledger {
+func NewLedger(loc *time.Location, log *slog.Logger, tr trace.Tracer) *ledger.Ledger {
 	return ledger.New(
 		map[string]ledger.SourceNormaliser{
 			sourceMonzo:                            monzo.Normaliser{},
@@ -173,7 +173,17 @@ func NewLedger(loc *time.Location, log *slog.Logger) *ledger.Ledger {
 			FormatHalifaxPDF: importer.Normaliser{},
 			FormatManualCSV:  importer.Normaliser{},
 		},
-		loc, log)
+		loc, log, tr)
+}
+
+// storeTelemetry makes a store opened by a command trace its queries into the command's span.
+func storeTelemetry(t cliTelemetry) store.OpenOption {
+	return store.WithTelemetry(t.Providers.TracerProvider, t.Providers.MeterProvider)
+}
+
+// observeLock reports the writer lock st holds through the process's held gauge.
+func observeLock(t cliTelemetry, st *store.Store) error {
+	return t.Metrics.ObserveWriterLock(st.CurrentHold)
 }
 
 // Bootstrap creates the roles and the schemas as the superuser.
@@ -190,14 +200,14 @@ func Bootstrap(ctx context.Context, e Env) int {
 
 // Migrate applies the migrations and the grants as the owner.
 func Migrate(ctx context.Context, e Env) int {
-	return e.withTelemetry(ctx, "migrate", func(ctx context.Context, _ cliTelemetry) int { return migrate(ctx, e) })
+	return e.withTelemetry(ctx, "migrate", func(ctx context.Context, t cliTelemetry) int { return migrate(ctx, e, t) })
 }
 
-func migrate(ctx context.Context, e Env) int {
+func migrate(ctx context.Context, e Env, t cliTelemetry) int {
 	if err := e.Cfg.Require("migrate"); err != nil {
 		return e.fail(err)
 	}
-	err := store.Migrate(ctx, e.Cfg.OwnerDatabaseURL, ledger.NormaliserRev)
+	err := store.Migrate(ctx, e.Cfg.OwnerDatabaseURL, ledger.NormaliserRev, storeTelemetry(t))
 	if errors.Is(err, store.ErrRenormaliseRequired) {
 		_, _ = fmt.Fprintln(e.Stdout, "migrated; this version reads stored data differently: run `finstore renormalise`")
 		return ExitOK
@@ -221,14 +231,19 @@ func renormalise(ctx context.Context, e Env, t cliTelemetry, verify bool) int {
 	if err := e.Cfg.Require("renormalise"); err != nil {
 		return e.fail(err)
 	}
+	// Renormalise replays every raw row: no query spans, which would number in the hundreds of
+	// thousands. The batch steps and the writer lock are still spans.
 	st, err := store.Open(ctx, e.Cfg.OwnerDatabaseURL)
 	if err != nil {
 		return e.fail(err)
 	}
 	defer st.Close()
-	l := NewLedger(e.Cfg.Timezone, t.Log)
+	if err := observeLock(t, st); err != nil {
+		return e.fail(err)
+	}
+	l := NewLedger(e.Cfg.Timezone, t.Log, t.Providers.Tracer(semconv.ServiceName))
 	var diffs []store.CoreDiff
-	err = st.HoldWriterLock(ctx, func(ctx context.Context, conn *pgx.Conn) error {
+	err = st.HoldWriterLock(ctx, store.HolderRenormalise, func(ctx context.Context, conn *pgx.Conn) error {
 		var err error
 		diffs, err = l.Renormalise(ctx, conn, verify)
 		return err
@@ -284,17 +299,21 @@ func (s AccountSpec) validate() error {
 }
 
 // withWriter opens the app store and runs fn under the writer lock in one transaction.
-func withWriter(ctx context.Context, e Env, log *slog.Logger, command string, fn func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error) error {
+func withWriter(ctx context.Context, e Env, t cliTelemetry, command string, fn func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error) error {
 	if err := e.Cfg.Require(command); err != nil {
 		return err
 	}
-	st, err := store.Open(ctx, e.Cfg.DatabaseURL)
+	st, err := store.Open(ctx, e.Cfg.DatabaseURL, storeTelemetry(t))
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	l := NewLedger(e.Cfg.Timezone, log)
-	return st.WithWriterLock(ctx, func(ctx context.Context, tx pgx.Tx) error { return fn(ctx, tx, l) })
+	if err := observeLock(t, st); err != nil {
+		return err
+	}
+	l := NewLedger(e.Cfg.Timezone, t.Log, t.Providers.Tracer(semconv.ServiceName))
+	// The command word (account or import) is the lock's holder.
+	return st.WithWriterLock(ctx, command, func(ctx context.Context, tx pgx.Tx) error { return fn(ctx, tx, l) })
 }
 
 // AccountAdd creates a file-fed account by writing an operator entry and normalising it.
@@ -312,7 +331,7 @@ func accountAdd(ctx context.Context, e Env, t cliTelemetry, spec AccountSpec) in
 	if err != nil {
 		return e.fail(err)
 	}
-	err = withWriter(ctx, e, t.Log, "account", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
+	err = withWriter(ctx, e, t, "account", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
 		core, err := store.NewCore(tx, store.SchemaCore)
 		if err != nil {
 			return err
@@ -339,14 +358,14 @@ func accountAdd(ctx context.Context, e Env, t cliTelemetry, spec AccountSpec) in
 
 // AccountList prints every account.
 func AccountList(ctx context.Context, e Env) int {
-	return e.withTelemetry(ctx, "account list", func(ctx context.Context, _ cliTelemetry) int { return accountList(ctx, e) })
+	return e.withTelemetry(ctx, "account list", func(ctx context.Context, t cliTelemetry) int { return accountList(ctx, e, t) })
 }
 
-func accountList(ctx context.Context, e Env) int {
+func accountList(ctx context.Context, e Env, t cliTelemetry) int {
 	if err := e.Cfg.Require("account"); err != nil {
 		return e.fail(err)
 	}
-	st, err := store.Open(ctx, e.Cfg.DatabaseURL)
+	st, err := store.Open(ctx, e.Cfg.DatabaseURL, storeTelemetry(t))
 	if err != nil {
 		return e.fail(err)
 	}
@@ -380,7 +399,7 @@ func acceptDifference(ctx context.Context, e Env, t cliTelemetry, slug, reason s
 		return e.fail(errors.New("--reason is required"))
 	}
 	var diff int64
-	err := withWriter(ctx, e, t.Log, "account", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
+	err := withWriter(ctx, e, t, "account", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
 		core, err := store.NewCore(tx, store.SchemaCore)
 		if err != nil {
 			return err
@@ -444,7 +463,7 @@ func accountEnd(ctx context.Context, e Env, t cliTelemetry, slug string, lastDat
 	if err != nil {
 		return e.fail(err)
 	}
-	err = withWriter(ctx, e, t.Log, "account", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
+	err = withWriter(ctx, e, t, "account", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
 		core, err := store.NewCore(tx, store.SchemaCore)
 		if err != nil {
 			return err
@@ -496,7 +515,7 @@ func importStatement(ctx context.Context, e Env, t cliTelemetry, slug, format, n
 	}
 	code := ExitOK
 	var message string
-	err = withWriter(ctx, e, t.Log, "import", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
+	err = withWriter(ctx, e, t, "import", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
 		core, err := store.NewCore(tx, store.SchemaCore)
 		if err != nil {
 			return err
@@ -593,7 +612,12 @@ func loadCapture(ctx context.Context, e Env, t cliTelemetry, dirs []string) int 
 		return e.fail(err)
 	}
 	defer st.Close()
-	res, err := capture.Load(ctx, st, NewLedger(e.Cfg.Timezone, t.Log), dirs, e.now)
+	if err := observeLock(t, st); err != nil {
+		return e.fail(err)
+	}
+	// Like renormalise, a bulk load opens the store without query spans.
+	tr := t.Providers.Tracer(semconv.ServiceName)
+	res, err := capture.Load(ctx, st, NewLedger(e.Cfg.Timezone, t.Log, tr), dirs, e.now, tr)
 	if err != nil {
 		return e.fail(err)
 	}
@@ -609,14 +633,14 @@ func loadCapture(ctx context.Context, e Env, t cliTelemetry, dirs []string) int 
 
 // Coverage prints the coverage view.
 func Coverage(ctx context.Context, e Env, asJSON bool) int {
-	return e.withTelemetry(ctx, "coverage", func(ctx context.Context, _ cliTelemetry) int { return coverage(ctx, e, asJSON) })
+	return e.withTelemetry(ctx, "coverage", func(ctx context.Context, t cliTelemetry) int { return coverage(ctx, e, t, asJSON) })
 }
 
-func coverage(ctx context.Context, e Env, asJSON bool) int {
+func coverage(ctx context.Context, e Env, t cliTelemetry, asJSON bool) int {
 	if err := e.Cfg.Require("coverage"); err != nil {
 		return e.fail(err)
 	}
-	st, err := store.Open(ctx, e.Cfg.DatabaseURL)
+	st, err := store.Open(ctx, e.Cfg.DatabaseURL, storeTelemetry(t))
 	if err != nil {
 		return e.fail(err)
 	}

@@ -33,7 +33,7 @@ func TestUpsertAccountKeepsDetailWhenNoneIsGiven(t *testing.T) {
 	c := newCluster(t)
 	ctx := context.Background()
 	app := openStore(t, c.app)
-	err := app.WithWriterLock(ctx, func(ctx context.Context, tx pgx.Tx) error {
+	err := app.WithWriterLock(ctx, store.HolderTest, func(ctx context.Context, tx pgx.Tx) error {
 		core := mustCore(t, tx, store.SchemaCore)
 		acc := testAccount("lloyds-joint", "joint", "api")
 		acc.Detail = json.RawMessage(`{"display_name":"Made Up","account_id":"a-1"}`)

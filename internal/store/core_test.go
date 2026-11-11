@@ -30,7 +30,7 @@ func TestTransactionVersions(t *testing.T) {
 	app := openStore(t, c.app)
 	t0 := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
-	err := app.WithWriterLock(ctx, func(ctx context.Context, tx pgx.Tx) error {
+	err := app.WithWriterLock(ctx, store.HolderTest, func(ctx context.Context, tx pgx.Tx) error {
 		core := mustCore(t, tx, store.SchemaCore)
 		acc := testAccount("monzo-current", "current", "api")
 		if err := core.UpsertAccount(ctx, acc); err != nil {

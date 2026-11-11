@@ -39,10 +39,16 @@ var ErrRenormaliseRequired = errors.New("store: core was built by another normal
 // grants. When the stored revision differs it leaves the views as they are (renormalise
 // recreates them with the new core), applies the grants to what exists, and returns an error
 // wrapping ErrRenormaliseRequired.
-func Migrate(ctx context.Context, ownerURL string, normaliserRev int) error {
+//
+// With WithTelemetry the connection, goose's statements (it opens its own connections from the
+// same configuration) and every statement here trace as query spans under ctx's span.
+func Migrate(ctx context.Context, ownerURL string, normaliserRev int, opts ...OpenOption) error {
 	cfg, err := pgx.ParseConfig(ownerURL)
 	if err != nil {
 		return fmt.Errorf("store: migrate: parse URL: %w", err)
+	}
+	if oc := newOpenConfig(opts); oc.enabled() {
+		cfg.Tracer = oc.queryTracer()
 	}
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {

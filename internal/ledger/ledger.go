@@ -9,9 +9,13 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/rknightion/finstore/internal/semconv"
 	"github.com/rknightion/finstore/internal/store"
+	"github.com/rknightion/finstore/internal/telemetry"
 )
 
 // Ledger is the projection: it applies raw rows, in seq order, to a core schema. It is the only
@@ -22,19 +26,41 @@ type Ledger struct {
 	files   map[string]FileNormaliser
 	loc     *time.Location
 	log     *slog.Logger
+	tracer  trace.Tracer
 }
 
 // New returns a Ledger. sources is keyed by raw source name (for example "monzo"); files by import
 // format (for example "halifax-pdf", "manual-csv"). loc is the zone a source normaliser uses to
-// turn an instant into a day; nil means UTC. A nil log discards.
-func New(sources map[string]SourceNormaliser, files map[string]FileNormaliser, loc *time.Location, log *slog.Logger) *Ledger {
+// turn an instant into a day; nil means UTC. A nil log discards. tr makes the spans of the batch
+// steps (one for a catch-up, one for each step of a renormalise, never one for a row); a nil tr
+// makes none.
+func New(sources map[string]SourceNormaliser, files map[string]FileNormaliser, loc *time.Location, log *slog.Logger, tr trace.Tracer) *Ledger {
 	if loc == nil {
 		loc = time.UTC
 	}
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Ledger{sources: maps.Clone(sources), files: maps.Clone(files), loc: loc, log: log}
+	if tr == nil {
+		tr = tracenoop.NewTracerProvider().Tracer(semconv.ServiceName)
+	}
+	return &Ledger{sources: maps.Clone(sources), files: maps.Clone(files), loc: loc, log: log, tracer: tr}
+}
+
+// batch starts the span of one batch step. The returned function ends it: count, when not
+// negative, is recorded as finstore.count, and a non-nil err fails the span with a fixed category
+// (never the error's text, which can quote data).
+func (l *Ledger) batch(ctx context.Context, name string) (context.Context, func(count int, err error)) {
+	ctx, span := l.tracer.Start(ctx, name, trace.WithSpanKind(trace.SpanKindInternal))
+	return ctx, func(count int, err error) {
+		if count >= 0 {
+			span.SetAttributes(attribute.Int(semconv.SpanCount, count))
+		}
+		if err != nil {
+			telemetry.Fail(span, "error")
+		}
+		span.End()
+	}
 }
 
 // CatchUp normalises every raw row with seq greater than the schema's projection_state.last_seq,
@@ -54,6 +80,21 @@ func New(sources map[string]SourceNormaliser, files map[string]FileNormaliser, l
 // store.ErrRenormaliseRequired) and changes nothing, because days already projected would be in
 // the old zone and new ones in the new.
 func (l *Ledger) CatchUp(ctx context.Context, q store.DBTX, schema string) (Stats, error) {
+	return l.catchUp(ctx, q, schema, semconv.SpanLedgerCatchUp, false)
+}
+
+// catchUp is CatchUp under the span name that says which step of a batch it is.
+// A zone change is not a failure of the step when the caller tolerates it (the live catch-up of a
+// renormalise, whose result is about to be compared or replaced).
+func (l *Ledger) catchUp(ctx context.Context, q store.DBTX, schema, spanName string, tolerateZoneChange bool) (stats Stats, err error) {
+	ctx, end := l.batch(ctx, spanName)
+	defer func() {
+		if tolerateZoneChange && errors.Is(err, ErrZoneChanged) {
+			end(stats.RowsProcessed, nil)
+			return
+		}
+		end(stats.RowsProcessed, err)
+	}()
 	core, err := store.NewCore(q, schema)
 	if err != nil {
 		return Stats{}, err
@@ -71,7 +112,6 @@ func (l *Ledger) CatchUp(ctx context.Context, q store.DBTX, schema string) (Stat
 	case *ps.Zone != zone:
 		return Stats{}, fmt.Errorf("%w (core %s, configured %s)", ErrZoneChanged, *ps.Zone, zone)
 	}
-	var stats Stats
 	for row, err := range store.RawRowsAfter(ctx, q, ps.LastSeq) {
 		if err != nil {
 			return stats, err
@@ -109,21 +149,26 @@ func (l *Ledger) Renormalise(ctx context.Context, owner store.DBTX, verify bool)
 	// A live core built by another revision may have another shape, which this code cannot write:
 	// it is left as it is, and verify reports its unprojected rows as only in core_next.
 	if ps.NormaliserRev == NormaliserRev {
-		if _, err := l.CatchUp(ctx, owner, store.SchemaCore); err != nil && !errors.Is(err, ErrZoneChanged) {
+		if _, err := l.catchUp(ctx, owner, store.SchemaCore, semconv.SpanLedgerCatchUp, true); err != nil && !errors.Is(err, ErrZoneChanged) {
 			return nil, fmt.Errorf("ledger: catch up live core: %w", err)
 		}
 	}
-	if err := store.CreateCoreNext(ctx, owner, NormaliserRev); err != nil {
+	cctx, end := l.batch(ctx, semconv.SpanRenormaliseCreate)
+	err = store.CreateCoreNext(cctx, owner, NormaliserRev)
+	end(-1, err)
+	if err != nil {
 		return nil, err
 	}
-	if _, err := l.CatchUp(ctx, owner, store.SchemaCoreNext); err != nil {
+	if _, err := l.catchUp(ctx, owner, store.SchemaCoreNext, semconv.SpanRenormaliseCatch, false); err != nil {
 		if derr := store.DropCoreNext(context.WithoutCancel(ctx), owner); derr != nil {
 			return nil, errors.Join(err, derr)
 		}
 		return nil, err
 	}
 	if verify {
-		diffs, err := store.DiffCore(ctx, owner)
+		dctx, end := l.batch(ctx, semconv.SpanRenormaliseDiff)
+		diffs, err := store.DiffCore(dctx, owner)
+		end(len(diffs), err)
 		if derr := store.DropCoreNext(ctx, owner); derr != nil {
 			err = errors.Join(err, derr)
 		}
@@ -132,7 +177,10 @@ func (l *Ledger) Renormalise(ctx context.Context, owner store.DBTX, verify bool)
 		}
 		return diffs, nil
 	}
-	if err := store.SwapCore(ctx, owner, NormaliserRev); err != nil {
+	sctx, end := l.batch(ctx, semconv.SpanRenormaliseSwap)
+	err = store.SwapCore(sctx, owner, NormaliserRev)
+	end(-1, err)
+	if err != nil {
 		return nil, err
 	}
 	return nil, nil

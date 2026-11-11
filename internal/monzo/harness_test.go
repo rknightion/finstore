@@ -87,7 +87,7 @@ func newHarness(t *testing.T, fakeOpts []monzotest.Option, mod func(*Options)) *
 	if err != nil {
 		t.Fatal(err)
 	}
-	real := ledger.New(map[string]ledger.SourceNormaliser{Source: Normaliser{}}, nil, loc, nil)
+	real := ledger.New(map[string]ledger.SourceNormaliser{Source: Normaliser{}}, nil, loc, nil, nil)
 	h := &harness{t: t, fake: monzotest.New(fakeOpts...), st: st, proj: &stubProjector{real: real}}
 	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()

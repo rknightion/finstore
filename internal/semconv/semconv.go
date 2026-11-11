@@ -213,7 +213,11 @@ const (
 	SpanUserName                  = "user.name"
 	SpanPgxOperationType          = "pgx.operation.type"
 	SpanPgxSQLState               = "pgx.sql_state"
-	SpanProcessExitCode           = "process.exit.code"
+	// SpanPgxRowsAffected is a count; SpanPgxPrepareStmtName is "stmtcache_" and a hash of
+	// constant SQL (finstore never names a statement itself). Neither holds a value.
+	SpanPgxRowsAffected    = "pgx.rows_affected"
+	SpanPgxPrepareStmtName = "pgx.prepare_stmt.name"
+	SpanProcessExitCode    = "process.exit.code"
 )
 
 // finstore's own span attribute keys.
@@ -289,7 +293,7 @@ var spanAttributes = []string{
 	SpanClientAddress, SpanUserAgentOriginal, SpanHTTPRequestResendCount, SpanHTTPRequestBodySize,
 	SpanHTTPResponseBodySize, SpanErrorType, SpanDBSystemName, SpanDBNamespace, SpanDBQueryText,
 	SpanDBOperationName, SpanDBCollectionName, SpanDBOperationBatchSize, SpanUserName,
-	SpanPgxOperationType, SpanPgxSQLState, SpanProcessExitCode,
+	SpanPgxOperationType, SpanPgxSQLState, SpanPgxRowsAffected, SpanPgxPrepareStmtName, SpanProcessExitCode,
 	SpanSource, SpanConnectOutcome, SpanJob, SpanJobOutcome, SpanRunKind, SpanRunID, SpanRunOutcome,
 	SpanRunPages, SpanRunRows, SpanRangeStart, SpanRangeEnd, SpanBankCode, SpanLockHolder,
 	SpanLockWaitMS, SpanCount, SpanCommand,

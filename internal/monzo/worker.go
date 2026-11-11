@@ -325,7 +325,7 @@ func (w *Worker) awaitApproval(ctx context.Context, id int64) bool {
 // expected 403 forbidden.insufficient_permissions included, means poll again.
 func (w *Worker) pollApproval(ctx context.Context, fetchID *int64) (bool, error) {
 	var approved bool
-	err := w.st.HoldWriterLock(ctx, func(ctx context.Context, _ *pgx.Conn) error {
+	err := w.st.HoldWriterLock(ctx, store.HolderMonzoApproval, func(ctx context.Context, _ *pgx.Conn) error {
 		if *fetchID == 0 {
 			id, err := store.InsertFetch(ctx, w.st.DB(), store.Fetch{Source: Source, Kind: kindMeta, StartedAt: w.now()})
 			if err != nil {

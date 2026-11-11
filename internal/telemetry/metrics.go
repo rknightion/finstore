@@ -18,6 +18,7 @@ import (
 // Metrics holds the service's instruments. Other packages record through its
 // methods and never see an instrument name.
 type Metrics struct {
+	meter           metric.Meter
 	syncLastSuccess metric.Int64Gauge
 	syncRuns        metric.Int64Counter
 	bankRequests    metric.Int64Counter
@@ -39,7 +40,7 @@ type Metrics struct {
 
 // NewMetrics creates every instrument on meter.
 func NewMetrics(meter metric.Meter) (*Metrics, error) {
-	var m Metrics
+	m := Metrics{meter: meter}
 	var err error
 	gauge := func(dst *metric.Int64Gauge, name, unit, desc string) {
 		if err != nil {
@@ -239,6 +240,29 @@ func (m *Metrics) Up(ctx context.Context) { m.up.Record(ctx, 1) }
 // across collections, so a change in the value is a restart.
 func (m *Metrics) ProcessStarted(ctx context.Context, at time.Time) {
 	m.processStart.Record(ctx, at.Unix())
+}
+
+// ObserveWriterLock registers the writer-lock gauge. At each collection it calls hold, which says
+// who holds the lock and since when (store.CurrentHold), and reports the seconds held so far under
+// the holder's name. While nobody holds the lock it reports nothing, so a stuck hold is a rising
+// series and a free lock is no series at all.
+func (m *Metrics) ObserveWriterLock(hold func() (holder string, since time.Time, ok bool)) error {
+	g, err := m.meter.Float64ObservableGauge(semconv.MetricWriterLockHeld, metric.WithUnit("s"),
+		metric.WithDescription("Seconds the writer lock has been held, by holder; absent while it is free"))
+	if err != nil {
+		return fmt.Errorf("create %s: %w", semconv.MetricWriterLockHeld, err)
+	}
+	_, err = m.meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		if holder, since, ok := hold(); ok {
+			o.ObserveFloat64(g, time.Since(since).Seconds(),
+				metric.WithAttributes(attribute.String(semconv.AttrHolder, holder)))
+		}
+		return nil
+	}, g)
+	if err != nil {
+		return fmt.Errorf("register %s: %w", semconv.MetricWriterLockHeld, err)
+	}
+	return nil
 }
 
 // selfMetrics counts the telemetry pipeline's own trouble: failed exports and span attributes
