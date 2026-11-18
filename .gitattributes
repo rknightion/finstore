@@ -1,0 +1,2 @@
+# Go module checksums are covered by dependency review and the repository vulnerability gate.
+/go.sum linguist-generated=true
