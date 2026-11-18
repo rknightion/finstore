@@ -1,0 +1,18 @@
+{
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "user": "ubuntu",
+  "install": "GOFLAGS=-mod=readonly just cloud-bootstrap </dev/null",
+  "egressMode": "network_settings_only",
+  "egressAllowlist": [
+    "apt.postgresql.org",
+    "archive.ubuntu.com",
+    "ports.ubuntu.com",
+    "proxy.golang.org",
+    "storage.googleapis.com",
+    "sum.golang.org",
+    "vuln.go.dev",
+    "www.postgresql.org"
+  ]
+}
