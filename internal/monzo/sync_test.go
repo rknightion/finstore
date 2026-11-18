@@ -187,12 +187,26 @@ func TestScheduledRunWithoutActiveConsentDoesNothing(t *testing.T) {
 	if err := h.w.RunScheduled(context.Background(), KindHourly); err != nil {
 		t.Fatalf("no consent: %v", err)
 	}
-	// Awaiting approval: the first worker stops in its first pause.
+	if n := len(h.fake.Requests()); n != 0 {
+		t.Fatalf("scheduled run made %d requests with no consent", n)
+	}
+	// Wait until the background approval poll has finished its first request.
+	approvalPaused := make(chan struct{})
 	h.setOnSleep(func(ctx context.Context, _ int, _ time.Duration) error {
+		close(approvalPaused)
 		<-ctx.Done()
 		return ctx.Err()
 	})
 	h.callback(h.w)
+	select {
+	case <-approvalPaused:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the approval wait never paused")
+	}
+	h.setOnSleep(nil)
+	if got := h.consent().State; got != store.ConsentAwaitingApproval {
+		t.Fatalf("consent state = %s, want awaiting approval", got)
+	}
 	requests := len(h.fake.Requests())
 	if err := h.w.RunScheduled(context.Background(), KindHourly); err != nil {
 		t.Fatalf("awaiting approval: %v", err)
