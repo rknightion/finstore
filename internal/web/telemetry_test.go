@@ -327,7 +327,14 @@ func TestAFailedExchangeWithCanaryValuesLeaksNothing(t *testing.T) {
 // the connect handler, and is in no span, log line or metric, for a connect that starts, one the
 // same-origin check refuses, and the status page.
 func TestTheSignedInAddressLeaksNothing(t *testing.T) {
-	const canary = "canary-ident-8e31@example.com"
+	const (
+		canaryPrefix = "canary-ident"
+		// A generated hexadecimal trace or span ID cannot contain this discriminator.
+		canarySuffix = "8e3z"
+		canaryLocal  = canaryPrefix + "-" + canarySuffix
+		canaryDomain = "canary-domain.invalid"
+		canary       = canaryLocal + "@" + canaryDomain
+	)
 	tr := newTraced(t, canary)
 	for name, c := range map[string]struct {
 		method, path string
@@ -360,8 +367,8 @@ func TestTheSignedInAddressLeaksNothing(t *testing.T) {
 		if text == "" {
 			t.Errorf("%s is empty: the test would prove nothing", what)
 		}
-		if strings.Contains(text, "canary-ident") || strings.Contains(text, "8e31") {
-			t.Errorf("the signed-in address reached the %s: %s", what, text)
+		if strings.Contains(text, canaryPrefix) || strings.Contains(text, canarySuffix) || strings.Contains(text, canaryDomain) {
+			t.Errorf("the signed-in address reached the %s", what)
 		}
 	}
 }
