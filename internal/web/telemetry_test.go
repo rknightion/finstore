@@ -263,7 +263,13 @@ func TestTheConnectorRunsInsideTheCallbackSpan(t *testing.T) {
 // Leak tests 1 and 2 through the whole handler, for both callback routes: the authorisation code
 // and the state a callback carries are in no span, log line or metric.
 func TestACallbackWithCanaryCodeAndStateLeaksNothing(t *testing.T) {
-	const canaryCode, canaryState = "CANARYCODE-7c2e", "CANARYSTATE-91ab"
+	// Keep the fragments outside the hexadecimal alphabet used by trace and span IDs.
+	const (
+		codeFragment  = "7c2x"
+		stateFragment = "91ay"
+		canaryCode    = "CANARYCODE-" + codeFragment
+		canaryState   = "CANARYSTATE-" + stateFragment
+	)
 	for _, route := range []string{"/callback/monzo", "/callback/truelayer"} {
 		t.Run(route, func(t *testing.T) {
 			tr := newTraced(t)
@@ -295,7 +301,7 @@ func TestACallbackWithCanaryCodeAndStateLeaksNothing(t *testing.T) {
 				if text == "" {
 					t.Errorf("%s is empty: the test would prove nothing", what)
 				}
-				if strings.Contains(text, "CANARY") || strings.Contains(text, "7c2e") || strings.Contains(text, "91ab") {
+				if strings.Contains(text, "CANARY") || strings.Contains(text, codeFragment) || strings.Contains(text, stateFragment) {
 					t.Errorf("a canary reached the %s: %s", what, text)
 				}
 			}
