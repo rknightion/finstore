@@ -81,6 +81,12 @@ vuln:
 [group('check')]
 check: fmt-check lint vet test tidy-check build vuln
 
+# Workstation feedback for Go edits since HEAD. Checks the working tree and its Go dependents.
+# Unclear scope, shared files, and an empty change set use the full gate. Commit gates use `just check`.
+[group('check')]
+check-fast:
+    if [ -n "${CI:-}${GITHUB_ACTIONS:-}" ] || ! command -v python3 >/dev/null; then just check </dev/null; else python3 tools/check_fast.py </dev/null; fi
+
 # Build the container image
 [group('build')]
 image tag="finstore:dev":
