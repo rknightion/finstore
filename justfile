@@ -20,6 +20,11 @@ default:
 setup: _install-golangci-lint
     go mod download
 
+# Prepare the tools and compile the race-enabled test binaries without running them.
+cloud-bootstrap: setup
+    GOBIN={{ tools_dir }} go install golang.org/x/vuln/cmd/govulncheck@{{ govulncheck_version }}
+    scratch="$(mktemp -d)"; trap 'rm -rf "$scratch"' EXIT; go test -c -race -o "$scratch/" ./...
+
 [private]
 _install-golangci-lint:
     mkdir -p {{ golangci_lint_dir }}
