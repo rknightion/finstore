@@ -116,7 +116,7 @@ func TestFailedRunWithNoCategoryFailsWithTheGenericWord(t *testing.T) {
 func TestAbandonFailsARunThatNeverFinishedAndLeavesAFinishedOne(t *testing.T) {
 	m, tr, mem, _, reader := runFixture(t)
 	_, never := m.StartRun(context.Background(), tr, "monzo", "backfill", 0)
-	never.Abandon("cancelled")
+	never.Abandon("timeout")
 	never.End()
 	ctx, done := m.StartRun(context.Background(), tr, "monzo", "hourly", 1)
 	done.Finish(ctx, "ok", "", 1, 2)
@@ -127,9 +127,9 @@ func TestAbandonFailsARunThatNeverFinishedAndLeavesAFinishedOne(t *testing.T) {
 		a := attrsOf(s)
 		switch a[semconv.SpanRunKind] {
 		case "backfill":
-			if a[semconv.SpanRunOutcome] != "failed" || a[semconv.SpanErrorType] != "cancelled" ||
-				s.Status.Code != codes.Error || s.Status.Description != "cancelled" {
-				t.Errorf("abandoned run %v status %v, want failed and cancelled", a, s.Status)
+			if a[semconv.SpanRunOutcome] != "failed" || a[semconv.SpanErrorType] != "timeout" ||
+				s.Status.Code != codes.Error || s.Status.Description != "timeout" {
+				t.Errorf("abandoned run %v status %v, want failed and timeout", a, s.Status)
 			}
 		case "hourly":
 			if a[semconv.SpanRunOutcome] != "ok" || s.Status.Code == codes.Error {
@@ -140,6 +140,27 @@ func TestAbandonFailsARunThatNeverFinishedAndLeavesAFinishedOne(t *testing.T) {
 	h, ok := collectFrom(t, reader)[semconv.MetricSyncRunDuration].Data.(metricdata.Histogram[float64])
 	if !ok || len(h.DataPoints) != 1 {
 		t.Errorf("duration points = %+v, want only the finished run's", h)
+	}
+}
+
+// A run abandoned because serve was stopping (its wait for the writer lock was cut) is recorded
+// failed with the category cancelled as error.type, but its span status is not Error: a deploy is
+// not a failure, and the scheduler's own shutdown handling sets no error status either.
+func TestAbandonAsCancelledSetsNoErrorStatus(t *testing.T) {
+	m, tr, mem, _, _ := runFixture(t)
+	_, run := m.StartRun(context.Background(), tr, "monzo", "backfill", 0)
+	run.Abandon("cancelled")
+	run.End()
+	spans := mem.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("%d spans, want 1", len(spans))
+	}
+	a := attrsOf(spans[0])
+	if a[semconv.SpanRunOutcome] != "failed" || a[semconv.SpanErrorType] != "cancelled" {
+		t.Errorf("attributes %v, want outcome failed and error.type cancelled", a)
+	}
+	if spans[0].Status.Code == codes.Error {
+		t.Errorf("status %v, want no error status for a shutdown-cut run", spans[0].Status)
 	}
 }
 

@@ -37,7 +37,8 @@ func newBankInstruments(meter metric.Meter) (bankInstruments, error) {
 }
 
 // BankObserver returns the observer a bankhttp client for source reports each attempt and retry
-// to. An attempt with no HTTP response arrives with the status class "no_response".
+// to. An attempt with no usable HTTP response (none arrived, its body could not be read, or its
+// status was outside 100 to 599) arrives with the status class "no_response".
 func (m *Metrics) BankObserver(source string) bankhttp.Observer {
 	return bankObserver{m: m, source: source}
 }

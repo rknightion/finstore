@@ -557,17 +557,22 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 			Notice:       cfg.ConnectNotice,
 			ConsentState: "not connected",
 			ApprovedAt:   s.when(row.ApprovedAt),
-			ExpiresAt:    s.when(row.ExpectedExpiryAt),
+			ExpiresAt:    dash,
 			DaysToExpiry: dash,
 			LastSyncOK:   s.when(row.LastSyncOKAt),
 			LastOutcome:  dash,
+		}
+		if !consentEnded(row.ConsentState) {
+			ps.ExpiresAt = s.when(row.ExpectedExpiryAt)
 		}
 		if row.ConsentState != nil {
 			ps.ConsentState = strings.ReplaceAll(*row.ConsentState, "_", " ")
 			ps.Connected = true
 			ps.Notice = cfg.ReconnectNotice
 		}
-		if row.DaysToExpiry != nil {
+		// A consent that has ended has no expiry to look forward to: no date, and no days left
+		// (the view counts them down below zero for an expired one).
+		if row.DaysToExpiry != nil && !consentEnded(row.ConsentState) {
 			ps.DaysToExpiry = fmt.Sprint(*row.DaysToExpiry)
 		}
 		if row.LastRunOutcome != nil {
@@ -597,6 +602,11 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	if err := statusTmpl.Execute(w, p); err != nil {
 		s.opts.Log.ErrorContext(r.Context(), "status page not rendered", semconv.LogOutcome, "error")
 	}
+}
+
+// consentEnded reports whether state is a consent that was lost or has expired.
+func consentEnded(state *string) bool {
+	return state != nil && (*state == store.ConsentLost || *state == store.ConsentExpired)
 }
 
 func (s *Server) statusFailed(w http.ResponseWriter, r *http.Request) {

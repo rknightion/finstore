@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"maps"
+	"regexp"
 	"slices"
 	"strings"
 	"unicode/utf8"
@@ -15,23 +16,29 @@ import (
 // that would stop the projection at that row for good. Every record is therefore sanitised as it
 // leaves its normaliser, before any id is derived from it or anything is written: U+0000 is
 // removed from text fields, invalid UTF-8 becomes U+FFFD, and in stored JSON content each U+0000
-// becomes U+FFFD. These are pure functions, so replay gives the same rows as the live path. The
-// exact bytes stay in raw. Version hashes are unaffected: they are computed over HashInput, which
-// is never stored as text.
+// and each lone surrogate escape (which jsonb refuses) becomes U+FFFD. These are pure functions,
+// so replay gives the same rows as the live path. The exact bytes stay in raw. Version hashes are
+// unaffected: they are computed over HashInput, which is never stored as text.
 
 // cleanText returns s as valid UTF-8 (each invalid sequence becomes U+FFFD) with no U+0000.
 func cleanText(s string) string {
 	return strings.ReplaceAll(strings.ToValidUTF8(s, "�"), "\x00", "")
 }
 
-// cleanJSON returns content with every U+0000 in its strings and keys replaced by U+FFFD and any
-// invalid UTF-8 replaced by U+FFFD. Content that needs neither is returned unchanged; otherwise it
-// is decoded and re-encoded (numbers kept as written). Content that does not decode as exactly
-// one JSON value is returned unchanged, for the caller's own check to refuse.
+// needsClean matches the escapes cleanJSON has to look at: U+0000, and any surrogate (D800 to
+// DFFF). A surrogate pair is valid and survives the re-encode as its character; the decoder turns a
+// lone one into U+FFFD.
+var needsClean = regexp.MustCompile(`\\u(0000|[dD][89a-fA-F][0-9a-fA-F]{2})`)
+
+// cleanJSON returns content with every U+0000 in its strings and keys replaced by U+FFFD, every lone
+// surrogate escape replaced by U+FFFD and any invalid UTF-8 replaced by U+FFFD. Content that needs
+// none of these is returned unchanged; otherwise it is decoded and re-encoded (numbers kept as
+// written). Content that does not decode as exactly one JSON value is returned unchanged, for the
+// caller's own check to refuse.
 func cleanJSON(content json.RawMessage) json.RawMessage {
 	// A false positive (an escaped backslash before "u0000") only costs a re-encode that changes
 	// nothing in meaning; the decoder, not this test, decides what a string holds.
-	if utf8.Valid(content) && !bytes.Contains(content, []byte(`\u0000`)) {
+	if utf8.Valid(content) && !needsClean.Match(content) {
 		return content
 	}
 	dec := json.NewDecoder(bytes.NewReader(content))

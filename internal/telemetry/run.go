@@ -116,10 +116,15 @@ func (r *RunSpan) Finish(ctx context.Context, outcome, category string, pages, r
 		attribute.String(semconv.AttrOutcome, outcome)))
 }
 
+// categoryCancelled is the run category of work that was stopped because serve was stopping.
+const categoryCancelled = "cancelled"
+
 // Abandon records a run that never produced an outcome (it never got the writer lock, or its row
-// could not be written): outcome failed, the category as error.type, and a failed status. It does
-// nothing when Finish has already recorded the run's end, and records no duration, because no run
-// was timed.
+// could not be written): outcome failed, the category as error.type, and a failed status. A run
+// abandoned as cancelled (the wait for the lock was cut by serve stopping) gets no failed status,
+// as a scheduler job cancelled by shutdown gets none: a deploy is not a failure. It does nothing
+// when Finish has already recorded the run's end, and records no duration, because no run was
+// timed.
 func (r *RunSpan) Abandon(category string) {
 	if r == nil || r.done.Swap(true) {
 		return
@@ -130,7 +135,9 @@ func (r *RunSpan) Abandon(category string) {
 	r.span.SetAttributes(
 		attribute.String(semconv.SpanRunOutcome, "failed"),
 		attribute.String(semconv.SpanErrorType, category))
-	Fail(r.span, category)
+	if category != categoryCancelled {
+		Fail(r.span, category)
+	}
 }
 
 // End ends the span.

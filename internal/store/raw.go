@@ -213,6 +213,34 @@ func APIResponseExists(ctx context.Context, q DBTX, endpoint string, params json
 	return ok, nil
 }
 
+// APIResponseFetchIDs returns the ids of the fetches that hold a response with this endpoint,
+// request parameters, fetch time and body SHA-256 (see APIResponseExists), oldest first.
+func APIResponseFetchIDs(ctx context.Context, q DBTX, endpoint string, params json.RawMessage, fetchedAt time.Time, bodySHA256 []byte) ([]int64, error) {
+	if params == nil {
+		params = json.RawMessage(`{}`)
+	}
+	rows, err := q.Query(ctx, `SELECT DISTINCT fetch_id FROM raw.api_response
+		WHERE endpoint = $1 AND fetched_at = $2 AND body_sha256 = $3 AND params = $4::jsonb
+		ORDER BY fetch_id`, endpoint, fetchedAt, bodySHA256, string(params))
+	if err != nil {
+		return nil, fmt.Errorf("store: look up the fetches of an api response: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return nil, fmt.Errorf("store: look up the fetches of an api response: %w", err)
+	}
+	return ids, nil
+}
+
+// CountAPIResponses returns the number of responses the fetch with id holds.
+func CountAPIResponses(ctx context.Context, q DBTX, fetchID int64) (int, error) {
+	var n int
+	if err := q.QueryRow(ctx, `SELECT count(*) FROM raw.api_response WHERE fetch_id = $1`, fetchID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("store: count the responses of a fetch: %w", err)
+	}
+	return n, nil
+}
+
 // GetFetch returns the fetch with id, or ErrNotFound.
 func GetFetch(ctx context.Context, q DBTX, id int64) (Fetch, error) {
 	rows, err := q.Query(ctx, `SELECT `+fetchColumns+` FROM raw.fetch WHERE id = $1`, id)
@@ -270,6 +298,23 @@ func PreviousResponseInRun(ctx context.Context, q DBTX, runID int64, accountKey,
 		return APIResponse{}, false, fmt.Errorf("store: previous response in run: %w", err)
 	}
 	return r, true, nil
+}
+
+// NewestSuccessfulResponseBody returns the body of the newest stored 2xx response of source to
+// the templated endpoint, and false when there is none. A bank that answered with an error, or no
+// whole response (status 0), is passed over.
+func NewestSuccessfulResponseBody(ctx context.Context, q DBTX, source, endpoint string) ([]byte, bool, error) {
+	var body []byte
+	err := q.QueryRow(ctx, `SELECT body FROM raw.api_response
+		WHERE source = $1 AND endpoint = $2 AND status BETWEEN 200 AND 299
+		ORDER BY seq DESC LIMIT 1`, source, endpoint).Scan(&body)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("store: newest successful response: %w", err)
+	}
+	return body, true, nil
 }
 
 // CountCallsToday counts the responses stored for source and the templated endpoint whose request

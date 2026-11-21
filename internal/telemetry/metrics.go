@@ -3,6 +3,8 @@ package telemetry
 import (
 	"context"
 	"fmt"
+	"maps"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -39,10 +41,12 @@ type Metrics struct {
 	lastRunOK       metric.Int64Gauge
 	lastRunTime     metric.Int64Gauge
 	lastRateLimited metric.Int64Gauge
-	historyOK       metric.Int64Gauge
 	unanswered      metric.Int64Gauge
-	mcpToolCalls    metric.Int64Counter
-	bank            bankInstruments
+	// history is the source-to-value snapshot the historyOK observable gauge reports at each
+	// collection; a source left out of the snapshot has no series.
+	history      historySnapshot
+	mcpToolCalls metric.Int64Counter
+	bank         bankInstruments
 }
 
 // NewMetrics creates every instrument on meter.
@@ -85,7 +89,6 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 	gauge(&m.lastRunOK, semconv.MetricSyncLastRunOK, "1", "1 when the newest finished run of a source and kind ended ok, 0 when it ended partial or failed")
 	gauge(&m.lastRunTime, semconv.MetricSyncLastRunTime, "s", "Unix time the newest finished run of a source and kind ended")
 	gauge(&m.lastRateLimited, semconv.MetricSyncLastRateLimitedTime, "s", "Unix time the newest rate-limited run of a source ended; absent for a source that never had one")
-	gauge(&m.historyOK, semconv.MetricConsentHistoryOK, "1", "1 when a connect, backfill or capture run ended ok since the source's current consent was approved, 0 when none has")
 	gauge(&m.unanswered, semconv.MetricConnectUnanswered, "1", "Connect attempts of a source that expired unused in the last 24 hours")
 	counter(&m.mcpToolCalls, semconv.MetricMCPToolCalls, "MCP tool calls, by tool, outcome (ok, invalid, busy, timeout, refused or error) and client (the grant group of the caller)")
 	if err == nil {
@@ -103,6 +106,9 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 		}
 	}
 	if err == nil {
+		err = m.observeConsentHistory()
+	}
+	if err == nil {
 		m.bank, err = newBankInstruments(meter)
 	}
 	if err != nil {
@@ -112,10 +118,12 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 }
 
 // SchedulerObserver returns the scheduler's observer. Each job run is a new root span named
-// scheduler.job with the job's registered name and outcome, and is counted, timed, and recorded
-// as the job's last outcome. A nil tr makes no spans. The job name is a registered name, never
-// data; the outcome is ok, error or panic, and neither a returned error nor a panic value is
-// recorded.
+// scheduler.job with the job's registered name and outcome, and is counted and timed. Its outcome is
+// recorded as the job's last outcome unless it is cancelled (the job returned an error after the
+// scheduler was told to stop): a cancelled run is counted and timed, is not a failed span, and
+// does not write last_ok, so a deploy cannot trip the Scheduled Job Failed alert. A nil tr makes
+// no spans. The job name is a registered name, never data; the outcome is ok, error, panic or
+// cancelled, and neither a returned error nor a panic value is recorded.
 func (m *Metrics) SchedulerObserver(tr trace.Tracer) scheduler.Observer {
 	if tr == nil {
 		tr = tracenoop.NewTracerProvider().Tracer(semconv.ServiceName)
@@ -206,14 +214,80 @@ func (m *Metrics) LastRateLimited(ctx context.Context, source string, at time.Ti
 	m.lastRateLimited.Record(ctx, at.Unix(), metric.WithAttributes(attribute.String(semconv.AttrSource, source)))
 }
 
-// ConsentHistory records whether a source's current consent has its history: 1 when a connect or
-// backfill run ended ok since the approval, 0 when none has.
-func (m *Metrics) ConsentHistory(ctx context.Context, source string, ok bool) {
+// historySnapshot is what the consent history gauge reports: a value for each source in it.
+type historySnapshot struct {
+	mu   sync.Mutex
+	vals map[string]int64
+}
+
+func (h *historySnapshot) set(source string, v int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.vals == nil {
+		h.vals = map[string]int64{}
+	}
+	h.vals[source] = v
+}
+
+func (h *historySnapshot) replace(vals map[string]int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.vals = vals
+}
+
+func (h *historySnapshot) copy() map[string]int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return maps.Clone(h.vals)
+}
+
+// observeConsentHistory registers the consent history gauge as an observable gauge that reports
+// the snapshot at each collection. A synchronous gauge keeps every series it has ever recorded for
+// as long as the process runs (the SDK's last-value aggregation never forgets one), so a source
+// whose consent was lost, expired or replaced would keep reading its last value, and a 0 would
+// keep History Missing firing beside Consent Lost. An observable gauge reports only what its
+// callback observes, so a source left out of the snapshot has no series, the same way the writer
+// lock gauge has none while the lock is free.
+func (m *Metrics) observeConsentHistory() error {
+	_, err := m.meter.Int64ObservableGauge(semconv.MetricConsentHistoryOK, metric.WithUnit("1"),
+		metric.WithDescription("1 when a connect or backfill run, or a capture run that stored at least one response, ended ok since the source's current consent was approved, 0 when none has; absent while the source has no active current consent"),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			for source, v := range m.history.copy() {
+				o.Observe(v, metric.WithAttributes(attribute.String(semconv.AttrSource, source)))
+			}
+			return nil
+		}))
+	if err != nil {
+		return fmt.Errorf("create %s: %w", semconv.MetricConsentHistoryOK, err)
+	}
+	return nil
+}
+
+// ConsentHistory sets whether a source's current consent has its history: 1 when a connect or
+// backfill run, or a capture run that stored at least one response, ended ok since the approval, 0
+// when none has. It leaves every other source as it was; the status job uses ReplaceConsentHistory,
+// which also drops the sources that are no longer in the query.
+func (m *Metrics) ConsentHistory(_ context.Context, source string, ok bool) {
 	var v int64
 	if ok {
 		v = 1
 	}
-	m.historyOK.Record(ctx, v, metric.WithAttributes(attribute.String(semconv.AttrSource, source)))
+	m.history.set(source, v)
+}
+
+// ReplaceConsentHistory makes sources (source name to whether its current consent has its history,
+// see ConsentHistory) the whole set the gauge reports: a source that is not in it, because its
+// consent is no longer active or current, has no series from the next collection on.
+func (m *Metrics) ReplaceConsentHistory(sources map[string]bool) {
+	vals := make(map[string]int64, len(sources))
+	for source, ok := range sources {
+		var v int64
+		if ok {
+			v = 1
+		}
+		vals[source] = v
+	}
+	m.history.replace(vals)
 }
 
 // ConnectsUnanswered records how many of a source's connect attempts expired unused in the last

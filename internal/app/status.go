@@ -49,16 +49,21 @@ type statusPublisher struct {
 	log      *slog.Logger
 	dumpFile string
 	now      func() time.Time
+	// sources are the configured sources (Monzo, and each TrueLayer connection when TrueLayer is
+	// configured). The run and connect-attempt gauges read only these, so a source retired from the
+	// configuration stops alerting on the rows it left behind.
+	sources []string
 }
 
 // publishRunState sends the gauges the run alerts read, all from the database: each kind of run's
 // latest result, when each source was last rate limited, whether each current consent has its
 // history, and the connect attempts that expired unused. A source with nothing to say for a gauge
 // is skipped, so an alert never sees a series for it (a source never rate limited has no
-// last_rate_limited point). Run kinds an operator command writes (import, capture) are never read.
+// last_rate_limited point, and a source without an active current consent has no history_ok
+// series: it is dropped when it leaves the query). Run kinds an operator command writes (import, capture) are never read.
 func (p *statusPublisher) publishRunState(ctx context.Context) error {
 	db := p.st.DB()
-	runs, err := store.LatestRuns(ctx, db)
+	runs, err := store.LatestRuns(ctx, db, p.sources)
 	if err != nil {
 		return err
 	}
@@ -76,10 +81,15 @@ func (p *statusPublisher) publishRunState(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The whole set at once: a source whose consent is no longer active and current drops out of the
+	// query, and its series must go with it (a lost consent is Consent Lost's to report, not History
+	// Missing's).
+	published := make(map[string]bool, len(history))
 	for _, h := range history {
-		p.m.ConsentHistory(ctx, h.Source, h.OK)
+		published[h.Source] = h.OK
 	}
-	unanswered, err := store.UnansweredConnects(ctx, db, p.now())
+	p.m.ReplaceConsentHistory(published)
+	unanswered, err := store.UnansweredConnects(ctx, db, p.now(), p.sources)
 	if err != nil {
 		return err
 	}

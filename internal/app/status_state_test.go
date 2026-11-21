@@ -50,7 +50,8 @@ func newStateRig(t *testing.T, now time.Time) *stateRig {
 		t.Fatal(err)
 	}
 	r := &stateRig{t: t, st: st, now: now, reader: reader}
-	r.p = &statusPublisher{st: st, m: metrics, log: slog.New(slog.DiscardHandler), now: func() time.Time { return r.now }}
+	r.p = &statusPublisher{st: st, m: metrics, log: slog.New(slog.DiscardHandler), now: func() time.Time { return r.now },
+		sources: []string{"monzo", "truelayer:ob-lloyds", "truelayer:ob-monzo"}}
 	return r
 }
 
@@ -272,4 +273,78 @@ func TestStatusPublishesWhetherTheCurrentConsentHasItsHistory(t *testing.T) {
 	r.status()
 	r.want(semconv.MetricConsentHistoryOK, map[string]string{"source": "monzo"}, 1)
 	r.want(semconv.MetricConsentHistoryOK, map[string]string{"source": "truelayer:ob-lloyds"}, 0)
+}
+
+// A source that drops out of the history query keeps no series. A consent that is lost, expired or
+// replaced is no longer active and current, so its source reports no history_ok: a 0 left at its
+// last value would keep History Missing firing beside Consent Lost until serve restarted. The
+// series comes back when a new consent is active.
+func TestStatusDropsTheHistorySeriesOfASourceWithNoActiveConsent(t *testing.T) {
+	now := time.Date(2030, 4, 1, 12, 0, 0, 0, time.UTC)
+	r := newStateRig(t, now)
+	ctx := context.Background()
+	approved := now.Add(-48 * time.Hour)
+	lloyds, monzo := map[string]string{"source": "truelayer:ob-lloyds"}, map[string]string{"source": "monzo"}
+	r.consent("truelayer:ob-lloyds", approved)
+	r.consent("monzo", approved)
+	r.status()
+	r.want(semconv.MetricConsentHistoryOK, lloyds, 0)
+	r.want(semconv.MetricConsentHistoryOK, monzo, 0)
+
+	// Lloyds' consent is lost; Monzo's is replaced by one still awaiting its approval.
+	cur, err := store.CurrentConsent(ctx, r.st.DB(), "truelayer:ob-lloyds")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reason := "access_denied"
+	if _, err := store.TransitionConsent(ctx, r.st.DB(), cur.ID, store.ConsentTransition{
+		To: store.ConsentLost, At: now, From: []string{store.ConsentActive}, Reason: &reason}); err != nil {
+		t.Fatal(err)
+	}
+	next, err := store.CreateConsent(ctx, r.st.DB(), "monzo", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCurrentConsent(ctx, r.st.DB(), next); err != nil {
+		t.Fatal(err)
+	}
+	r.status()
+	if _, ok := r.gauge(semconv.MetricConsentHistoryOK, lloyds); ok {
+		t.Error("a source whose consent is lost still reports history_ok")
+	}
+	if _, ok := r.gauge(semconv.MetricConsentHistoryOK, monzo); ok {
+		t.Error("a source whose consent was replaced by one not yet active still reports history_ok")
+	}
+	if got := r.points(semconv.MetricConsentHistoryOK); got != 0 {
+		t.Errorf("history_ok has %d points, want none", got)
+	}
+
+	// A new consent that is active reports again.
+	r.consent("truelayer:ob-lloyds", now)
+	r.status()
+	r.want(semconv.MetricConsentHistoryOK, lloyds, 0)
+}
+
+// A source retired from the configuration keeps its rows, and its last failed run or unanswered
+// connect attempt must not alert for ever: the run and connect-attempt gauges read only the
+// configured sources.
+func TestStatusIgnoresASourceRetiredFromTheConfiguration(t *testing.T) {
+	now := time.Date(2030, 4, 1, 12, 0, 0, 0, time.UTC)
+	r := newStateRig(t, now)
+	r.run("monzo", "hourly", "ok", nil, now.Add(-time.Hour))
+	r.run("truelayer:ob-monzo", "sync", "failed", nil, now.Add(-time.Hour))
+	r.attempt("truelayer:ob-monzo", "retired unused", now.Add(-3*time.Hour))
+	r.attempt("monzo", "configured unused", now.Add(-3*time.Hour))
+
+	// TrueLayer's Monzo connection has been removed from the configuration.
+	r.p.sources = []string{"monzo", "truelayer:ob-lloyds"}
+	r.status()
+	r.want(semconv.MetricSyncLastRunOK, map[string]string{"source": "monzo", "kind": "hourly"}, 1)
+	if _, ok := r.gauge(semconv.MetricSyncLastRunOK, map[string]string{"source": "truelayer:ob-monzo", "kind": "sync"}); ok {
+		t.Error("a retired source still publishes last_run.ok, so Sync Run Not OK fires for ever")
+	}
+	r.want(semconv.MetricConnectUnanswered, map[string]string{"source": "monzo"}, 1)
+	if _, ok := r.gauge(semconv.MetricConnectUnanswered, map[string]string{"source": "truelayer:ob-monzo"}); ok {
+		t.Error("a retired source still publishes connect.unanswered")
+	}
 }

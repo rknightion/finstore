@@ -251,3 +251,35 @@ func TestWriterLockExcludesOtherWriters(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Finishing a run that already has an end changes nothing and is not an error: the first end
+// stands. A run that does not exist is still ErrNotFound.
+func TestFinishRunOfAFinishedRunChangesNothing(t *testing.T) {
+	c := newCluster(t)
+	ctx := context.Background()
+	q := openStore(t, c.app).DB()
+	s := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	id, err := store.StartRun(ctx, q, "monzo", "hourly", s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishRun(ctx, q, id, store.RunResult{FinishedAt: s.Add(time.Minute), Outcome: "partial",
+		Requests: 3, RowsSeen: 9, ErrorCategory: ptr("history_failed")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishRun(ctx, q, id, store.RunResult{FinishedAt: s.Add(time.Hour), Outcome: "ok",
+		Requests: 50, RowsSeen: 60}); err != nil {
+		t.Fatalf("finishing a finished run: %v, want nil", err)
+	}
+	r, err := store.GetRun(ctx, q, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.FinishedAt == nil || !r.FinishedAt.Equal(s.Add(time.Minute)) || *r.Outcome != "partial" || r.Requests != 3 ||
+		r.RowsSeen != 9 || r.ErrorCategory == nil || *r.ErrorCategory != "history_failed" {
+		t.Fatalf("run after a second finish: %+v, want the first end kept", r)
+	}
+	if err := store.FinishRun(ctx, q, id+1000, store.RunResult{FinishedAt: s, Outcome: "ok"}); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("finishing a run that does not exist: %v, want ErrNotFound", err)
+	}
+}

@@ -10,7 +10,9 @@
 //   - a visible Tj with no Tm since the previous visible Tj (or since BT) is
 //     refused, as is one after T*, or after a Td that follows a Tm that scales
 //     or rotates. Invisible text (under 1 point) is exempt: it is not returned,
-//     and statements draw hidden labels straight after a visible string;
+//     and statements draw hidden labels straight after a visible string. A
+//     visible Tj after a hidden string under the same Tm (no Tm, Td or BT
+//     between them) is refused, because the hidden string's width has moved it;
 //   - any Tr operand other than 0 is refused;
 //   - a visible Tj while a non-identity cm is in effect is refused. The graphics state
 //     stack is tracked (q pushes, Q pops), so a cm wrapped in q/Q around an
@@ -256,6 +258,9 @@ func extractText(content []byte, limit int) ([]Text, error) {
 		lineX, lineY float64
 		// placed is true from a Tm until the next Tj: each Tj needs its own Tm.
 		placed bool
+		// moved is true when a hidden string has been drawn since the last Tm, Td or BT: its
+		// width has advanced the text position by an amount the reader does not know.
+		moved bool
 		// scaled is true when the last Tm scales or rotates, so a Td in it
 		// would move by more or less than its operands say.
 		scaled bool
@@ -310,7 +315,7 @@ func extractText(content []byte, limit int) ([]Text, error) {
 				}
 			case "BT":
 				x, y, lineX, lineY = 0, 0, 0, 0
-				placed, scaled = false, false
+				placed, scaled, moved = false, false, false
 			case "Tm":
 				n, ok := numbers(ops, 6)
 				if !ok {
@@ -318,7 +323,7 @@ func extractText(content []byte, limit int) ([]Text, error) {
 				}
 				x, y = n[4], n[5]
 				lineX, lineY = x, y
-				placed, scaled = true, n[0] != 1 || n[1] != 0 || n[2] != 0 || n[3] != 1
+				placed, scaled, moved = true, n[0] != 1 || n[1] != 0 || n[2] != 0 || n[3] != 1, false
 			case "Td", "TD":
 				n, ok := numbers(ops, 2)
 				if !ok {
@@ -326,6 +331,7 @@ func extractText(content []byte, limit int) ([]Text, error) {
 				}
 				lineX, lineY = lineX+n[0], lineY+n[1]
 				x, y = lineX, lineY
+				moved = false
 				if scaled {
 					placed = false
 				}
@@ -342,13 +348,17 @@ func extractText(content []byte, limit int) ([]Text, error) {
 				}
 				// Invisible text is not returned, so where it lands does not matter: it neither
 				// needs a Tm nor uses one up. Statements draw a hidden label straight after a
-				// visible string, with no Tm between them. A hidden string drawn before a
-				// visible one moves it by less than a point, which no column edge is near.
+				// visible string, with no Tm between them. But its width advances the text
+				// position, so a visible string drawn after it under the same Tm is refused.
 				if size < minVisibleSize {
+					moved = true
 					break
 				}
 				if !placed {
 					return nil, fmt.Errorf("%w: Tj without its own Tm", ErrUnsupported)
+				}
+				if moved {
+					return nil, fmt.Errorf("%w: Tj after hidden text under the same Tm", ErrUnsupported)
 				}
 				if transformed[len(transformed)-1] {
 					return nil, fmt.Errorf("%w: text under a cm", ErrUnsupported)
@@ -362,6 +372,7 @@ func extractText(content []byte, limit int) ([]Text, error) {
 				if size >= minVisibleSize {
 					return nil, fmt.Errorf("%w: text operator %s", ErrUnsupported, t.str)
 				}
+				moved = true
 			case "BI":
 				if err := skipInlineImage(lx); err != nil {
 					return nil, err

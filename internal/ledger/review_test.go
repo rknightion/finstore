@@ -119,6 +119,46 @@ func TestNULAndBadUTF8AreSanitisedAndTheRunGoesOn(t *testing.T) {
 	}
 }
 
+// A lone surrogate escape in a bank body is valid JSON text that PostgreSQL's jsonb refuses. It is
+// replaced as the record is sanitised, so the insert cannot fail and stop the projection at that
+// row; a valid pair is kept as it is.
+func TestLoneSurrogateEscapeInContentIsSanitisedAndTheRunGoesOn(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.accounts(fAcc{ID: "acc_1", Type: "current"})
+	lone := json.RawMessage(`{"id":"tx_lone","account":"acc_1","amount":-5,"created":"` + jan5.Format(time.RFC3339) +
+		`","extra":{"high":"a\ud800b","low":"c\udc00d","reversed":"\udc00\ud800","trailing":"x\ud83d","key\ud800":"v","pair":"\ud83d\ude00"}}`)
+	e.respond(e.fetch(1, "acc_1", nil), "/transactions", body(fBody{Transactions: []json.RawMessage{
+		lone, txn("tx_plain", "acc_1", -11, jan5)}}))
+	st := e.catchUp()
+	if st.Unparseable != 0 || st.TransactionsCreated != 2 || e.lastSeq() != e.maxRawSeq() {
+		t.Fatalf("stats %+v", st)
+	}
+	accID := wantAccountID(fakeSource, "acc_1")
+	vs, err := e.core().ListTransactionVersions(ctx, wantTxnID(accID, fakeSource, "tx_lone"))
+	if err != nil || len(vs) != 1 {
+		t.Fatalf("versions %+v, %v", vs, err)
+	}
+	var content struct {
+		Extra map[string]string
+	}
+	if err := json.Unmarshal(vs[0].Content, &content); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"high": "a�b", "low": "c�d", "reversed": "��", "trailing": "x�", "key�": "v", "pair": "😀"}
+	if len(content.Extra) != len(want) {
+		t.Fatalf("content %s", vs[0].Content)
+	}
+	for k, w := range want {
+		if content.Extra[k] != w {
+			t.Errorf("extra[%q] = %q, want %q (content %s)", k, content.Extra[k], w, vs[0].Content)
+		}
+	}
+	if r := e.recon(accID); r.RunningSumMinor != -16 {
+		t.Fatalf("running sum %d, want the whole page", r.RunningSumMinor)
+	}
+}
+
 func TestAcceptDifferenceOnAFileAccountIsRefusedAndChangesNothing(t *testing.T) {
 	e := newEnv(t)
 	e.addFileAccount("bank-current")

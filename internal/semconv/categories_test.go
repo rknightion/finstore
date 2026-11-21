@@ -21,3 +21,16 @@ func TestEveryBankCategoryMayBeAStatusDescription(t *testing.T) {
 		}
 	}
 }
+
+// The run categories the workers record are span status descriptions the exporter keeps; one that
+// is missing here would read "error" on a failed run's span.
+func TestEveryRunCategoryMayBeAStatusDescription(t *testing.T) {
+	for _, c := range []string{
+		"history_failed", "consent_lost", "superseded", "interrupted", "card_key_shared", "cards_refused",
+		"scopes_unknown", "cancelled", "internal",
+	} {
+		if !semconv.IsStatusCategory(c) {
+			t.Errorf("run category %q is not a status category", c)
+		}
+	}
+}

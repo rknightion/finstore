@@ -21,6 +21,10 @@ func TestCleanJSONReplacesOnlyRealNULs(t *testing.T) {
 		`{"a":"\\u0000"}`:                `{"a":"\\u0000"}`, // an escaped backslash, not a NUL
 		`{"k\u0000":"v"}`:                `{"k` + "�" + `":"v"}`,
 		"{\"a\":\"\xff\"}":               `{"a":"` + "�" + `"}`,
+		`{"a":"x\ud800y"}`:               `{"a":"x` + "�" + `y"}`, // a lone high surrogate
+		`{"a":"x\udc00y"}`:               `{"a":"x` + "�" + `y"}`, // a lone low surrogate
+		`{"a":"\ud83d\ude00"}`:           `{"a":"😀"}`,             // a valid pair, kept as its character
+		`{"a":"\\ud800"}`:                `{"a":"\\ud800"}`,       // an escaped backslash, not a surrogate
 		`{"n":1.50}`:                     `{"n":1.50}`,
 	}
 	for in, want := range cases {

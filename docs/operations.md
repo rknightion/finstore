@@ -93,7 +93,8 @@ Three things about Monzo shape this flow:
   anything. If you start a reconnect, finish it. An attempt abandoned before the email link changes
   nothing.
 - **A connection ends about 90 days after approval.** The status page and the
-  `finstore.consent.expiry.time` metric show when. Reconnecting takes a minute and also refetches
+  `finstore.consent.expiry.time` metric show when. Once a consent is lost or expired the status
+  page shows no expiry date and no days left. Reconnecting takes a minute and also refetches
   the full history.
 
 After the first minutes, Monzo serves only the last 90 days. The service syncs the last 7 days every
@@ -129,7 +130,7 @@ reconnect it, so reconnect Lloyds and Monzo (TrueLayer) once from the status pag
 Pending transactions and the account detail need no reconnect. When `/me` cannot be read, a run
 treats `cards` and `info` as not granted.
 
-**Mandates and SCA.** Lloyds answers the standing orders and direct debits reads (`/standing_orders` and `/direct_debits` of each account) with 403 and the error `sca_exceeded` ("SCA exemption has expired") once the window after you authenticate at the bank has passed: the connect, which runs just after the approval, reads them, but a scheduled sync does not. A scheduled sync that gets that answer keeps the mandates already stored (they are not replaced, ended or cleared), is not marked `partial`, does not touch the consent, and counts the read on `finstore.truelayer.optional_reads` with the result `sca_required`. So **Lloyds mandates are refreshed only at a connect**: a standing order or direct debit cancelled or added at the bank shows up after you reconnect, not before. The same answer on a connect, or any other 403 or error on these reads, is handled as before: the run ends `partial`.
+**Mandates and SCA.** Lloyds answers the standing orders and direct debits reads (`/standing_orders` and `/direct_debits` of each account) with 403 and the error `sca_exceeded` ("SCA exemption has expired") once the window after you authenticate at the bank has passed: the connect, which runs just after the approval, reads them, but a scheduled sync does not. A scheduled sync that gets that answer keeps the mandates already stored (they are not replaced, ended or cleared), is not marked `partial`, does not touch the consent, and counts the read on `finstore.truelayer.optional_reads` with the result `sca_required`. So **Lloyds mandates are refreshed only at a connect**: a standing order or direct debit cancelled or added at the bank shows up after you reconnect, not before. The same answer on a connect, or any other 403 or error on these reads, is handled as before: the run ends `partial`. TrueLayer's support notes that some banks answer these two reads outside the SCA window with `access_denied` instead of `sca_exceeded`. finstore reads `access_denied` on any ledger read as the loss of the consent, so such a bank would end its consent at the first scheduled sync. Lloyds has not been seen to do this; if a consent ends `lost` with `access_denied` at a scheduled sync right after a working connect, look at which endpoint was refused (`raw.api_response`) before reconnecting.
 
 **Refused card reads.** The card reads of a Lloyds run (the card list, each card's transactions and balance) are ledger reads, but a refusal of one (401, 403 or `access_denied`) never ends the consent: a `cards` scope the bank does not honour must not cost the working account feed. The run ends `partial` with `cards_refused`, makes no further card call (not even a pending read), and its account reads are unaffected. On a connect the missing card history does not make the run `history_failed`. A refused token refresh is not a refusal of the card call and still ends the consent, as it does anywhere else.
 
@@ -152,7 +153,27 @@ the status page shows no TrueLayer section.
 `/callback/truelayer`. There is no approval wait: the consent is active as soon as you are back, and
 the connect-time fetch runs at once (for Lloyds, every transaction since 2024-08-01, then the
 balance). If the Lloyds history call fails, the connect run ends `partial` with `history_failed`;
-reconnect to fetch it again. Declining at the bank changes nothing.
+reconnect to fetch it again. A Lloyds connect that loses its consent (the bank refuses a call with 401
+or `access_denied`) ends `failed`, still with `history_failed`, because its history is missing too;
+the consent row keeps why it was lost. A restart that finds a Lloyds consent still awaiting its
+approval with no connect run recorded for it (the callback could not write one) records the run
+`partial` with `history_failed` before it approves the consent, so the lost history is alerted on.
+Declining at the bank changes nothing.
+
+**A connect replaced mid-fetch.** Press connect again while the first connect is still fetching and
+the second callback replaces the first consent and cancels its fetch. The cancelled run ends
+`partial` with `superseded` (not `cancelled`, and for Lloyds not `history_failed`: the newer connect
+fetches the history), and nothing is logged as an error. A run stopped by `serve` shutting down is
+`cancelled` instead, or stays `history_failed` for a Lloyds connect that had not fetched its history.
+
+**An unreadable `/me`.** A connect reads `/data/v1/me` when it approves the consent, for the expiry
+and the granted scopes, and reads it once more after two seconds when the first read fails. If both
+fail, the consent is approved for 90 days and the run has no scopes, so it makes no card call and no
+`/info` call. A Lloyds connect that is otherwise `ok` then ends `partial` with `scopes_unknown`, so the
+skipped card reads show: the card history older than a scheduled run's 35 days is lost until the next
+reconnect, and `finstore.consent.history_ok` stays 0 until then. Reconnect from the status page when
+the bank is answering. The retry counts as a second call to `/me` that day toward the daily limit.
+A Monzo (TrueLayer) connect reads no ledger data from `cards`, so it stays `ok`.
 
 **Syncing.** Each connection syncs at 06:20 and 18:20 in `FINSTORE_TIMEZONE`, each up to five
 minutes late at random: accounts and mandates (Lloyds refuses the mandate reads outside the window after a connect, so its mandates are refreshed only at a connect), and for Lloyds the last 35 days of transactions and
@@ -210,8 +231,9 @@ Formats:
 - **`halifax-pdf`**: the PDF statement the Halifax app produces. The reader checks that the rows
   add up to the statement's totals, that each row's running balance follows from the previous one,
   that the last balance equals the statement's closing balance, that the rows are in date order,
-  and that every row is dated inside the statement's printed period. A file that fails any check
-  is rejected whole.
+  and that every row is dated inside the statement's printed period. A description that runs on
+  to the top of the next page, under the repeated table header, is read as part of its row. A file
+  that fails any check is rejected whole.
 - **`manual-csv`**: for anything typed up by hand, such as a mortgage. UTF-8, with the header
   `date,type,amount,balance_after,description`. `date` is `YYYY-MM-DD`; `amount` and
   `balance_after` are decimal pounds; `amount` is signed, and each `balance_after` must equal the
@@ -265,13 +287,46 @@ warning. Two cards in one list that share their last four digits are both skippe
 warning is logged and the run ends `partial` with `card_key_shared`, since merging two cards into
 one account would be worse than having neither.
 
+### Cards that share their last four
+
+Two cards in one list that end in the same four digits cannot be told apart, so finstore keys
+neither: every run while the clash lasts ends `partial` with `card_key_shared` (a warning with a
+count, no card detail), the two cards get no account and no rows, and the accounts keep syncing as
+usual. Because a `partial` run does not count as a successful sync, `finstore.sync.last_run.ok`
+reads 0 for the source and its last-success time stops moving, so the Sync Run Not OK and the
+no-successful-sync alerts fire until the clash ends. finstore has no setting that keeps one of the
+two. What to do:
+
+1. **Find the two cards.** The newest stored card list is in `raw`. It holds card numbers and names,
+   so read it where the data is allowed to be seen:
+
+   ```sql
+   SELECT fetched_at, raw.json_body(body) -> 'results' AS cards
+   FROM raw.api_response
+   WHERE source = 'truelayer:ob-lloyds' AND endpoint = '/data/v1/cards' AND status = 200
+   ORDER BY seq DESC LIMIT 1;
+   ```
+
+   Two entries have `partial_card_number` ending in the same four digits.
+2. **End the clash at the bank.** Have the bank replace one of the two (a replacement has a new
+   number) or close the one you no longer use, so that the list no longer holds both. The next
+   scheduled sync then reads both or the remaining card, the run ends `ok` again and the alerts
+   clear. A replaced card follows [Ending a replaced card](#ending-a-replaced-card).
+3. **Meanwhile.** Neither card is tracked while they clash, and their history is fetched when the
+   clash ends (a connect asks from 2021-01-01, a scheduled run for 35 days, so reconnect once it
+   has ended if the clash lasted longer than that). If you need the alerts quiet for the duration,
+   silence them in Grafana; do not reconnect, which does nothing for this.
+
 ### Ending a replaced card
 
 A new card number is a new key and so a new account. The old account stops being listed but stays
 open with its last balance, so a sum of card balances would count the debt twice (and if TrueLayer's
 card resource is the account rather than the plastic, the new key's history repeats the old rows).
 finstore warns when a card account that has not ended is missing from a successful card list, and
-sets `finstore.truelayer.cards_unlisted` to how many. The warning carries the source and a count
+sets `finstore.truelayer.cards_unlisted` to how many. The gauge has a value from start: `serve`
+seeds it from the newest stored card list and the card accounts the ledger holds, so a card
+that was already missing is visible after a restart and not only after the next card list. The
+warning carries the source and a count
 only, since nothing from a bank response goes in a log. Find the card in the data: the open card
 accounts that stopped getting new rows are the ones, for example
 
@@ -303,8 +358,8 @@ current balances.
 | `finstore account end --slug S --last-date YYYY-MM-DD`, `finstore account end --slug S --clear` | app | Ends an account at a date, or removes its end. See [Ending an account](#ending-an-account) |
 | `finstore account accept-difference --slug S --reason TEXT` | app | For an account an API feeds: records that its current balance difference is known and accepted, so it stops counting as a mismatch. A different difference later counts again. A statement-fed account is refused: its gaps close when the missing statement is imported |
 | `finstore import` | app | Imports one statement from standard input |
-| `finstore load-capture --dir PATH [--dir PATH]...` | app | Loads API responses captured before the service existed. Loading twice loads once, and a capture older than what is already held never replaces newer data |
-| `finstore renormalise [--verify]` | owner | Rebuilds `core` from `raw`. With `--verify` it swaps nothing: exit 0 when the rebuilt copy equals the live one, 4 when it differs, listing table, key, column and kind of difference. Either way it first normalises any stored rows the live record has not caught up with |
+| `finstore load-capture --dir PATH [--dir PATH]...` | app | Loads API responses captured before the service existed. Loading twice loads once, and a capture older than what is already held never replaces newer data. A capture loaded while it was still running, then loaded again once it has finished, gets the completion of a finished fetch whose pages it already holds, without storing them again |
+| `finstore renormalise [--verify]` | owner | Rebuilds `core` from `raw`. With `--verify` it swaps nothing: exit 0 when the rebuilt copy equals the live one, 4 when it differs, listing table, key, column and kind of difference. Either way it first normalises any stored rows the live record has not caught up with, unless the live record was built by another normaliser revision: that one is left as it is, and the rows still waiting show as differences |
 | `finstore coverage [--json]` | app | Prints the coverage view |
 | `finstore healthcheck` | none | Exit 0 when the local server answers `/healthz` with 200, 1 otherwise |
 | `finstore version` | none | Version, commit and build date |
@@ -476,6 +531,12 @@ positive, and the balance is minus what is owed. The sign comes from the transac
 balances are recorded and nothing is compared, so `agent.coverage` reports no gaps for it and a
 wrong sign is caught only by reading its figures against the bank's app. A connect fetches a card's
 history from 2021-01-01, and a scheduled run the last 35 days.
+
+A card transaction's `running_balance` in `agent.transactions.detail` is the bank's own record and
+keeps the bank's sign. It is not flipped to the ledger's: the sign change that makes a purchase
+negative applies to `amount_minor` and to `agent.balances` (minus what is owed), never to
+`detail`. So do not compare a card's `detail` running balance with `agent.balances` without
+allowing for that, and never sum it with ledger amounts.
 
 Standing orders and direct debits ("mandates") have a view each, with one row per mandate per
 account:
@@ -720,16 +781,16 @@ metric value, a label or a log field; the log handler drops any field that is no
 | `finstore.sync.last_success.time` | `source` | Unix time of the last successful scheduled sync |
 | `finstore.sync.runs` (counter) | `source`, `kind`, `outcome`, and `error_category` on a run that recorded one | Runs finished. `error_category` is the fixed word the run's `sync.run` row carries (`rate_limited`, `timeout`, `history_failed` and so on), on Monzo runs as well as TrueLayer's, so one rule can count runs that ended for one reason |
 | `finstore.sync.run.duration` (histogram, seconds) | `source`, `kind`, `outcome` | How long a run took, with buckets from 1 s to 1 hour. A connect run that a restart ended (the process stopped before its fetch) was not timed and has no point |
-| `finstore.sync.last_run.ok` | `source`, `kind` | 1 when the newest finished run of that source and kind ended `ok`, 0 when it ended `partial` or `failed`. Kinds `hourly`, `nightly`, `sync`, `connect` and `backfill` only: an `import` or `capture` run is never published, failed or not. A run recorded with `error_category` `cancelled` is skipped, so a deploy never reads as a failure and the run before it stands. `cancelled` means the run's context was cancelled: `serve` stopping under it (whatever call it was in when it stopped), or a newer connect replacing a Monzo full-history fetch. A run that passed its own deadline is `timeout` and is a failure like any other: it reads 0 here. Published by the `status` job from the database, so it follows the next minute's run |
+| `finstore.sync.last_run.ok` | `source`, `kind` | 1 when the newest finished run of that source and kind ended `ok`, 0 when it ended `partial` or `failed`. Kinds `hourly`, `nightly`, `sync`, `connect` and `backfill` only: an `import` or `capture` run is never published, failed or not. A run recorded with `error_category` `cancelled` is skipped, so a deploy never reads as a failure and the run before it stands. `cancelled` means the run's context was cancelled: `serve` stopping under it (whatever call it was in when it stopped; only a category a stop can itself produce is rewritten to `cancelled`, so a `server_error`, `rate_limited`, `cards_refused` or `card_key_shared` the run had already recorded is kept), or a newer connect replacing a Monzo full-history fetch. A TrueLayer connect replaced mid-fetch is `partial` with `superseded` instead. Only the configured sources are read: Monzo, and the two TrueLayer connections when TrueLayer is configured, so a connection removed from the configuration stops alerting on the rows it left. A run that passed its own deadline is `timeout` and is a failure like any other: it reads 0 here. Published by the `status` job from the database, so it follows the next minute's run |
 | `finstore.sync.last_run.time` | `source`, `kind` | Unix time that run finished |
 | `finstore.sync.last_rate_limited.time` | `source` | Unix time the source's newest run that ended with `error_category` `rate_limited` finished. A source that never had one publishes nothing |
-| `finstore.consent.history_ok` | `source` | For a source whose current consent is `active`: 1 when a `connect` run (TrueLayer), `backfill` run (Monzo) or `capture` run (`load-capture`, which loads a captured full history; one that stored at least one response) ended `ok` at or after the consent's approval, 0 when none has, so older rows may be missing. It stays 0 after a `partial` fetch until a reconnect fetches the history. Nothing for a source with no active consent |
-| `finstore.connect.unanswered` | `source` | Connect attempts of that source that started in the last 24 hours and expired unused (the browser never reached the callback, or you abandoned the connect). A source that has had an attempt reads 0 once they are all older, or answered |
+| `finstore.consent.history_ok` | `source` | For a source whose current consent is `active`: 1 when a `connect` run (TrueLayer), `backfill` run (Monzo) or `capture` run (`load-capture`, which loads a captured full history; one that stored at least one response) ended `ok` at or after the consent's approval, 0 when none has, so older rows may be missing. It stays 0 after a `partial` fetch until a reconnect fetches the history. The series is dropped, not set to a value, when the source has no active current consent (lost, expired, replaced, or one still awaiting approval): a 0 left behind would keep History Missing firing beside Consent Lost, which already reports it, and the series returns with the next active consent |
+| `finstore.connect.unanswered` | `source` | Connect attempts of that source that started in the last 24 hours and expired unused (the browser never reached the callback, or you abandoned the connect). A source that has had an attempt reads 0 once they are all older, or answered. Only the configured sources are read, as for `last_run.ok` |
 | `finstore.bank.requests` (counter) | `source`, `endpoint`, `status_class` | Bank requests made. `status_class` is `2xx`, `4xx` and so on, or `none` for a request with no usable response. `none` here and `no_response` on `finstore.bank.request.duration` below mean the same thing; the two names differ because the counter's value is older and its published values do not change |
-| `finstore.bank.request.duration` (histogram, seconds) | `source`, `endpoint`, `status_class` | Duration of each bank attempt, retries included, with buckets from 50 ms to 30 s. An attempt with no usable HTTP response has `status_class` `no_response`: none arrived (a transport failure or a timeout), its body could not be read (it was cut off or over the 64 MiB limit) even though a status arrived, or the status was outside 100 to 599. The call then fails with the category `network` or `timeout`, as it does for the counter's `none` |
+| `finstore.bank.request.duration` (histogram, seconds) | `source`, `endpoint`, `status_class` | Duration of each bank attempt, retries included, with buckets from 50 ms to 30 s. An attempt with no usable HTTP response has `status_class` `no_response`: none arrived (a transport failure or a timeout), its body could not be read (it was cut off or over the 64 MiB limit) even though a status arrived, or the status was outside 100 to 599. When none arrived or the body could not be read, the call fails with the category `network` or `timeout`, as it does for the counter's `none`; a status outside the range keeps the category its status gives (600 to 999 read `server_error`, below 100 `unexpected_status`) |
 | `finstore.bank.retries` (counter) | `source`, `endpoint`, `reason` | Bank calls repeated, by `reason`: `rate_limited`, `server_error`, `timeout` or `network`. A token call is never repeated after a transport failure or a 5xx, so it never counts here for those |
 | `finstore.truelayer.optional_reads` (counter) | `source`, `endpoint`, `result` | TrueLayer reads whose answer never reaches the ledger (pending transactions, Monzo's card list, `/info`), by result: `ok`, `unsupported`, `refused`, `rate_limited` or `failed`. It also counts, on the standing orders and direct debits endpoints only, a scheduled sync's read that the bank refused with 403 `sca_exceeded`, as `sca_required` (see "Mandates and SCA" under TrueLayer above) |
-| `finstore.truelayer.cards_unlisted` | `source` | How many card accounts that have not ended the newest card list left out |
+| `finstore.truelayer.cards_unlisted` | `source` | How many card accounts that have not ended the newest card list left out. Set when a card list is applied, and seeded at start from the newest stored one (Lloyds only) |
 | `finstore.consent.state` | `source`, `state` | 1 for the current state, 0 for the others |
 | `finstore.consent.expiry.time` | `source` | Unix time the consent is expected to end |
 | `finstore.reconciliation.mismatch` | `account` | 1 while the account's last check failed or it has a statement gap |
@@ -887,9 +948,11 @@ means the release stuck, and a command holder is just a long command).
 | `finstore.consent.history_ok` is 0 | No `connect` (TrueLayer), `backfill` (Monzo) or `capture` (`load-capture`) run ended `ok` after the approval, so older rows are missing. The history is only offered just after approval | Reconnect from the status page |
 | `finstore.connect.unanswered` is above 0 | A connect attempt expired unused in the last 24 hours | Nothing if you abandoned it; it clears after 24 hours. Otherwise try again and watch the browser console: it never reached the callback |
 | A TrueLayer run ends `partial` with `rate_limited` | A fifth call of the day to one endpoint for one account was skipped, or TrueLayer answered 429 | Nothing: the next day's syncs catch up. Do not reconnect and sync by hand several times in a day |
-| A Lloyds connect run ends `partial` with `history_failed` | The full-history call of an account or a card failed (a refusal of a card read is `cards_refused` instead), the card list failed, or the service stopped before it ran | Reconnect from the status page |
+| A Lloyds connect run ends `partial` (or `failed`, when it lost its consent) with `history_failed` | The full-history call of an account or a card failed (a refusal of a card read is `cards_refused` instead), the card list failed, the consent was lost, the service stopped before it ran, or a restart found the consent awaiting approval with no run recorded | Reconnect from the status page |
+| A Lloyds connect run ends `partial` with `scopes_unknown` | `/data/v1/me` could not be read, even after one retry, so the granted scopes were unknown and the cards were not read | Reconnect from the status page once the bank answers. Accounts are unaffected |
+| A connect run ends `partial` with `superseded` | A newer connect replaced its consent while it was fetching | Nothing: the newer connect fetches instead |
 | A run ends `partial` with `cards_refused` | The bank refused a card read although `/me` lists `cards`. The consent is kept and the run made no further card call | Nothing breaks: accounts sync as usual. Check whether the bank offers cards on this consent; reconnecting may help. Cards simply stay as they were |
-| A run ends `partial` with `card_key_shared` | Two cards in one list share their last four digits, so both were skipped | Nothing finstore can do: the cards cannot be told apart by their number. Look at the cards at the bank |
+| A run ends `partial` with `card_key_shared` | Two cards in one list share their last four digits, so both were skipped | [Cards that share their last four](#cards-that-share-their-last-four) |
 | `finstore.truelayer.optional_reads` has result `sca_required` for the standing orders and direct debits endpoints | The bank only answers those two reads shortly after you authenticate at the bank, so every scheduled sync is refused (403 `sca_exceeded`) and only a connect reads them. Expected for Lloyds; it applies to any TrueLayer connection whose bank answers this way. The run stays `ok`, the stored mandates are kept, and they are as old as the last connect | Nothing. To refresh the mandates, reconnect from the status page |
 | `finstore.truelayer.optional_reads` has results `refused`, `failed` or `unsupported` for an endpoint | The bank does not honour a scope the consent lists, or the call keeps failing. The run is not marked partial by an optional read | Check the endpoint's results over several days: an endpoint with no `ok` for 48 hours is worth an alert, except the standing orders and direct debits endpoints, which a bank that needs recent authentication answers only at a connect (`sca_required`). A consent without `cards` makes no card call: reconnect to add it |
 | `finstore.truelayer.cards_unlisted` is above 0 | A card account that has not ended is missing from the newest card list, usually a replaced card | [End the old card's account](#ending-a-replaced-card) |

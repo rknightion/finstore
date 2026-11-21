@@ -28,6 +28,10 @@ type Row struct {
 	In, Out  int64
 	Bal      int64
 	PageEnds bool // the next row starts on a new page, under a repeated header
+	// NextPageCont is an optional second line of this row's description that is drawn at the
+	// top of the next page, straight under the repeated header and before any row starts there.
+	// It needs PageEnds.
+	NextPageCont string
 }
 
 // Statement is a made-up statement in the structure the real ones have: a
@@ -182,6 +186,10 @@ func (g *Statement) PDF() []byte {
 			furniture()
 			header(700)
 			y = 675
+			if r.NextPageCont != "" {
+				add(headerX[1], y, 9, r.NextPageCont)
+				y -= rowGap
+			}
 		}
 	}
 	add(57, y-10, 12, "Transaction types")

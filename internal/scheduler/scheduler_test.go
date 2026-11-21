@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -270,6 +271,28 @@ func TestObserverSeesShutdownAsCancelledNotError(t *testing.T) {
 	slices.Sort(finished)
 	if want := []string{"fails=error", "long=cancelled"}; !slices.Equal(finished, want) {
 		t.Errorf("finished = %v, want %v", finished, want)
+	}
+}
+
+// A job whose own deadline expires (a per-run timeout) while the scheduler is live is an error, not
+// cancelled: reading context.DeadlineExceeded as a cancellation would hide every real sync timeout
+// from the Scheduled Job Failed alert. Only the scheduler's own context ending makes a run cancelled.
+func TestJobWhoseOwnDeadlineExpiresWhileTheSchedulerIsLiveIsAnError(t *testing.T) {
+	obs := &recordingObserver{}
+	s := New(time.Now, slog.New(slog.DiscardHandler), obs)
+	s.Every("slow", time.Hour, 0, func(ctx context.Context) error {
+		ctx, cancel := context.WithTimeout(ctx, time.Millisecond)
+		defer cancel()
+		<-ctx.Done()
+		return fmt.Errorf("sync: %w", ctx.Err())
+	})
+	runUntil(t, s, func() bool {
+		_, fin := obs.snapshot()
+		return len(fin) >= 1
+	})
+	_, finished := obs.snapshot()
+	if want := []string{"slow=error"}; !slices.Equal(finished, want) {
+		t.Errorf("finished = %v, want %v: a job's own deadline is a failure, not a cancellation", finished, want)
 	}
 }
 

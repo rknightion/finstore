@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -74,8 +75,8 @@ type Options struct {
 	Location *time.Location
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
-	// Sleep pauses the auth client between retries of a rate-limited token call; nil means a real
-	// timer.
+	// Sleep pauses the auth client between retries of a rate-limited token call, and the approval
+	// between the attempts to read /me; nil means a real timer.
 	Sleep func(ctx context.Context, d time.Duration) error
 	// Tracer makes the spans of bank calls and runs; nil means none.
 	Tracer trace.Tracer
@@ -284,7 +285,7 @@ func (w *Worker) connect(ctx context.Context, consentID int64, pair tokenPair, r
 			return errTokenExpired
 		}
 		started = true
-		return w.runLocked(ctx, conn, runID, consentID, KindConnect, pair.access, me.Scopes)
+		return w.runLocked(ctx, conn, runID, consentID, KindConnect, pair.access, me.Scopes, !me.Read)
 	})
 	switch {
 	case !started:
@@ -303,12 +304,19 @@ func (w *Worker) abandonedCategory() string {
 	return categoryInterrupted
 }
 
+// consentReplaced reports whether consent id is no longer the source's current one, because a newer
+// connect replaced it. A consent that cannot be read is not reported replaced.
+func (w *Worker) consentReplaced(ctx context.Context, id int64) bool {
+	c, err := store.GetConsent(context.WithoutCancel(ctx), w.st.DB(), id)
+	return err == nil && (!c.IsCurrent || c.State == store.ConsentReplaced)
+}
+
 // abandonConnect ends connect run runID, whose fetch never ran, as partial: superseded when a newer
 // connect replaced consent id (that connect fetches instead), otherwise abandonedCategory.
 func (w *Worker) abandonConnect(ctx context.Context, runID, consentID int64, cause error) {
 	ctx = context.WithoutCancel(ctx)
 	cat := w.abandonedCategory()
-	if c, err := store.GetConsent(ctx, w.st.DB(), consentID); err == nil && (!c.IsCurrent || c.State == store.ConsentReplaced) {
+	if w.consentReplaced(ctx, consentID) {
 		cat = categorySuperseded
 	}
 	tally := &runTally{category: cat, partial: true}
@@ -325,29 +333,68 @@ func (w *Worker) abandonConnect(ctx context.Context, runID, consentID int64, cau
 		semconv.LogOutcome, outcomePartial, semconv.LogErrorCategory, cat, semconv.LogKind, category(cause))
 }
 
+// Reading /data/v1/me for an approval: a failed read is made once more after a short pause, so a
+// momentary failure does not leave the connect without its scopes.
+const (
+	meAttempts = 2
+	mePause    = 2 * time.Second
+)
+
+// pause waits d, or less when ctx ends first, which it returns.
+func (w *Worker) pause(ctx context.Context, d time.Duration) error {
+	if w.opts.Sleep != nil {
+		return w.opts.Sleep(ctx, d)
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
 // approve reads /data/v1/me under a meta fetch, with token when it is set and otherwise the stored
 // one, and makes consent id active until the expiry it reports, or for consent.Lifetime when the
-// call fails. It also returns what /me said (the zero meInfo when the call failed), so the connect
-// run can take its scopes from the consent it is running under.
+// call fails. A failed read is retried once (meAttempts), each attempt under a meta fetch of its
+// own. It also returns what /me said (meInfo.Read is false when no attempt answered), so the
+// connect run can take its scopes from the consent it is running under and end partial when it has
+// none.
 func (w *Worker) approve(ctx context.Context, id int64, token string) (store.Consent, meInfo, error) {
-	expiry := w.now().Add(consent.Lifetime)
+	var expiry time.Time
 	var read meInfo
 	err := w.st.HoldWriterLock(ctx, store.HolderTrueLayerApprove, func(ctx context.Context, _ *pgx.Conn) error {
-		fid, err := store.InsertFetch(ctx, w.st.DB(), store.Fetch{Source: w.source, Kind: kindMeta, StartedAt: w.now()})
-		if err != nil {
-			return err
-		}
-		me, err := w.api.me(withAccessToken(withFetch(ctx, fid), token))
-		switch {
-		case errors.Is(err, ErrConsentLost):
-			return err
-		case err != nil:
-			w.log.WarnContext(ctx, "truelayer consent expiry unknown: assuming 90 days", semconv.LogErrorCategory, category(err))
-		default:
-			read = me
-			if me.Expiry.After(w.now()) {
-				expiry = me.Expiry
+		var meErr error
+		for attempt := range meAttempts {
+			if attempt > 0 && w.pause(ctx, mePause) != nil {
+				break
 			}
+			fid, err := store.InsertFetch(ctx, w.st.DB(), store.Fetch{Source: w.source, Kind: kindMeta, StartedAt: w.now()})
+			if err != nil {
+				return err
+			}
+			var me meInfo
+			me, meErr = w.api.me(withAccessToken(withFetch(ctx, fid), token))
+			if meErr == nil {
+				read = me
+				read.Read = true
+				break
+			}
+			if errors.Is(meErr, ErrConsentLost) {
+				return meErr
+			}
+			if errors.Is(meErr, errDailyLimit) {
+				// The limit would refuse the retry as well.
+				break
+			}
+		}
+		expiry = w.now().Add(consent.Lifetime)
+		switch {
+		case meErr != nil:
+			w.log.WarnContext(ctx, "truelayer consent expiry unknown: assuming 90 days", semconv.LogErrorCategory, category(meErr))
+		case read.Expiry.After(w.now()):
+			expiry = read.Expiry
 		}
 		return nil
 	})
@@ -368,8 +415,9 @@ func (w *Worker) approve(ctx context.Context, id int64, token string) (store.Con
 // reconnect replaces) or interrupted for Monzo; a
 // current consent with no stored token ends lost with token_missing; and a current consent still
 // awaiting approval (a restart between the exchange and the approval) is approved in the
-// background with /data/v1/me, or 90 days if that fails. It must run before the worker does
-// anything else.
+// background with /data/v1/me, or 90 days if that fails; a Lloyds consent approved that way with no
+// connect run since its token was issued (the callback could not record one) gets a connect run
+// ended partial with history_failed first. It must run before the worker does anything else.
 func (w *Worker) Resume(ctx context.Context) (err error) {
 	ctx, end := telemetry.StartResume(ctx, w.opts.Tracer, w.source)
 	defer func() {
@@ -392,6 +440,7 @@ func (w *Worker) Resume(ctx context.Context) (err error) {
 		w.log.WarnContext(ctx, "truelayer connect run ended by a restart", semconv.LogRunID, id,
 			semconv.LogOutcome, outcomePartial, semconv.LogErrorCategory, tally.category)
 	}
+	w.seedCardsUnlisted(ctx)
 	cur, err := w.consents.Current(ctx, q)
 	if errors.Is(err, consent.ErrNoConsent) {
 		return nil
@@ -404,6 +453,9 @@ func (w *Worker) Resume(ctx context.Context) (err error) {
 		return err
 	}
 	if cur.State == store.ConsentAwaitingApproval {
+		if err := w.recordMissingConnectRun(ctx, cur.Consent); err != nil {
+			return err
+		}
 		id := cur.ID
 		// No link: this work starts no run span for a link to be carried to (the approval alone is
 		// not a run), so its writer lock, queries and bank call are their own traces.
@@ -418,6 +470,80 @@ func (w *Worker) Resume(ctx context.Context) (err error) {
 			}
 		})
 	}
+	return nil
+}
+
+// seedCardsUnlisted gives finstore.truelayer.cards_unlisted a value at start. The gauge is set when
+// the ledger applies a card list, which a restart would leave unset until the next run with the
+// cards scope, hours later, so an alert on it could not see a card that was already missing. The
+// count is the one the ledger makes for the newest stored card list: the unended card accounts the
+// list does not name. A source with no stored card list, or one that cannot be read, keeps no
+// value until its next list; a failure here never stops the start.
+func (w *Worker) seedCardsUnlisted(ctx context.Context) {
+	if w.opts.Connection != ConnLloyds {
+		return
+	}
+	missing, found, err := w.storedCardsUnlisted(ctx)
+	switch {
+	case err != nil:
+		w.log.WarnContext(ctx, "truelayer cards_unlisted not seeded", semconv.LogErrorCategory, category(err))
+	case found:
+		w.metrics.CardsUnlisted(ctx, w.source, missing)
+	}
+}
+
+// storedCardsUnlisted counts the unended card accounts the newest stored card list does not name,
+// as the ledger does when it applies a list, and reports false when no card list is stored.
+func (w *Worker) storedCardsUnlisted(ctx context.Context) (missing int, found bool, err error) {
+	body, found, err := store.NewestSuccessfulResponseBody(ctx, w.st.DB(), w.source, pathCards)
+	if err != nil || !found {
+		return 0, false, err
+	}
+	list, err := usableCards(body)
+	if err != nil {
+		return 0, false, err
+	}
+	core, err := store.NewCore(w.st.DB(), store.SchemaCore)
+	if err != nil {
+		return 0, false, err
+	}
+	held, err := core.UnendedCardKeys(ctx, w.source)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, key := range held {
+		if !slices.Contains(list.Keys, key) {
+			missing++
+		}
+	}
+	return missing, true, nil
+}
+
+// recordMissingConnectRun gives a Lloyds consent that is about to be approved by Resume, and that no
+// connect run has been recorded for since its token was issued, a connect run ended partial with
+// history_failed. HandleCallback records the run after the exchange; when that write failed, the
+// callback errored with the consent awaiting approval, and approving it with no run would lose the
+// full history (only the exchanged token gets it) with nothing to alert on. Monzo's connect has no
+// history to lose.
+func (w *Worker) recordMissingConnectRun(ctx context.Context, c store.Consent) error {
+	if w.opts.Connection != ConnLloyds {
+		return nil
+	}
+	q := w.st.DB()
+	has, err := store.HasRunSince(ctx, q, w.source, KindConnect, c.TokenIssuedAt)
+	if err != nil || has {
+		return err
+	}
+	runID, err := store.StartRun(ctx, q, w.source, KindConnect, w.now())
+	if err != nil {
+		return err
+	}
+	tally := &runTally{category: w.abandonedCategory(), partial: true}
+	if err := w.finishRun(ctx, runID, KindConnect, outcomePartial, tally); err != nil {
+		return err
+	}
+	w.log.WarnContext(ctx, "truelayer connect run recorded by a restart: the callback could not record it", semconv.LogRunID, runID,
+		semconv.LogOutcome, outcomePartial, semconv.LogErrorCategory, tally.category)
 	return nil
 }
 

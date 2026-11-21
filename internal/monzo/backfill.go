@@ -393,15 +393,32 @@ feed:
 	return firstErr
 }
 
+// runCategory is the error category a run that ended with outcome and tally category is recorded
+// with. A run that did not end ok on a context that was cancelled (serve stopping) is cancelled
+// when the category it holds is one a cancellation itself produces (a cut-off attempt reads
+// network, a stopped store call internal): the state gauges skip such a run, so a deploy never
+// reads as a failure. Every other category is a real finding of the run and is kept, so a deploy
+// landing mid-run cannot hide it: server_error, rate_limited, timeout and the rest.
+func runCategory(ctx context.Context, outcome, category string) string {
+	if outcome != outcomeOK && errors.Is(ctx.Err(), context.Canceled) && cancellationCategory(category) {
+		return categoryCancelled
+	}
+	return category
+}
+
+// cancellationCategory reports whether a run category is one that stopping the run can itself
+// produce, and so one that a cancelled context may rewrite to cancelled.
+func cancellationCategory(category string) bool {
+	switch category {
+	case "", "network", categoryCancelled, "internal":
+		return true
+	}
+	return false
+}
+
 // finishRun records the end of a run and counts it.
 func (w *Worker) finishRun(ctx context.Context, runID int64, kind, outcome string, tally *runTally) error {
-	category := tally.category
-	// A run that did not end ok on a context that was cancelled (serve stopping) is cancelled,
-	// whatever the interrupted call reported first (a cut-off attempt reads network): the state
-	// gauges skip such a run, so a deploy never reads as a failure.
-	if outcome != outcomeOK && errors.Is(ctx.Err(), context.Canceled) {
-		category = categoryCancelled
-	}
+	category := runCategory(ctx, outcome, tally.category)
 	var cat *string
 	if category != "" {
 		c := category

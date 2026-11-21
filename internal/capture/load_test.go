@@ -609,6 +609,107 @@ func TestLoadStoresAFinishedFetchWholeWhenSomeOfItsPagesWereLoadedBefore(t *test
 	}
 }
 
+// A capture loaded while it was still running holds every page it has, and no completion. If its
+// run.json later marks the fetch complete with no page added, every page is already held, but the
+// completion row is still owed: without it the period is reported as a gap for good. It is written
+// once, on the fetch that holds the pages, and neither the pages nor the fetch are stored again.
+func TestLoadWritesTheCompletionOnceWhenAllPagesAreHeldAndTheFetchIsNowComplete(t *testing.T) {
+	st := newStore(t)
+	since, before := "2026-01-01T00:00:00Z", "2026-03-01T00:00:00Z"
+	page1 := txPage("acc_made_up", since, before, at(1), `{"transactions":[{"id":"tx_a"}]}`)
+	page2 := txPage("acc_made_up", since, before, at(2), `{"transactions":[{"id":"tx_b"}]}`)
+
+	running := writeDir(t, []entry{page1, page2}, []rng{{Account: "acc_made_up", Since: since, Before: before, Pages: 2}})
+	res, err := loadAll(t, st, newProjector(t), running)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := count(t, st.DB()); res.FetchesCompleted != 0 || c.completions != 0 || c.responses != 2 || c.fetches != 1 {
+		t.Fatalf("after the capture that was still running: %+v, %+v, want 2 responses in 1 fetch and no completion", res, c)
+	}
+
+	finished := writeDir(t, []entry{page1, page2},
+		[]rng{{Account: "acc_made_up", Since: since, Before: before, Pages: 2, Complete: true}})
+	res, err = loadAll(t, st, newProjector(t), finished)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := count(t, st.DB())
+	if res.FetchesCompleted != 1 || res.ResponsesLoaded != 0 || res.ResponsesSkipped != 2 || c.completions != 1 || c.responses != 2 || c.fetches != 1 {
+		t.Fatalf("after the finished capture: %+v, %+v, want one completion on the fetch already held and nothing else stored", res, c)
+	}
+	var done *store.FetchComplete
+	for _, row := range rawRows(t, st) {
+		if row.Kind == store.RawFetchComplete {
+			done = row.FetchComplete
+		}
+	}
+	if done == nil || done.Pages != 2 || !done.CompletedAt.Equal(at(2)) {
+		t.Fatalf("completion row = %+v, want 2 pages completed at the last page's time", done)
+	}
+	if ok, err := store.FetchCompleted(context.Background(), st.DB(), done.FetchID); err != nil || !ok {
+		t.Fatalf("FetchCompleted = %v, %v", ok, err)
+	}
+
+	// Loaded again, it is complete already: nothing is written.
+	before3 := count(t, st.DB())
+	res, err = loadAll(t, st, newProjector(t), finished)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after := count(t, st.DB()); res.FetchesCompleted != 0 || after.fetches != before3.fetches ||
+		after.responses != before3.responses || after.completions != before3.completions {
+		t.Fatalf("a repeated load wrote %+v then %+v (%+v)", before3, after, res)
+	}
+}
+
+// When every page of a finished fetch is held but no single stored fetch holds exactly those
+// pages (they came from two earlier loads), the fetch is stored whole under a new fetch row and
+// completed there, as for a partly held one: a completion on either old fetch would speak for a
+// page it does not hold.
+func TestLoadStoresAFinishedFetchWholeWhenItsPagesAreHeldByDifferentFetches(t *testing.T) {
+	st := newStore(t)
+	since, before := "2026-01-01T00:00:00Z", "2026-03-01T00:00:00Z"
+	page1 := txPage("acc_made_up", since, before, at(1), `{"transactions":[{"id":"tx_a"}]}`)
+	page2 := txPage("acc_made_up", since, before, at(2), `{"transactions":[{"id":"tx_b"}]}`)
+	for _, p := range []entry{page1, page2} {
+		dir := writeDir(t, []entry{p}, []rng{{Account: "acc_made_up", Since: since, Before: before, Pages: 1}})
+		if _, err := loadAll(t, st, newProjector(t), dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c := count(t, st.DB()); c.fetches != 2 || c.responses != 2 || c.completions != 0 {
+		t.Fatalf("after the two partial loads: %+v", c)
+	}
+
+	finished := writeDir(t, []entry{page1, page2},
+		[]rng{{Account: "acc_made_up", Since: since, Before: before, Pages: 2, Complete: true}})
+	res, err := loadAll(t, st, newProjector(t), finished)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := count(t, st.DB()); res.FetchesCompleted != 1 || c.fetches != 3 || c.responses != 4 || c.completions != 1 {
+		t.Fatalf("after the finished capture: %+v, %+v, want a third fetch holding both pages, completed", res, c)
+	}
+	var completed int64
+	for _, row := range rawRows(t, st) {
+		if row.Kind == store.RawFetchComplete {
+			completed = row.FetchComplete.FetchID
+		}
+	}
+	if n, err := store.CountAPIResponses(context.Background(), st.DB(), completed); err != nil || n != 2 {
+		t.Fatalf("the completed fetch holds %d responses, %v, want both pages", n, err)
+	}
+	// And a further load changes nothing.
+	again := count(t, st.DB())
+	if _, err := loadAll(t, st, newProjector(t), finished); err != nil {
+		t.Fatal(err)
+	}
+	if after := count(t, st.DB()); after.fetches != again.fetches || after.responses != again.responses || after.completions != again.completions {
+		t.Fatalf("a repeated load wrote %+v then %+v", again, after)
+	}
+}
+
 // A request made to test where the bank's time limit falls is a /transactions response with no
 // window. It is not a page of any fetch: treating it as one rejected the whole directory, and
 // giving it a period would let a completion row mark real transactions as disappeared.

@@ -49,15 +49,17 @@ func (w *Worker) RunScheduled(ctx context.Context) error {
 		}
 		ctx, span := w.metrics.StartRun(ctx, w.opts.Tracer, w.source, KindSync, runID)
 		defer span.End()
-		return w.runLocked(ctx, conn, runID, c.ID, KindSync, "", nil)
+		return w.runLocked(ctx, conn, runID, c.ID, KindSync, "", nil, false)
 	})
 }
 
 // runLocked runs run runID, a connect or a scheduled run already recorded, under the writer lock
 // held on conn, within RunTimeout, and records its end. token, when set, is used for every call as
 // it is. scopes are the scopes the consent was granted as the connect's own approval read them
-// from /me; a scheduled run reads them from its own /me instead.
-func (w *Worker) runLocked(ctx context.Context, conn *pgx.Conn, runID, consentID int64, kind, token string, scopes []string) error {
+// from /me; a scheduled run reads them from its own /me instead. scopesUnknown is set on a connect
+// whose approval could not read /me even after a retry: a Lloyds run that is otherwise ok then ends
+// partial with scopes_unknown, so the skipped card reads are visible.
+func (w *Worker) runLocked(ctx context.Context, conn *pgx.Conn, runID, consentID int64, kind, token string, scopes []string, scopesUnknown bool) error {
 	q := w.st.DB()
 	rctx, cancel := context.WithTimeout(ctx, w.opts.RunTimeout)
 	defer cancel()
@@ -78,13 +80,32 @@ func (w *Worker) runLocked(ctx context.Context, conn *pgx.Conn, runID, consentID
 	case tally.partial:
 		outcome = outcomePartial
 	}
-	// A Lloyds connect that ended before every account's history arrived, for whatever reason, has
-	// lost the full history until a reconnect: history_failed is what alerts on that.
-	if kind == KindConnect && w.opts.Connection == ConnLloyds && !tally.historyComplete() {
+	// A connect that did not end ok because a newer connect replaced its consent (the callback
+	// cancels the older connect's work) did not fail: that connect fetches instead. It ends
+	// superseded whatever it was doing, and raises neither the history alert nor an error.
+	superseded := kind == KindConnect && outcome != outcomeOK && w.consentReplaced(ctx, consentID)
+	switch {
+	case superseded:
+		runErr = nil
+		outcome = outcomePartial
+		tally.supersede()
+	case kind == KindConnect && w.opts.Connection == ConnLloyds && !tally.historyComplete():
+		// A Lloyds connect that ended before every account's history arrived, for whatever reason,
+		// has lost the full history until a reconnect: history_failed is what alerts on that. A
+		// connect that lost its consent keeps the failed outcome, which is what happened to it (the
+		// consent row keeps why it was lost); every other such run is partial.
 		tally.failHistory()
+		if !errors.Is(runErr, ErrConsentLost) && !isAccessDenied(runErr) {
+			outcome = outcomePartial
+		}
+	}
+	if scopesUnknown && w.opts.Connection == ConnLloyds && outcome == outcomeOK {
+		// Nothing else went wrong, so nothing else says that the cards (and with them the card
+		// history older than a scheduled run reads) were never asked for.
+		tally.fail(categoryScopesUnknown)
 		outcome = outcomePartial
 	}
-	if isAccessDenied(runErr) {
+	if !superseded && isAccessDenied(runErr) {
 		w.markLost(ctx, consentID)
 		runErr = errors.Join(ErrConsentLost, runErr)
 	}
@@ -103,7 +124,7 @@ func (w *Worker) runLocked(ctx context.Context, conn *pgx.Conn, runID, consentID
 		w.metrics.CardsUnlisted(ctx, source, n)
 	}
 	w.log.InfoContext(ctx, "truelayer run finished", semconv.LogKind, kind, semconv.LogRunID, runID,
-		semconv.LogOutcome, outcome, semconv.LogErrorCategory, tally.category, semconv.LogRows, tally.rows)
+		semconv.LogOutcome, outcome, semconv.LogErrorCategory, runCategory(ctx, outcome, tally.category), semconv.LogRows, tally.rows)
 	return errors.Join(runErr, finishErr, okErr, projErr)
 }
 
@@ -409,18 +430,35 @@ func (w *Worker) history(ctx context.Context, runID int64, kind string, a listed
 	return nil
 }
 
+// runCategory is the error category a run that ended with outcome and tally category is recorded
+// with. A run that did not end ok on a context that was cancelled (serve stopping) is cancelled
+// when the category it holds is one a cancellation itself produces (a cut-off attempt reads
+// network, a stopped store call internal): the state gauges skip such a run, so a deploy never
+// reads as a failure. Every other category is a real finding of the run and is kept, so a deploy
+// landing mid-run cannot hide it: server_error, rate_limited, cards_refused, card_key_shared,
+// timeout, a Lloyds connect's history_failed (that history is lost until a reconnect and the
+// History Missing alert is for exactly that), and superseded (a newer connect replaced the
+// consent; its context here is already detached).
+func runCategory(ctx context.Context, outcome, category string) string {
+	if outcome != outcomeOK && errors.Is(ctx.Err(), context.Canceled) && cancellationCategory(category) {
+		return "cancelled"
+	}
+	return category
+}
+
+// cancellationCategory reports whether a run category is one that stopping the run can itself
+// produce, and so one that a cancelled context may rewrite to cancelled.
+func cancellationCategory(category string) bool {
+	switch category {
+	case "", "network", "cancelled", "internal":
+		return true
+	}
+	return false
+}
+
 // finishRun records the end of a run and counts it with its error category.
 func (w *Worker) finishRun(ctx context.Context, runID int64, kind, outcome string, tally *runTally) error {
-	category := tally.category
-	// A run that did not end ok on a context that was cancelled (serve stopping) is cancelled,
-	// whatever the interrupted call reported first (a cut-off attempt reads network): the state
-	// gauges skip such a run, so a deploy never reads as a failure. Two categories are kept: a
-	// connect that a newer connect replaced is superseded (its context here is already detached),
-	// and a Lloyds connect that stopped before its history arrived stays history_failed, because
-	// that history is lost until a reconnect and the History Missing alert is for exactly that.
-	if outcome != outcomeOK && category != categoryHistoryFailed && errors.Is(ctx.Err(), context.Canceled) {
-		category = "cancelled"
-	}
+	category := runCategory(ctx, outcome, tally.category)
 	var cat *string
 	if category != "" {
 		c := category

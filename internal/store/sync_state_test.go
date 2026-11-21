@@ -26,12 +26,19 @@ func finishedRun(t *testing.T, q store.DBTX, source, kind, outcome string, categ
 // captureRun records an ok Monzo capture run that stored rows responses, finished at finished.
 func captureRun(t *testing.T, q store.DBTX, rows int, finished time.Time) {
 	t.Helper()
+	captureRunOf(t, q, "monzo", "ok", rows, finished)
+}
+
+// captureRunOf records a capture run of source that ended with outcome after storing rows
+// responses, finished at finished.
+func captureRunOf(t *testing.T, q store.DBTX, source, outcome string, rows int, finished time.Time) {
+	t.Helper()
 	ctx := context.Background()
-	id, err := store.StartRun(ctx, q, "monzo", "capture", finished.Add(-time.Hour))
+	id, err := store.StartRun(ctx, q, source, "capture", finished.Add(-time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.FinishRun(ctx, q, id, store.RunResult{FinishedAt: finished, Outcome: "ok", Requests: rows, RowsSeen: rows}); err != nil {
+	if err := store.FinishRun(ctx, q, id, store.RunResult{FinishedAt: finished, Outcome: outcome, Requests: rows, RowsSeen: rows}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -75,13 +82,19 @@ func TestLatestRunsReportsTheNewestFinishedRunOfEachSourceAndKind(t *testing.T) 
 	finishedRun(t, q, "monzo", "backfill", "ok", nil, now.Add(-9*time.Hour))
 	finishedRun(t, q, "truelayer:ob-lloyds", "connect", "partial", nil, now.Add(-8*time.Hour))
 	finishedRun(t, q, "truelayer:ob-lloyds", "sync", "failed", nil, now.Add(-4*time.Hour))
+	// A source retired from the configuration keeps its rows and is not read: its failed sync would
+	// otherwise be the newest result of a source nothing syncs any more.
+	finishedRun(t, q, "truelayer:ob-monzo", "sync", "failed", nil, now.Add(-time.Hour))
 	// Statement imports and capture loads are operator commands: never reported, even failed.
 	finishedRun(t, q, "halifax", "import", "failed", nil, now.Add(-time.Hour))
 	finishedRun(t, q, "capture", "capture", "failed", nil, now.Add(-time.Hour))
 
-	got, err := store.LatestRuns(ctx, q)
+	got, err := store.LatestRuns(ctx, q, []string{"monzo", "truelayer:ob-lloyds"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if none, err := store.LatestRuns(ctx, q, nil); err != nil || len(none) != 0 {
+		t.Fatalf("LatestRuns with no configured source = %+v, %v, want nothing", none, err)
 	}
 	want := []store.LatestRun{
 		{Source: "monzo", Kind: "backfill", OK: true, FinishedAt: now.Add(-9 * time.Hour)},
@@ -111,7 +124,7 @@ func TestLatestRunsDoesNotSkipARunThatHitItsDeadline(t *testing.T) {
 	finishedRun(t, q, "monzo", "hourly", "ok", nil, now.Add(-2*time.Hour))
 	finishedRun(t, q, "monzo", "hourly", "failed", &timeout, now.Add(-time.Hour))
 
-	got, err := store.LatestRuns(context.Background(), q)
+	got, err := store.LatestRuns(context.Background(), q, []string{"monzo"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,14 +231,15 @@ func TestConsentHistoryCountsAnOkCaptureRunSinceApproval(t *testing.T) {
 		return out
 	}
 
-	// Monzo: a capture run from before the approval proves nothing, and neither does an hourly sync.
-	finishedRun(t, q, "monzo", "capture", "ok", nil, approved.Add(-time.Hour))
+	// Each negative case stored rows, so that only the condition under test can exclude it. Monzo: a
+	// capture run from before the approval proves nothing, and neither does an hourly sync.
+	captureRun(t, q, 801, approved.Add(-time.Hour))
 	activeConsent(t, q, "monzo", approved)
 	finishedRun(t, q, "monzo", "hourly", "ok", nil, approved.Add(time.Hour))
 	// Another source's ok capture run is not Monzo's, and a capture that did not end ok is no history.
 	activeConsent(t, q, "truelayer:ob-lloyds", approved)
-	finishedRun(t, q, "truelayer:ob-lloyds", "capture", "partial", nil, approved.Add(time.Hour))
-	finishedRun(t, q, "truelayer:ob-monzo", "capture", "ok", nil, approved.Add(time.Hour))
+	captureRunOf(t, q, "truelayer:ob-lloyds", "partial", 801, approved.Add(time.Hour))
+	captureRunOf(t, q, "truelayer:ob-monzo", "ok", 801, approved.Add(time.Hour))
 	if got := read(); len(got) != 2 || got["monzo"] || got["truelayer:ob-lloyds"] {
 		t.Fatalf("before an ok capture since approval: %v, want both false", got)
 	}
@@ -277,9 +291,9 @@ func TestUnansweredConnectsCountsExpiredAttemptsOfTheLastDay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	read := func(at time.Time) map[string]int {
+	read := func(at time.Time, sources ...string) map[string]int {
 		t.Helper()
-		rows, err := store.UnansweredConnects(ctx, q, at)
+		rows, err := store.UnansweredConnects(ctx, q, at, sources)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -289,7 +303,8 @@ func TestUnansweredConnectsCountsExpiredAttemptsOfTheLastDay(t *testing.T) {
 		}
 		return out
 	}
-	got := read(now)
+	all := []string{"monzo", "truelayer:ob-lloyds", "truelayer:ob-monzo"}
+	got := read(now, all...)
 	want := map[string]int{"monzo": 1, "truelayer:ob-lloyds": 0, "truelayer:ob-monzo": 0}
 	if len(got) != len(want) {
 		t.Fatalf("UnansweredConnects = %v, want %v", got, want)
@@ -300,7 +315,15 @@ func TestUnansweredConnectsCountsExpiredAttemptsOfTheLastDay(t *testing.T) {
 		}
 	}
 	// A day later the same attempt no longer counts, and its source reads 0.
-	if later := read(now.Add(25 * time.Hour)); later["monzo"] != 0 {
+	if later := read(now.Add(25*time.Hour), all...); later["monzo"] != 0 {
 		t.Errorf("monzo still counts an attempt from over 24 hours ago: %v", later)
+	}
+	// Only the configured sources are read: one retired from the configuration is not listed, so its
+	// attempts cannot alert for ever, and no configured source lists nothing.
+	if got := read(now, "monzo"); len(got) != 1 || got["monzo"] != 1 {
+		t.Errorf("UnansweredConnects for monzo only = %v, want just monzo: 1", got)
+	}
+	if got := read(now); len(got) != 0 {
+		t.Errorf("UnansweredConnects with no configured source = %v, want nothing", got)
 	}
 }

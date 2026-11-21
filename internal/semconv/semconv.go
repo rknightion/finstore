@@ -42,7 +42,8 @@ const (
 // record them; none is recorded yet except where noted.
 const (
 	// MetricBankRequestDuration is a histogram (s) of one bank attempt, by source, endpoint and
-	// status_class ("no_response" when the attempt got no HTTP response).
+	// status_class ("no_response" when the attempt got no usable HTTP response: none arrived, its
+	// body could not be read, or its status was outside 100 to 599).
 	MetricBankRequestDuration = "finstore.bank.request.duration"
 	// MetricBankRetries counts bank retries by source, endpoint and reason (AttrReason).
 	MetricBankRetries = "finstore.bank.retries"
@@ -257,8 +258,12 @@ const (
 	SpanUserName                  = "user.name"
 	SpanPgxOperationType          = "pgx.operation.type"
 	SpanPgxSQLState               = "pgx.sql_state"
-	// SpanPgxRowsAffected is a count; SpanPgxPrepareStmtName is "stmtcache_" and a hash of
-	// constant SQL (finstore never names a statement itself). Neither holds a value.
+	// SpanPgxRowsAffected is a count. SpanPgxPrepareStmtName is the name pgx gives a prepared
+	// statement: "stmtcache_" and a hash of the SQL on the native pool, but through pgx's stdlib
+	// adapter db.PrepareContext names the statement with the SQL text itself (stdlib/sql.go
+	// passes query as both name and SQL), the same string as db.query.text, so nothing new leaves
+	// the process. Finstore's SQL is constant text with its values as parameters, so neither holds a
+	// value.
 	SpanPgxRowsAffected    = "pgx.rows_affected"
 	SpanPgxPrepareStmtName = "pgx.prepare_stmt.name"
 	SpanProcessExitCode    = "process.exit.code"
@@ -389,7 +394,7 @@ var statusCategories = []string{
 	"forbidden_insufficient_permissions", "forbidden_verification_required", "bad_request",
 	"unexpected_status",
 	// Run categories (monzo, truelayer, consent).
-	"history_failed", "consent_lost", "superseded", "interrupted", "card_key_shared", "cards_refused",
+	"history_failed", "consent_lost", "superseded", "interrupted", "card_key_shared", "cards_refused", "scopes_unknown",
 	"window_closed", "timestamp_group_over_page", "backfill_started", "unexpected_body", "cancelled", "internal",
 	// Import and ledger rejections.
 	"check_failed", "account_mismatch", "unknown_format", "rejected_before",
