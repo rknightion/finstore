@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -39,14 +40,41 @@ var mcpSettings = []struct{ name, value string }{
 	{"temp_file_limit", "'1GB'"},
 }
 
+// MCPDrift counts what RoleMCP's per-role settings had drifted to when Bootstrap found them: the
+// role-wide settings (Role) and the per-database ones (Database) that differ from mcpSettings,
+// whether changed, added or removed. It carries counts only: a name or value a login chose is
+// never returned, so it can be reported without being trusted.
+type MCPDrift struct{ Role, Database int }
+
+// Any reports whether anything had drifted.
+func (d MCPDrift) Any() bool { return d.Role+d.Database > 0 }
+
+// BootstrapOption changes how Bootstrap runs.
+type BootstrapOption func(*bootstrapConfig)
+
+type bootstrapConfig struct{ onMCPDrift func(MCPDrift) }
+
+// WithMCPDriftReport calls fn, after the run has committed, when RoleMCP's settings had drifted from
+// mcpSettings. Bootstrap resets them as it always has; fn is how the caller reports that it had to.
+func WithMCPDriftReport(fn func(MCPDrift)) BootstrapOption {
+	return func(c *bootstrapConfig) { c.onMCPDrift = fn }
+}
+
 // Bootstrap connects as a superuser to the database named in superuserURL and creates the four
 // roles (the owner and the app with the two passwords, and the NOLOGIN agent and MCP roles), sets
 // RoleMCP's settings, gives the owner CREATE on the database (which creating and renaming
-// core_next needs) and creates the five schemas owned by the owner. Running it again changes
-// nothing but the two passwords: RoleMCP's login and password are left as EnableMCPLogin set them.
+// core_next needs) and creates the five schemas owned by the owner. It revokes TEMPORARY on the
+// database from PUBLIC and from the app, agent and MCP roles, so only the owner holds it. Running it
+// again changes nothing but the two passwords: RoleMCP's login and password are left as EnableMCPLogin
+// set them, and settings RoleMCP changed for itself are reset (see WithMCPDriftReport).
 //
 // Bootstrap must run before Migrate, whose grants name RoleMCP.
-func Bootstrap(ctx context.Context, superuserURL, ownerPassword, appPassword string) error {
+func Bootstrap(ctx context.Context, superuserURL, ownerPassword, appPassword string, opts ...BootstrapOption) error {
+	var cfg bootstrapConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+	var drift MCPDrift
 	if ownerPassword == "" || appPassword == "" {
 		return errors.New("store: bootstrap: both passwords must be set")
 	}
@@ -56,7 +84,7 @@ func Bootstrap(ctx context.Context, superuserURL, ownerPassword, appPassword str
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
 
-	return pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
 		// Serialise concurrent bootstraps: CREATE ROLE has no IF NOT EXISTS.
 		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", MigrateLockKey); err != nil {
 			return fmt.Errorf("store: bootstrap: lock: %w", err)
@@ -91,7 +119,8 @@ func Bootstrap(ctx context.Context, superuserURL, ownerPassword, appPassword str
 				return fmt.Errorf("store: bootstrap: %s role %s: %w", verb, r.name, err)
 			}
 		}
-		if err := bootstrapMCPRole(ctx, tx); err != nil {
+		var err error
+		if drift, err = bootstrapMCPRole(ctx, tx); err != nil {
 			return err
 		}
 		owner := pgx.Identifier{RoleOwner}.Sanitize()
@@ -99,8 +128,16 @@ func Bootstrap(ctx context.Context, superuserURL, ownerPassword, appPassword str
 		if err := tx.QueryRow(ctx, "SELECT current_database()").Scan(&db); err != nil {
 			return fmt.Errorf("store: bootstrap: current database: %w", err)
 		}
-		if _, err := tx.Exec(ctx, fmt.Sprintf("GRANT CREATE, CONNECT, TEMPORARY ON DATABASE %s TO %s",
-			pgx.Identifier{db}.Sanitize(), owner)); err != nil {
+		// TEMPORARY is granted to PUBLIC by default, which would let a direct login as finstore_mcp create
+		// temporary tables after turning read-only off (temp_file_limit does not bound them). Nothing
+		// but the owner (migrations, renormalise) needs it: the app, agent and MCP roles use no
+		// temporary table. Revoking it on every run also corrects a database bootstrapped before this.
+		dbID := pgx.Identifier{db}.Sanitize()
+		if _, err := tx.Exec(ctx, fmt.Sprintf("REVOKE TEMPORARY ON DATABASE %s FROM PUBLIC, %s, %s, %s",
+			dbID, pgx.Identifier{RoleApp}.Sanitize(), pgx.Identifier{RoleAgent}.Sanitize(), pgx.Identifier{RoleMCP}.Sanitize())); err != nil {
+			return fmt.Errorf("store: bootstrap: revoke temporary on database: %w", err)
+		}
+		if _, err := tx.Exec(ctx, fmt.Sprintf("GRANT CREATE, CONNECT, TEMPORARY ON DATABASE %s TO %s", dbID, owner)); err != nil {
 			return fmt.Errorf("store: bootstrap: grant database to owner: %w", err)
 		}
 		for _, s := range Schemas {
@@ -114,22 +151,39 @@ func Bootstrap(ctx context.Context, superuserURL, ownerPassword, appPassword str
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if drift.Any() && cfg.onMCPDrift != nil {
+		cfg.onMCPDrift(drift)
+	}
+	return nil
 }
 
 // bootstrapMCPRole creates RoleMCP when it is absent (NOLOGIN, no password), tightens its fixed
 // attributes when it exists, and sets its settings. An existing role keeps its LOGIN and password.
-func bootstrapMCPRole(ctx context.Context, tx pgx.Tx) error {
+// It returns what the settings had drifted to before it reset them.
+func bootstrapMCPRole(ctx context.Context, tx pgx.Tx) (MCPDrift, error) {
 	id := pgx.Identifier{RoleMCP}.Sanitize()
 	var exists bool
 	if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)", RoleMCP).Scan(&exists); err != nil {
-		return fmt.Errorf("store: bootstrap: look up role %s: %w", RoleMCP, err)
+		return MCPDrift{}, fmt.Errorf("store: bootstrap: look up role %s: %w", RoleMCP, err)
 	}
 	stmt := "ALTER ROLE " + id + " " + mcpAttrs
 	if !exists {
 		stmt = "CREATE ROLE " + id + " NOLOGIN " + mcpAttrs + " PASSWORD NULL"
 	}
 	if _, err := tx.Exec(ctx, stmt); err != nil {
-		return fmt.Errorf("store: bootstrap: configure role %s: %w", RoleMCP, err)
+		return MCPDrift{}, fmt.Errorf("store: bootstrap: configure role %s: %w", RoleMCP, err)
+	}
+	// Before anything is reset, compare what is stored with what mcpSettings says. A role created
+	// just now has none yet, which is not drift.
+	var drift MCPDrift
+	if exists {
+		var err error
+		if drift, err = mcpSettingsDrift(ctx, tx); err != nil {
+			return MCPDrift{}, err
+		}
 	}
 	// The role can change its own settings from a login (ALTER ROLE ... SET, also IN DATABASE, which
 	// a role-wide setting does not override), so start from none: first every per-database row, then
@@ -138,27 +192,59 @@ func bootstrapMCPRole(ctx context.Context, tx pgx.Tx) error {
 		JOIN pg_database d ON d.oid = s.setdatabase
 		WHERE s.setrole = (SELECT oid FROM pg_roles WHERE rolname = $1) AND s.setdatabase <> 0`, RoleMCP)
 	if err != nil {
-		return fmt.Errorf("store: bootstrap: list per-database settings of %s: %w", RoleMCP, err)
+		return MCPDrift{}, fmt.Errorf("store: bootstrap: list per-database settings of %s: %w", RoleMCP, err)
 	}
 	dbs, err := pgx.CollectRows(rows, pgx.RowTo[string])
 	if err != nil {
-		return fmt.Errorf("store: bootstrap: list per-database settings of %s: %w", RoleMCP, err)
+		return MCPDrift{}, fmt.Errorf("store: bootstrap: list per-database settings of %s: %w", RoleMCP, err)
 	}
 	for _, db := range dbs {
 		if _, err := tx.Exec(ctx, "ALTER ROLE "+id+" IN DATABASE "+pgx.Identifier{db}.Sanitize()+" RESET ALL"); err != nil {
-			return fmt.Errorf("store: bootstrap: reset settings of %s in %s: %w", RoleMCP, db, err)
+			return MCPDrift{}, fmt.Errorf("store: bootstrap: reset settings of %s in %s: %w", RoleMCP, db, err)
 		}
 	}
 	if _, err := tx.Exec(ctx, "ALTER ROLE "+id+" RESET ALL"); err != nil {
-		return fmt.Errorf("store: bootstrap: reset settings of %s: %w", RoleMCP, err)
+		return MCPDrift{}, fmt.Errorf("store: bootstrap: reset settings of %s: %w", RoleMCP, err)
 	}
 	for _, s := range mcpSettings {
 		// Names and values are constants in this file.
 		if _, err := tx.Exec(ctx, "ALTER ROLE "+id+" SET "+s.name+" = "+s.value); err != nil {
-			return fmt.Errorf("store: bootstrap: set %s on role %s: %w", s.name, RoleMCP, err)
+			return MCPDrift{}, fmt.Errorf("store: bootstrap: set %s on role %s: %w", s.name, RoleMCP, err)
 		}
 	}
-	return nil
+	return drift, nil
+}
+
+// mcpSettingsDrift compares RoleMCP's stored settings with mcpSettings. It counts, and never keeps
+// a name or value: a login chose them.
+func mcpSettingsDrift(ctx context.Context, tx pgx.Tx) (MCPDrift, error) {
+	var stored []string // "name=value", as ALTER ROLE ... SET wrote it
+	var perDatabase int
+	if err := tx.QueryRow(ctx, `SELECT coalesce(r.rolconfig, '{}'::text[]),
+		       (SELECT coalesce(sum(cardinality(s.setconfig)), 0)::int FROM pg_db_role_setting s
+		        WHERE s.setrole = r.oid AND s.setdatabase <> 0)
+		FROM pg_roles r WHERE r.rolname = $1`, RoleMCP).Scan(&stored, &perDatabase); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return MCPDrift{}, nil // not created yet
+		}
+		return MCPDrift{}, fmt.Errorf("store: bootstrap: read settings of %s: %w", RoleMCP, err)
+	}
+	have := make(map[string]string, len(stored))
+	for _, kv := range stored {
+		name, value, _ := strings.Cut(kv, "=")
+		have[name] = value
+	}
+	drift := MCPDrift{Database: perDatabase}
+	for _, s := range mcpSettings {
+		// The constants are written as SQL literals: strip the quotes of '15s' to compare with what
+		// the server stores.
+		if v, ok := have[s.name]; !ok || v != strings.Trim(s.value, "'") {
+			drift.Role++
+		}
+		delete(have, s.name)
+	}
+	drift.Role += len(have) // what is left was added
+	return drift, nil
 }
 
 // EnableMCPLogin connects as a superuser and gives RoleMCP a login with password, or, when password
