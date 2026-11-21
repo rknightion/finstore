@@ -440,7 +440,10 @@ func TestWorkerRestartedInsideTheWindowKeepsTheSameDeadline(t *testing.T) {
 
 func TestScheduledRunDoesNotStartWhileFullHistoryFetchIsInFlight(t *testing.T) {
 	t.Parallel()
-	h := newHarness(t, nil, nil)
+	// One range worker: it is the one parked in the retry pause below. With the default six, the
+	// other workers keep requesting their own ranges while it waits, and a request of theirs that
+	// lands between the snapshot and the count reads as the scheduled run's.
+	h := newHarness(t, nil, func(o *Options) { o.Concurrency = 1 })
 	now := h.fake.Now()
 	h.fake.AddAccount(monzotest.Account{ID: "acc_test_1", Type: "uk_retail", Created: now.AddDate(-1, 0, 0)})
 	generate(h, "acc_test_1", 300, now.AddDate(-1, 0, 0), now.Add(-time.Hour), 1)

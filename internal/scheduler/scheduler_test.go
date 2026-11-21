@@ -510,3 +510,86 @@ func TestNextDaily(t *testing.T) {
 		})
 	}
 }
+
+// Once runs its job a single time, after the jitter, and never again however long Run goes on.
+func TestOnceRunsASingleTimeAfterItsJitter(t *testing.T) {
+	s, clk, _ := newTest(t) // rnd gives the largest jitter
+	var once, ticks atomic.Int32
+	s.Once("catch-up", time.Minute, func(context.Context) error { once.Add(1); return nil })
+	s.Every("tick", time.Millisecond, 0, func(context.Context) error { ticks.Add(1); return nil })
+	runUntil(t, s, func() bool { return ticks.Load() >= 20 })
+	if got := once.Load(); got != 1 {
+		t.Fatalf("the once job ran %d times, want 1", got)
+	}
+	if d := clk.delaysCopy(); !slices.Contains(d, time.Minute) {
+		t.Fatalf("delays %v lack the once job's jitter of a minute", d)
+	}
+}
+
+func TestOnceWithoutJitterStartsAtOnce(t *testing.T) {
+	s, clk, _ := newTest(t)
+	var runs atomic.Int32
+	s.Once("catch-up", 0, func(context.Context) error { runs.Add(1); return nil })
+	runUntil(t, s, func() bool { return runs.Load() >= 1 })
+	if d := clk.delaysCopy(); len(d) != 1 || d[0] != 0 {
+		t.Fatalf("delays = %v, want one delay of zero", d)
+	}
+}
+
+func TestOnceRefusesANegativeJitter(t *testing.T) {
+	s, _, _ := newTest(t)
+	defer func() {
+		if recover() == nil {
+			t.Fatal("Once accepted a negative jitter")
+		}
+	}()
+	s.Once("bad", -time.Second, func(context.Context) error { return nil })
+}
+
+// PrevDaily is the slot a Daily job most recently had: at or before t, and with nextDaily it
+// brackets t, including around a change of clocks.
+func TestPrevDaily(t *testing.T) {
+	london := mustLoc(t, "Europe/London")
+	utc := func(s string) time.Time {
+		v, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	tests := []struct {
+		name         string
+		at           string
+		hour, minute int
+		want         string
+	}{
+		{"earlier today, summer", "2026-06-01T10:00:00Z", 3, 0, "2026-06-01T02:00:00Z"},
+		{"earlier today, winter", "2026-01-15T10:00:00Z", 3, 0, "2026-01-15T03:00:00Z"},
+		{"before today's slot goes to yesterday's", "2026-01-15T01:00:00Z", 3, 0, "2026-01-14T03:00:00Z"},
+		{"exactly on the slot is that slot", "2026-01-15T03:00:00Z", 3, 0, "2026-01-15T03:00:00Z"},
+		{"a second after the slot is that slot", "2026-01-15T03:00:01Z", 3, 0, "2026-01-15T03:00:00Z"},
+		{"the evening slot, after a morning one", "2026-01-15T07:00:00Z", 18, 20, "2026-01-14T18:20:00Z"},
+		{"on the day clocks go forward, after the slot", "2026-03-29T12:00:00Z", 3, 0, "2026-03-29T02:00:00Z"},
+		{"on the day clocks go forward, before the slot", "2026-03-29T00:10:00Z", 3, 0, "2026-03-28T03:00:00Z"},
+		{"on the day clocks go back, after the slot", "2026-10-25T12:00:00Z", 3, 0, "2026-10-25T03:00:00Z"},
+		{"on the day clocks go back, before the slot", "2026-10-25T00:10:00Z", 3, 0, "2026-10-24T02:00:00Z"},
+		{"time inside the spring gap, after it", "2026-03-29T12:00:00Z", 1, 30, "2026-03-29T01:30:00Z"},
+		{"time inside the spring gap, before it", "2026-03-29T01:00:00Z", 1, 30, "2026-03-28T01:30:00Z"},
+		{"repeated hour is its first occurrence", "2026-10-25T01:45:00Z", 1, 30, "2026-10-25T00:30:00Z"},
+		{"midnight across the change", "2026-03-29T00:30:00Z", 0, 0, "2026-03-29T00:00:00Z"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			at := utc(tc.at)
+			got := PrevDaily(at, tc.hour, tc.minute, london)
+			if !got.Equal(utc(tc.want)) {
+				t.Fatalf("PrevDaily(%s, %02d:%02d) = %s, want %s", tc.at, tc.hour, tc.minute,
+					got.UTC().Format(time.RFC3339), tc.want)
+			}
+			if next := nextDaily(got, tc.hour, tc.minute, london); !next.After(at) {
+				t.Fatalf("the slot after %s is %s, not after %s: the two do not bracket it", got.UTC().Format(time.RFC3339),
+					next.UTC().Format(time.RFC3339), tc.at)
+			}
+		})
+	}
+}

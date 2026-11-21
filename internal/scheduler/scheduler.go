@@ -51,6 +51,8 @@ type task struct {
 	job   Job
 	first func(now time.Time) time.Duration
 	next  func(start, end time.Time) time.Duration
+	// once makes the job run a single time, at first; next is not used.
+	once bool
 }
 
 // New returns a Scheduler that reads the time from now and logs to log. A non-nil obs is told of
@@ -119,6 +121,26 @@ func (s *Scheduler) Daily(name string, hour, minute int, loc *time.Location, jit
 	})
 }
 
+// Once runs job a single time, a random delay in [0, jitter] after Run starts, and never again. A
+// jitter of zero runs it at once. It is for work that makes up for a slot missed while the service
+// was down, which should not wait for the next one.
+func (s *Scheduler) Once(name string, jitter time.Duration, job Job) {
+	if jitter < 0 {
+		panic("scheduler: Once needs a non-negative jitter")
+	}
+	s.add(task{
+		name: name,
+		job:  job,
+		once: true,
+		first: func(time.Time) time.Duration {
+			if jitter == 0 {
+				return 0
+			}
+			return time.Duration(s.rnd(int64(jitter) + 1))
+		},
+	})
+}
+
 func (s *Scheduler) add(t task) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -183,6 +205,9 @@ func (s *Scheduler) loop(ctx context.Context, t task) {
 		s.lastTick = start
 		s.mu.Unlock()
 		s.runJob(ctx, t)
+		if t.once {
+			return
+		}
 		d = t.next(start, s.now())
 	}
 }
@@ -250,6 +275,19 @@ func (s *Scheduler) observeFinish(ctx context.Context, job string, finish func(s
 func (s *Scheduler) observerFailed(ctx context.Context, job, stage string) {
 	s.log.LogAttrs(ctx, slog.LevelError, "scheduler observer failed",
 		slog.String(semconv.LogKind, job), slog.String(semconv.LogState, stage))
+}
+
+// PrevDaily returns the latest start of hour:minute in loc that is at or before t: the slot a Daily
+// job registered for that time most recently had, whether or not it ran. It reads the day the same
+// way Daily does around a change of clocks.
+func PrevDaily(t time.Time, hour, minute int, loc *time.Location) time.Time {
+	y, m, d := t.In(loc).Date()
+	for i := range 3 {
+		if c := dayInstant(y, m, d-i, hour, minute, loc); !c.After(t) {
+			return c
+		}
+	}
+	panic(fmt.Sprintf("scheduler: no daily time at or before %v", t)) // unreachable: yesterday's is earlier
 }
 
 // nextDaily returns the first start of hour:minute in loc that is after t.
