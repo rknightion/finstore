@@ -13,6 +13,34 @@ import (
 	"github.com/rknightion/finstore/internal/telemetry"
 )
 
+// SyncMissedSince reports whether this connection has an approved consent that no successful run
+// has synced since slot, a scheduled sync time that has already passed: its newest successful run
+// (a connect counts) is before slot, or, when none has succeeded, so is the approval itself. It is
+// the start-up check for a slot the service missed. A connection with no consent, one awaiting
+// approval, a lost or expired consent, or an active one past its expected expiry has nothing to
+// catch up (RunScheduled ends the last of those), and the check makes no bank call and writes
+// nothing.
+func (w *Worker) SyncMissedSince(ctx context.Context, slot time.Time) (bool, error) {
+	cur, err := w.consents.Current(ctx, w.st.DB())
+	if errors.Is(err, consent.ErrNoConsent) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if cur.State != store.ConsentActive {
+		return false, nil
+	}
+	if cur.ExpectedExpiryAt != nil && !w.now().Before(*cur.ExpectedExpiryAt) {
+		return false, nil
+	}
+	last := cur.LastSyncOKAt
+	if last == nil {
+		last = cur.ApprovedAt
+	}
+	return last != nil && last.Before(slot), nil
+}
+
 // RunScheduled runs one scheduled sync: /me, /accounts, and for each account (Monzo pots
 // excluded) its standing orders and direct debits (a 403 sca_exceeded on those two keeps what is
 // stored and does not make the run partial, see mandateRead), and for Lloyds its transactions for the last
