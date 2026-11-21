@@ -3,6 +3,9 @@
 // Each job has its own goroutine, so a slow or failing job never delays another and a job never
 // overlaps itself. A panic or error in a job is logged by job name and outcome only (never the
 // panic value or error text, which could carry bank data) and the job runs again at its next slot.
+// A job that returns an error after the scheduler was told to stop is not a failure: its outcome is
+// cancelled, which is not logged as an error. A job whose own deadline expires while the scheduler
+// is live is an ordinary error.
 package scheduler
 
 import (
@@ -22,8 +25,12 @@ type Job func(ctx context.Context) error
 
 // Observer watches each job run. Start is called as a run begins, with the context the job would
 // receive, and returns the context to give the job (it may carry a span) and a function the
-// scheduler calls once the run has ended, with its outcome: ok, error or panic. A job's panic is
-// recovered before that call, so finish always runs.
+// scheduler calls once the run has ended, with its outcome: ok, error, panic or cancelled. cancelled
+// is a job that returned an error after the scheduler's context was cancelled (serve stopping); an
+// observer counts and times it but does not treat it as a failure, and must not record it as the
+// job's last outcome. A job whose own deadline expired while the scheduler was live is error. A
+// job's panic is recovered before that call, so finish always runs. Every run is logged as a
+// failure only for error and panic.
 type Observer interface {
 	Start(ctx context.Context, job string) (context.Context, func(outcome string))
 }

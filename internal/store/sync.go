@@ -41,15 +41,24 @@ func StartRun(ctx context.Context, q DBTX, source, kind string, startedAt time.T
 	return id, nil
 }
 
-// FinishRun records the end of run id.
+// FinishRun records the end of run id. A run that already has an end is left exactly as it is and
+// the call returns nil: the first end stands, so two paths that both try to end a run (a restart
+// and a late worker, say) cannot rewrite its outcome. It returns ErrNotFound only for a run that
+// does not exist.
 func FinishRun(ctx context.Context, q DBTX, id int64, r RunResult) error {
 	tag, err := q.Exec(ctx, `UPDATE sync.run SET finished_at = $2, outcome = $3, requests = $4, rows_seen = $5,
-		error_category = $6 WHERE id = $1`, id, r.FinishedAt, r.Outcome, r.Requests, r.RowsSeen, r.ErrorCategory)
+		error_category = $6 WHERE id = $1 AND finished_at IS NULL`, id, r.FinishedAt, r.Outcome, r.Requests, r.RowsSeen, r.ErrorCategory)
 	if err != nil {
 		return fmt.Errorf("store: finish run: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+		var exists bool
+		if err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM sync.run WHERE id = $1)`, id).Scan(&exists); err != nil {
+			return fmt.Errorf("store: finish run: %w", err)
+		}
+		if !exists {
+			return ErrNotFound
+		}
 	}
 	return nil
 }
@@ -67,6 +76,17 @@ func GetRun(ctx context.Context, q DBTX, id int64) (Run, error) {
 		return Run{}, fmt.Errorf("store: get run: %w", err)
 	}
 	return r, nil
+}
+
+// HasRunSince reports whether source has a run of kind that started at or after since, finished
+// or not.
+func HasRunSince(ctx context.Context, q DBTX, source, kind string, since time.Time) (bool, error) {
+	var has bool
+	if err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM sync.run WHERE source = $1 AND kind = $2 AND started_at >= $3)`,
+		source, kind, since).Scan(&has); err != nil {
+		return false, fmt.Errorf("store: has run since: %w", err)
+	}
+	return has, nil
 }
 
 // UnfinishedRuns returns the ids of source's runs of kind that recorded no end, oldest first: runs
@@ -426,16 +446,22 @@ type LatestRun struct {
 	FinishedAt time.Time
 }
 
-// LatestRuns returns, for each source and each of StateRunKinds that has one, its newest finished
-// run. A run that ended with error_category cancelled is skipped: its context was cancelled (serve
-// was stopped under it, or a newer connect replaced it), which says nothing about the bank, and the
-// run before it still stands. A run that passed its own deadline is category timeout and counts.
-// Ordered by source and kind.
-func LatestRuns(ctx context.Context, q DBTX) ([]LatestRun, error) {
+// LatestRuns returns, for each of the given sources and each of StateRunKinds that has one, its
+// newest finished run. Only the configured sources are read: a source that was retired from the
+// configuration (a TrueLayer connection removed) keeps its rows, and its last failed run would
+// otherwise alert for ever. A run that ended with error_category cancelled is skipped: its context
+// was cancelled (serve was stopped under it, or a newer connect replaced it), which says nothing
+// about the bank, and the run before it still stands. A run that passed its own deadline is
+// category timeout and counts. Ordered by source and kind.
+func LatestRuns(ctx context.Context, q DBTX, sources []string) ([]LatestRun, error) {
+	if len(sources) == 0 {
+		return nil, nil
+	}
 	rows, err := q.Query(ctx, `SELECT DISTINCT ON (source, kind) source, kind, outcome = 'ok', finished_at
 		FROM sync.run
-		WHERE finished_at IS NOT NULL AND kind = ANY($1) AND error_category IS DISTINCT FROM 'cancelled'
-		ORDER BY source, kind, finished_at DESC, id DESC`, StateRunKinds)
+		WHERE finished_at IS NOT NULL AND kind = ANY($1) AND source = ANY($2)
+		  AND error_category IS DISTINCT FROM 'cancelled'
+		ORDER BY source, kind, finished_at DESC, id DESC`, StateRunKinds, sources)
 	if err != nil {
 		return nil, fmt.Errorf("store: latest runs: %w", err)
 	}
@@ -515,13 +541,17 @@ type UnansweredConnect struct {
 	Count  int
 }
 
-// UnansweredConnects returns, for each source that has had a connect attempt, how many attempts
-// started within the 24 hours before now and expired unused. A source whose attempts are all
-// older reads 0, so a gauge that read 1 reads 0 again.
-func UnansweredConnects(ctx context.Context, q DBTX, now time.Time) ([]UnansweredConnect, error) {
+// UnansweredConnects returns, for each of the given sources that has had a connect attempt, how
+// many attempts started within the 24 hours before now and expired unused. A source whose attempts
+// are all older reads 0, so a gauge that read 1 reads 0 again. Only the configured sources are
+// read, so a retired source's unanswered attempts do not alert for ever.
+func UnansweredConnects(ctx context.Context, q DBTX, now time.Time, sources []string) ([]UnansweredConnect, error) {
+	if len(sources) == 0 {
+		return nil, nil
+	}
 	rows, err := q.Query(ctx, `SELECT source,
 			count(*) FILTER (WHERE outcome = 'expired' AND started_at > $1::timestamptz - interval '24 hours')
-		FROM sync.connect_attempt GROUP BY source ORDER BY source`, now)
+		FROM sync.connect_attempt WHERE source = ANY($2) GROUP BY source ORDER BY source`, now, sources)
 	if err != nil {
 		return nil, fmt.Errorf("store: unanswered connects: %w", err)
 	}

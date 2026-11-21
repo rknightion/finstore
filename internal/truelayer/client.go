@@ -206,9 +206,12 @@ func (a *api) get(ctx context.Context, c call) (*bankhttp.Response, error) {
 }
 
 // meInfo is what /data/v1/me reports about the consent: when it ends and the scopes it was granted.
+// Read is set by the worker when /me answered, so the zero meInfo of a failed read is told apart
+// from an answer that lists no scopes.
 type meInfo struct {
 	Expiry time.Time
 	Scopes []string
+	Read   bool
 }
 
 // me returns the consent's end and granted scopes as /data/v1/me reports them. It is an error when
@@ -357,11 +360,21 @@ func (t *runTally) fail(category string) {
 }
 
 // failHistory marks a connect run partial with categoryHistoryFailed, which outranks any category
-// recorded before: it is the one that alerts.
+// recorded before: it is the one that alerts. It sets the category and the partial mark only; the
+// run's outcome is the caller's to decide.
 func (t *runTally) failHistory() {
 	t.mu.Lock()
 	t.partial = true
 	t.category = categoryHistoryFailed
+	t.mu.Unlock()
+}
+
+// supersede marks a connect run partial with categorySuperseded, which outranks any category
+// recorded before: a newer connect replaced the consent the run was fetching for.
+func (t *runTally) supersede() {
+	t.mu.Lock()
+	t.partial = true
+	t.category = categorySuperseded
 	t.mu.Unlock()
 }
 
@@ -379,6 +392,10 @@ const (
 	// categoryCardsRefused marks a run in which the bank refused a card read: the consent is kept and the
 	// run makes no further card call.
 	categoryCardsRefused = "cards_refused"
+	// categoryScopesUnknown ends a Lloyds connect run whose /me could not be read, even after a retry:
+	// the granted scopes are unknown, so the cards were not read and their history older than the
+	// scheduled window is lost until the next reconnect.
+	categoryScopesUnknown = "scopes_unknown"
 )
 
 // category is the error category of err for logs and sync.run.

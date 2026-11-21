@@ -207,6 +207,32 @@ func TestReadRejectsTjWithoutItsOwnTm(t *testing.T) {
 	}
 }
 
+// A hidden string drawn before a visible one under the same Tm advances the text position by its
+// width, so the visible string would be reported at the Tm and not where it is drawn. Any new
+// position (a Tm, a Td, a new BT) makes it safe again.
+func TestReadRejectsAVisibleStringDrawnAfterAHiddenOneUnderTheSameTm(t *testing.T) {
+	for name, c := range map[string]string{
+		"hidden Tj then visible Tj":  "BT 1 0 0 1 5 5 Tm /F1 0.05 Tf (hidden)Tj /F1 9 Tf (a)Tj ET\n",
+		"hidden TJ then visible Tj":  "BT 1 0 0 1 5 5 Tm /F1 0.05 Tf [(hidden)] TJ /F1 9 Tf (a)Tj ET\n",
+		"two hidden then visible Tj": "BT 1 0 0 1 5 5 Tm /F1 0.05 Tf (h1)Tj (h2)Tj /F1 9 Tf (a)Tj ET\n",
+	} {
+		if err := read(c); !errors.Is(err, pdftext.ErrUnsupported) {
+			t.Errorf("%s: got %v, want ErrUnsupported", name, err)
+		}
+	}
+	for name, c := range map[string]string{
+		"hidden, then a new Tm":     "BT 1 0 0 1 5 5 Tm /F1 0.05 Tf (hidden)Tj /F1 9 Tf 1 0 0 1 5 5 Tm (a)Tj ET\n",
+		"hidden, then a Td":         "BT 1 0 0 1 5 5 Tm /F1 0.05 Tf (hidden)Tj 0 -12 Td /F1 9 Tf (a)Tj ET\n",
+		"visible, then hidden":      "BT 1 0 0 1 5 5 Tm /F1 9 Tf (a)Tj /F1 0.05 Tf (hidden)Tj ET\n",
+		"hidden in an earlier BT":   "BT 1 0 0 1 5 5 Tm /F1 0.05 Tf (hidden)Tj ET BT 1 0 0 1 5 5 Tm /F1 9 Tf (a)Tj ET\n",
+		"hidden, then another text": "BT 1 0 0 1 5 5 Tm /F1 0.05 Tf (hidden)Tj /F1 9 Tf 1 0 0 1 5 20 Tm (a)Tj ET\n",
+	} {
+		if err := read(c); err != nil {
+			t.Errorf("%s: %v, want it accepted: the visible string has a known position", name, err)
+		}
+	}
+}
+
 // Real statements draw a hidden label straight after each visible string, with no Tm of its own.
 // Refusing that refused every real statement; returning the label would put text in the table
 // that nobody can see.

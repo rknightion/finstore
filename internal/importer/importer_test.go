@@ -43,6 +43,9 @@ func assertRows(t *testing.T, st *importer.Statement, g *genStatement) {
 		if w.Cont != "" {
 			desc += " " + w.Cont
 		}
+		if w.NextPageCont != "" {
+			desc += " " + w.NextPageCont
+		}
 		if !got.Date.Equal(date) || got.Description != desc || got.Type != w.Type ||
 			got.MoneyIn != w.In || got.MoneyOut != w.Out || got.Balance != w.Bal || got.Key == "" {
 			t.Errorf("row %d: got %+v, want %+v", i+1, got, w)
@@ -116,6 +119,27 @@ func TestParseHalifaxPDFTwoPages(t *testing.T) {
 	g := newGen(50000, rows)
 	st := parseGen(t, g)
 	assertRows(t, st, g)
+	if err := importer.Check(st); err != nil {
+		t.Error(err)
+	}
+}
+
+// A description can run on past the foot of a page: its next line is the first thing under the
+// repeated table header on the next page, before any row has started there. It belongs to the row
+// it continues, and a further line under it chains on as usual.
+func TestParseHalifaxPDFContinuationAtTheTopOfTheNextPage(t *testing.T) {
+	rows := baseRows()
+	rows[1].PageEnds, rows[1].NextPageCont = true, "CONTINUES ON PAGE TWO"
+	rows[2].Cont = "AND ONE MORE"
+	g := newGen(50000, rows)
+	st := parseGen(t, g)
+	assertRows(t, st, g)
+	if got := st.Rows[1].Description; got != "EXAMPLE SHOP (TOWN) £5 OFF CONTINUES ON PAGE TWO" {
+		t.Errorf("row 2 description %q", got)
+	}
+	if got := st.Rows[2].Description; got != "FIXTURE UTILITY AND ONE MORE" {
+		t.Errorf("row 3 description %q", got)
+	}
 	if err := importer.Check(st); err != nil {
 		t.Error(err)
 	}

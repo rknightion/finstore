@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/rknightion/finstore/internal/config"
+	"github.com/rknightion/finstore/internal/importer/importertest"
 	"github.com/rknightion/finstore/internal/semconv"
 	"github.com/rknightion/finstore/internal/store"
 	"github.com/rknightion/finstore/internal/telemetry"
@@ -83,9 +84,9 @@ func TestStatusPublisherReportsTheDatabasesState(t *testing.T) {
 	run("", Bootstrap)
 	run("", Migrate)
 
-	// Two statement-fed accounts: one that expects imports, whose newest statement ends later than
-	// its newest transaction would suggest only through the statement's own dates, and one that
-	// expects none.
+	// Two statement-fed accounts: one that expects imports, whose newest statement ends (31 March)
+	// well after its newest transaction (9 March), so the metric tells the statement's date from
+	// the transaction's, and one that expects none.
 	run("", func(ctx context.Context, e Env) int {
 		return AccountAdd(ctx, e, AccountSpec{Slug: "bank-joint", Type: "joint", Currency: "GBP", Name: "made-up", ExpectsImports: true})
 	})
@@ -99,7 +100,15 @@ func TestStatusPublisherReportsTheDatabasesState(t *testing.T) {
 	run("", func(ctx context.Context, e Env) int {
 		return AccountAdd(ctx, e, AccountSpec{Slug: "bank-old", Type: "joint", Currency: "GBP", Name: "made-up", ExpectsImports: true})
 	})
-	for _, slug := range []string{"bank-joint", "bank-loan", "bank-old"} {
+	joint := importertest.New(0, []importertest.Row{
+		{Date: "01 Mar 30", Desc: "MADE-UP EMPLOYER", Type: "FPI", In: 1000},
+		{Date: "09 Mar 30", Desc: "MADE-UP REFUND", Type: "FPI", In: 1500},
+	})
+	joint.Start, joint.End = time.Date(2030, 3, 1, 0, 0, 0, 0, time.UTC), time.Date(2030, 3, 31, 0, 0, 0, 0, time.UTC)
+	run(string(joint.PDF()), func(ctx context.Context, e Env) int {
+		return Import(ctx, e, "bank-joint", FormatHalifaxPDF, "made-up.pdf")
+	})
+	for _, slug := range []string{"bank-loan", "bank-old"} {
 		run(statement, func(ctx context.Context, e Env) int { return Import(ctx, e, slug, FormatManualCSV, "made-up.csv") })
 	}
 	run("", func(ctx context.Context, e Env) int {
@@ -191,7 +200,8 @@ func TestStatusPublisherReportsTheDatabasesState(t *testing.T) {
 	want(semconv.MetricConsentExpiryTime, map[string]string{"source": "monzo"}, expiry.Unix())
 	want(semconv.MetricSyncLastSuccessTime, map[string]string{"source": "monzo"}, synced.Unix())
 	want(semconv.MetricReconciliationMismatch, map[string]string{"account": "bank-joint"}, 0)
-	want(semconv.MetricImportLastTime, map[string]string{"account": "bank-joint"}, time.Date(2030, 3, 9, 0, 0, 0, 0, time.UTC).Unix())
+	// The newest statement date, not the newest transaction date (9 March).
+	want(semconv.MetricImportLastTime, map[string]string{"account": "bank-joint"}, time.Date(2030, 3, 31, 0, 0, 0, 0, time.UTC).Unix())
 	if _, ok := value(semconv.MetricImportLastTime, map[string]string{"account": "bank-loan"}); ok {
 		t.Error("an account that expects no imports has an import time, so it would raise \"import due\"")
 	}

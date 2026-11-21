@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -402,6 +403,49 @@ func TestStatusPageShowsStatesDatesAndCountsButNoAmount(t *testing.T) {
 		if strings.Contains(body, amount) {
 			t.Errorf("page shows the amount %s", amount)
 		}
+	}
+}
+
+// A consent that has ended (lost or expired) has no expiry to look forward to: the page shows
+// neither the date it was expected to end nor a count of days left, which for an expired one
+// would be a negative number. An active consent shows both.
+func TestStatusPageShowsNoExpiryDateOrDaysLeftForALostOrExpiredConsent(t *testing.T) {
+	approved := time.Date(2030, 1, 2, 10, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		state              string
+		expiry             time.Time
+		days               int
+		wantDate, wantDays bool
+	}{
+		{state: store.ConsentActive, expiry: time.Date(2030, 4, 3, 11, 45, 0, 0, time.UTC), days: 41, wantDate: true, wantDays: true},
+		{state: store.ConsentLost, expiry: time.Date(2030, 5, 17, 8, 15, 0, 0, time.UTC), days: 57},
+		{state: store.ConsentExpired, expiry: time.Date(2030, 3, 9, 7, 5, 0, 0, time.UTC), days: -3},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			read := &fakeReader{sources: []store.SyncStatusRow{{
+				Source: "monzo", ConsentState: ptr(tc.state), ApprovedAt: &approved,
+				ExpectedExpiryAt: &tc.expiry, DaysToExpiry: ptr(tc.days), LastRunOutcome: ptr("ok"),
+			}}}
+			body := do(newServer(t, &fakeConn{}, read, nil), http.MethodGet, "/", signedIn(nil)).Body.String()
+			if !strings.Contains(body, "2030-01-02 10:00") || !strings.Contains(body, tc.state) {
+				t.Fatalf("page lacks the approval date or the state %q: %s", tc.state, body)
+			}
+			date := tc.expiry.Format("2006-01-02 15:04")
+			if got := strings.Contains(body, date); got != tc.wantDate {
+				t.Errorf("page shows the expiry date %q: %v, want %v", date, got, tc.wantDate)
+			}
+			days := fmt.Sprintf(">%d<", tc.days)
+			if got := strings.Contains(body, days); got != tc.wantDays {
+				t.Errorf("page shows the days left %q: %v, want %v", days, got, tc.wantDays)
+			}
+			// The rows are still there, with a dash, so the layout does not change with the state.
+			if !tc.wantDate && !strings.Contains(body, "<dt>Expected to end</dt><dd>none</dd>") {
+				t.Errorf("page does not show none for the expiry date: %s", body)
+			}
+			if !tc.wantDays && !strings.Contains(body, "<dt>Days left</dt><dd>none</dd>") {
+				t.Errorf("page does not show none for the days left: %s", body)
+			}
+		})
 	}
 }
 

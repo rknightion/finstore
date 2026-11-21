@@ -228,6 +228,81 @@ func TestTimestampGroupLargerThanAPageLeavesTheRangeUnfinishedWithoutAFetchCompl
 	h.requireAllLive("acc_test_1", rows[150:])
 }
 
+// A range that was left at an id cursor is resumed from that id, and the rows the bank skips by
+// stepping past the cursor's timestamp group are not known: even when every page of the resumed
+// listing arrives, the fetch gets no raw.fetch_complete and the range stays unfinished, because
+// the ledger would mark the unlisted rows of its period disappeared.
+func TestResumingARangeFromATransactionIDCursorWritesNoFetchComplete(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil, func(o *Options) { o.Concurrency = 1 })
+	now := h.fake.Now()
+	h.fake.AddAccount(monzotest.Account{ID: "acc_test_1", Type: "uk_retail", Created: now.AddDate(0, -2, 0)})
+	// Two groups: 150 rows at one instant, then 100 at another, as in the test above.
+	rows := h.fake.GenerateTransactions("acc_test_1", 250, now.AddDate(0, -1, 0), now.AddDate(0, 0, -1), 150)
+	h.connect(nil)
+
+	var cursor string
+	for _, w := range h.windows("acc_test_1") {
+		if w.CompletedAt == nil && w.Cursor != nil {
+			cursor = *w.Cursor
+		}
+	}
+	if _, isTime := parseTime(cursor); cursor == "" || isTime {
+		t.Fatalf("the first run left the unfinished range at %q, want a transaction id: the scenario does not resume from an id", cursor)
+	}
+	fetchesBefore := map[int64]bool{}
+	for _, r := range h.rawRows() {
+		if r.Kind == store.RawFetch {
+			fetchesBefore[r.Fetch.ID] = true
+		}
+	}
+
+	h.fake.Advance(time.Hour)
+	from := len(h.fake.Requests())
+	h.connect(nil)
+
+	// The resumed fetch is the new one whose first /transactions request asked since the id.
+	var resumed []int64
+	for _, r := range h.rawRows() {
+		if r.Kind != store.RawFetch || fetchesBefore[r.Fetch.ID] {
+			continue
+		}
+		resp, err := store.APIResponsesForFetch(context.Background(), h.st.DB(), r.Fetch.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range resp {
+			var p map[string]any
+			if err := json.Unmarshal(a.Params, &p); err != nil {
+				t.Fatal(err)
+			}
+			if a.Endpoint == pathTransactions {
+				if since, _ := p["since"].(string); since == cursor {
+					resumed = append(resumed, r.Fetch.ID)
+				}
+				break
+			}
+		}
+	}
+	if len(resumed) != 1 {
+		t.Fatalf("%d fetches resumed from the id cursor %q, want 1 (%d /transactions requests in the second run)",
+			len(resumed), cursor, len(h.txRequests(from)))
+	}
+	if seq, ok := completionSeqs(h.rawRows())[resumed[0]]; ok {
+		t.Fatalf("the fetch resumed from an id cursor was completed (raw seq %d)", seq)
+	}
+	for _, w := range h.windows("acc_test_1") {
+		if w.Cursor != nil && *w.Cursor == cursor && w.CompletedAt != nil {
+			t.Fatalf("range %v..%v was completed by a fetch that resumed from an id", w.PeriodStart, w.PeriodEnd)
+		}
+	}
+	run := h.lastRun(kindBackfill)
+	if run.Outcome == nil || *run.Outcome != outcomePartial || run.ErrorCategory == nil || *run.ErrorCategory != categoryTimestampGroup {
+		t.Fatalf("run = %v %v, want partial %s", run.Outcome, run.ErrorCategory, categoryTimestampGroup)
+	}
+	h.requireAllLive("acc_test_1", rows[150:])
+}
+
 // slowHistory adds an account with enough history that fetching it takes several minutes of
 // fake time when every request advances the clock.
 func slowHistory(h *harness) []monzotest.Transaction {

@@ -173,10 +173,11 @@ func tlEnv(t *testing.T, super, monzoURL, tlURL string) config.Config {
 	return cfg
 }
 
-// logIDs matches the trace and span ids a log line carries. They are random hex and hold no data,
-// but a four digit marker (the tail of an account number) can occur inside one by chance, so the
-// marker check leaves them out. Nothing else in the log is skipped.
-var logIDs = regexp.MustCompile(`"(?:trace_id|span_id)":"[0-9a-f]+"`)
+// logIDs matches the trace and span ids a log line carries, and its timestamp. The ids are random
+// hex and the timestamp's nanoseconds are as good as random; neither holds data, but a four digit
+// marker (the tail of an account number) can occur inside one by chance, so the marker check
+// leaves them out. Nothing else in the log is skipped.
+var logIDs = regexp.MustCompile(`"(?:trace_id|span_id)":"[0-9a-f]+"|"time":"\d{4}-\d{2}-\d{2}T[0-9:.]+(?:Z|[+-]\d{2}:\d{2})"`)
 
 // TestTrueLayerEndToEnd drives the service with both TrueLayer connections configured, through
 // the real ledger and store, the HTTP routes and both fakes: a consent left with no token at

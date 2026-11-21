@@ -438,11 +438,25 @@ func TestStatusOutsideTheHTTPRangeIsNoResponse(t *testing.T) {
 		}
 	}
 	b := newTracedBank(t, []int{600}, `{}`, spanRules, "", WithoutRetries())
-	if _, err := b.c.Do(t.Context(), Request{Method: "GET", Path: "/accounts"}); err == nil {
-		t.Fatal("a 600 was a success")
+	_, err := b.c.Do(t.Context(), Request{Method: "GET", Path: "/accounts"})
+	var e *Error
+	if !errors.As(err, &e) {
+		t.Fatalf("a 600 was a success or not an Error: %v", err)
+	}
+	// The status class says no_response, but a status did arrive: the call's category follows the
+	// status (600 to 999 are server_error), not the transport failures network and timeout.
+	if e.Category != CategoryServerError || e.Status != 600 {
+		t.Errorf("a 600 failed with category %q status %d, want server_error 600", e.Category, e.Status)
 	}
 	if got := b.obs.attempts; len(got) != 1 || got[0] != (observedAttempt{"/accounts", semconv.StatusClassNoResponse}) {
 		t.Errorf("attempts = %v, want one no_response", got)
+	}
+	// A status below 100 cannot be sent by a real server; the classifier reads it as an unexpected
+	// status, again not a transport category.
+	for status, want := range map[int]Category{99: CategoryUnexpectedStatus, 999: CategoryServerError} {
+		if got := classify(Request{Method: "GET", Path: "/accounts"}, &Response{Status: status}).Category; got != want {
+			t.Errorf("classify(status %d) = %q, want %q", status, got, want)
+		}
 	}
 }
 

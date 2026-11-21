@@ -1,6 +1,13 @@
 // Package bankhttp is the only HTTP client the service may use to talk to a
 // bank. It sends nothing that is not on its allow-list, records responses
 // through an injected Recorder, and reports failures as categories only.
+//
+// The client's own retries (429, 5xx and transport failures) can be turned off with
+// WithoutRetries, which makes one call one attempt of this package. They cannot stop the standard
+// library's: net/http re-sends an idempotent request (every GET the allow-lists hold) on its own
+// when a reused idle connection turns out to have been closed by the peer before any response
+// arrived. The bank may therefore see a read twice for one call, and a caller that counts calls
+// against a limit counts one fewer than the bank may have received.
 package bankhttp
 
 import (
@@ -213,8 +220,9 @@ func WithTimeouts(connect, request time.Duration) Option {
 // token may have been spent.
 func WithTokenPath(path string) Option { return func(c *Client) { c.tokenPath = path } }
 
-// WithoutRetries turns off every retry (429, 5xx and transport failures), so
-// one call is exactly one attempt.
+// WithoutRetries turns off every retry of this package (429, 5xx and transport failures), so
+// one call is exactly one attempt of the client. It does not stop net/http re-sending an
+// idempotent request on a closed idle connection (see the package documentation).
 func WithoutRetries() Option { return func(c *Client) { c.retries = false } }
 
 // WithClock overrides the clock.
@@ -231,7 +239,8 @@ func WithSleep(sleep func(ctx context.Context, d time.Duration) error) Option {
 // path.
 type Observer interface {
 	// Attempt reports one attempt: statusClass is "2xx", "4xx" and so on, or "no_response" when
-	// the attempt got no HTTP response; d is how long it took.
+	// the attempt got no usable HTTP response (none arrived, its body could not be read, or its
+	// status was outside 100 to 599); d is how long it took.
 	Attempt(ctx context.Context, endpoint, statusClass string, d time.Duration)
 	// Retry reports that the call is being repeated: reason is rate_limited, server_error,
 	// timeout or network.
@@ -376,8 +385,8 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 // do is Do's retry loop for a request the allow-list accepted.
 func (c *Client) do(ctx context.Context, req Request, rule Rule) (*Response, error) {
 	isToken := req.Method == tokenMethod && req.Path == c.tokenPath
-	// What leaves the package names the rule's path: a template's concrete path
-	// holds an id from a bank response.
+	// The request parameters the caller attached with WithRequestParams go to the Recorder with
+	// every response. What leaves the package names the rule's path, never the concrete one.
 	params := requestParams(ctx)
 
 	var n429, n5xx, nNet int

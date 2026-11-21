@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,6 +63,45 @@ func TestShutdownDuringARunRecordsItCancelled(t *testing.T) {
 	}
 }
 
+// The run-finished log line carries the category the row, the counter and the span record. Here the
+// first thing to go wrong is a dropped connection (network) and serve then stops mid-run, so the
+// row says cancelled; the line must not say network.
+func TestRunFinishedLogLineCarriesTheCategoryAfterTheCancelledRewrite(t *testing.T) {
+	h := newHarness(t)
+	h.lloydsFixture()
+	w := h.worker(ConnLloyds, nil)
+	h.connect(w)
+	h.fake.Advance(24 * time.Hour)
+
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	hook := func(rw http.ResponseWriter, r *http.Request) bool {
+		switch templateOf(r.URL.Path) {
+		case pathStandingOrders:
+			if conn, _, err := rw.(http.Hijacker).Hijack(); err == nil {
+				_ = conn.Close()
+			}
+			return true
+		case pathTransactions:
+			stop()
+			time.Sleep(50 * time.Millisecond)
+		}
+		return false
+	}
+	h.onRequest.Store(&hook)
+	if err := w.RunScheduled(ctx); err == nil {
+		t.Fatal("a run stopped mid-fetch reported no error")
+	}
+	run := h.lastRun(Source(ConnLloyds))
+	if run.ErrorCategory == nil || *run.ErrorCategory != "cancelled" {
+		t.Fatalf("run category %v, want cancelled", run.ErrorCategory)
+	}
+	lines := h.logs.attrs("truelayer run finished")
+	if len(lines) == 0 || !strings.Contains(lines[len(lines)-1], "error_category=cancelled ") {
+		t.Fatalf("run-finished log lines = %q, want the last to carry error_category=cancelled", lines)
+	}
+}
+
 // The category recorded for a run that did not end ok follows the context it ran in: when that
 // was cancelled (serve stopping) the run is cancelled, even if the first thing to go wrong was a
 // cut-off bank call that reported network. An ok run is never rewritten, and a run on a context
@@ -106,5 +146,48 @@ func TestFinishRunOfACancelledContextRecordsCancelled(t *testing.T) {
 	}
 	if got := finish(expired, outcomePartial, "timeout"); got != "timeout" {
 		t.Errorf("run on a context past its deadline = %q, want timeout", got)
+	}
+}
+
+// Only a category that stopping the run can itself produce (network, cancelled, internal, or none)
+// is rewritten to cancelled when serve stops mid-run. A real finding earlier in the run is kept, so
+// a deploy landing mid-run cannot turn a server error, a rate limit or a refused card read into a
+// cancelled run that the state gauges skip.
+func TestFinishRunOfACancelledContextKeepsARealFinding(t *testing.T) {
+	h := newHarness(t)
+	w := h.worker(ConnLloyds, nil)
+	cancelled, stop := context.WithCancel(context.Background())
+	stop()
+	for cat, want := range map[string]string{
+		"network":             "cancelled",
+		"cancelled":           "cancelled",
+		"internal":            "cancelled",
+		"":                    "cancelled",
+		"server_error":        "server_error",
+		categoryRateLimited:   categoryRateLimited,
+		categoryCardsRefused:  categoryCardsRefused,
+		categoryCardKeyShared: categoryCardKeyShared,
+		categorySuperseded:    categorySuperseded,
+		"timeout":             "timeout",
+		categoryConsentLost:   categoryConsentLost,
+	} {
+		id, err := store.StartRun(context.Background(), h.st.DB(), Source(ConnLloyds), KindSync, h.fake.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.finishRun(cancelled, id, KindSync, outcomePartial, &runTally{category: cat, partial: true}); err != nil {
+			t.Fatal(err)
+		}
+		r, err := store.GetRun(context.Background(), h.st.DB(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := ""
+		if r.ErrorCategory != nil {
+			got = *r.ErrorCategory
+		}
+		if got != want {
+			t.Errorf("partial %q run on a cancelled context = %q, want %q", cat, got, want)
+		}
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,16 @@ const Superuser = "finstore_super"
 
 // Database is the database Start creates for the test.
 const Database = "finstore"
+
+// Timeouts. A start waits for the server to accept connections for startTimeoutSeconds, which a
+// loaded machine running every package's tests in parallel can need well over 15 s for; commandTimeout
+// bounds each helper command and must outlast the longest wait it makes, so the command is never
+// killed while pg_ctl is still waiting.
+const (
+	startTimeoutSeconds = 60
+	stopTimeoutSeconds  = 30
+	commandTimeout      = 2 * time.Minute
+)
 
 // Start starts a private cluster and returns a pgx URL for Superuser on Database, over a Unix
 // socket with TCP disabled. Authentication is trust, so any role in the cluster can connect
@@ -44,7 +55,7 @@ func Start(t testing.TB) string {
 	data := filepath.Join(root, "data")
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	execute := func(name string, args ...string) (string, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, bins[name], args...) // #nosec G204 -- binaries found on PATH, fixed arguments
 		// Do not let a developer's PG environment redirect utility connections.
@@ -66,11 +77,11 @@ func Start(t testing.TB) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if out, err := execute("pg_ctl", "-D", data, "-m", "immediate", "-w", "-t", "10", "stop"); err != nil {
+		if out, err := execute("pg_ctl", "-D", data, "-m", "immediate", "-w", "-t", strconv.Itoa(stopTimeoutSeconds), "stop"); err != nil {
 			t.Errorf("stop native PostgreSQL: %v\n%s", err, out)
 		}
 	})
-	if out, err := execute("pg_ctl", "-D", data, "-l", filepath.Join(root, "server.log"), "-w", "-t", "15", "start"); err != nil {
+	if out, err := execute("pg_ctl", "-D", data, "-l", filepath.Join(root, "server.log"), "-w", "-t", strconv.Itoa(startTimeoutSeconds), "start"); err != nil {
 		log, _ := os.ReadFile(filepath.Join(root, "server.log")) // #nosec G304 -- our own temporary directory
 		t.Fatalf("start native PostgreSQL: %v\n%s\n%s", err, out, log)
 	}

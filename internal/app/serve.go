@@ -323,7 +323,11 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 		hooks.Listening(ln.Addr())
 	}
 
-	status := &statusPublisher{st: st, m: metrics, log: log, dumpFile: cfg.DumpStatusFile, now: e.now}
+	statusSources := []string{monzo.Source}
+	for _, tw := range tlWorkers {
+		statusSources = append(statusSources, tw.Source())
+	}
+	status := &statusPublisher{st: st, m: metrics, log: log, dumpFile: cfg.DumpStatusFile, now: e.now, sources: statusSources}
 	sched := scheduler.New(e.now, log, metrics.SchedulerObserver(providers.Tracer(semconv.ServiceName)))
 	if !hooks.NoSchedule {
 		sched.Every("status", statusInterval, 0, status.run)

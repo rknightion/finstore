@@ -213,6 +213,13 @@ func TestRenormaliseOverAnOlderRevisionCoreSkipsTheLiveCatchUp(t *testing.T) {
 	if diffs := e.renormalise(true); len(diffs) == 0 {
 		t.Fatal("verify over a reshaped core reported no difference")
 	}
+	// Verify changes nothing in the live record: the waiting row is not projected into it.
+	if ps, err := e.core().GetProjectionState(ctx); err != nil || ps.NormaliserRev != ledger.NormaliserRev-1 || ps.LastSeq >= e.maxRawSeq() {
+		t.Fatalf("live projection state after verify %+v, %v: the waiting row was projected into it", ps, err)
+	}
+	if _, err := e.core().GetAccountBySlug(ctx, "fake-current-2"); err == nil {
+		t.Fatal("verify projected the waiting account into the live record")
+	}
 	e.renormalise(false)
 	if a := e.account("fake-current-2"); a.BankRef == nil || *a.BankRef != refB {
 		t.Fatalf("the unprojected account after the swap: %+v", a)

@@ -209,7 +209,9 @@ func parsePeriod(s string) (start, end time.Time, ok bool) {
 //
 // A line with text only in the description column continues the current row
 // when it is on the same page as that row's last line and no more than
-// maxContinuationGap points below it. Any other description-only line inside
+// maxContinuationGap points below it, or when it is the first line of the
+// table on the next page (straight under the repeated header, before any row
+// has started there): a description may run on past the foot of a page. Any other description-only line inside
 // the table is an error, not furniture to skip: it may be a continuation in a
 // changed layout, and dropping or misattaching it would silently change a
 // row's description and so its key.
@@ -223,13 +225,16 @@ func parseTable(lines []line) ([]Row, error) {
 		// lastPage and lastY locate the current row's last line.
 		lastPage int
 		lastY    float64
+		// topOfPage is true from a header row until the next line of its table: the only place
+		// where a continuation may come from the previous page.
+		topOfPage bool
 	)
 	for _, l := range lines {
 		if l.page != page {
 			page, open = l.page, false
 		}
 		if h, ok := headerColumns(l); ok {
-			cols, open = h, true
+			cols, open, topOfPage = h, true, true
 			continue
 		}
 		if !open {
@@ -238,6 +243,8 @@ func parseTable(lines []line) ([]Row, error) {
 		if hasText(l, endMarker) {
 			break
 		}
+		first := topOfPage
+		topOfPage = false
 		cells, ok := assignColumns(l, cols)
 		if !ok {
 			open = false
@@ -251,11 +258,14 @@ func parseTable(lines []line) ([]Row, error) {
 			if current == nil {
 				return nil, fmt.Errorf("%w: text before the first row", ErrFormat)
 			}
-			if gap := lastY - l.y; l.page != lastPage || gap <= 0 || gap > maxContinuationGap {
+			// A line on the next page has no y to measure against the row's last line; its place
+			// as the first line under the header, on the page after the row's, stands in for it.
+			nextPage := first && l.page == lastPage+1
+			if gap := lastY - l.y; !nextPage && (l.page != lastPage || gap <= 0 || gap > maxContinuationGap) {
 				return nil, fmt.Errorf("%w: description line apart from any row (after row %d)", ErrFormat, len(rows))
 			}
 			current.Description += " " + cells[colDescription]
-			lastY = l.y
+			lastPage, lastY = l.page, l.y
 			continue
 		}
 		date, err := time.Parse(shortDate, cells[colDate])

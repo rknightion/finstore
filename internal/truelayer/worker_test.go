@@ -142,11 +142,11 @@ func TestConnectFetchesFullHistoryWithTheExchangedTokenAndTransactionsBeforeBala
 	}
 }
 
-// AC3: /me failing leaves the consent approved for 90 days.
+// AC3: /me failing (the attempt and its retry) leaves the consent approved for 90 days.
 func TestApprovalWithoutMeIsNinetyDays(t *testing.T) {
 	h := newHarness(t)
 	h.lloydsFixture()
-	h.fake.FailMe(ConnLloyds, 1)
+	h.fake.FailMe(ConnLloyds, meAttempts)
 	w := h.worker(ConnLloyds, nil)
 	h.connect(w)
 	c := h.consent(Source(ConnLloyds))

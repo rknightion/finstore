@@ -295,6 +295,9 @@ func write(ctx context.Context, q store.DBTX, tr trace.Tracer, all []*response, 
 // loaded again once finished) is stored again whole, under a new fetch row: a completion row
 // speaks for every page of its fetch, so the fetch it completes must hold them all. The pages
 // stored twice are harmless to the projection, which sees the same transactions again.
+//
+// A fetch whose pages are all stored already, and which the capture now marks complete, gets its
+// completion row on the fetch that holds exactly those pages, unless that fetch has one.
 func writeFetch(ctx context.Context, q store.DBTX, runID int64, g *fetchGroup, res *Result) error {
 	first, last := g.pages[0], g.pages[len(g.pages)-1]
 	held := 0
@@ -308,8 +311,14 @@ func writeFetch(ctx context.Context, q store.DBTX, runID int64, g *fetchGroup, r
 		}
 	}
 	if held == len(g.pages) {
-		res.ResponsesSkipped += held
-		return nil
+		done, err := completeHeldFetch(ctx, q, g, res)
+		if err != nil {
+			return err
+		}
+		if done {
+			res.ResponsesSkipped += held
+			return nil
+		}
 	}
 	account := first.account
 	fetchID, err := store.InsertFetch(ctx, q, store.Fetch{
@@ -333,6 +342,66 @@ func writeFetch(ctx context.Context, q store.DBTX, runID int64, g *fetchGroup, r
 		res.FetchesCompleted++
 	}
 	return nil
+}
+
+// completeHeldFetch handles a fetch whose pages are all stored already. Without a completion in
+// the capture there is nothing to write. With one, the completion row goes on the stored fetch
+// that holds exactly these pages for this account and period, once: when such a fetch already has
+// a completion row nothing is written. It reports false when no stored fetch holds exactly these
+// pages (they are spread over several), so that the caller stores the fetch whole, as it does for
+// a partly held one.
+func completeHeldFetch(ctx context.Context, q store.DBTX, g *fetchGroup, res *Result) (bool, error) {
+	if !g.complete {
+		return true, nil
+	}
+	first, last := g.pages[0], g.pages[len(g.pages)-1]
+	var candidates []int64
+	for i, r := range g.pages {
+		ids, err := store.APIResponseFetchIDs(ctx, q, r.endpoint, r.params, r.fetchedAt, r.sum)
+		if err != nil {
+			return false, err
+		}
+		if i == 0 {
+			candidates = ids
+		} else {
+			candidates = slices.DeleteFunc(candidates, func(id int64) bool { return !slices.Contains(ids, id) })
+		}
+	}
+	var holder int64
+	for _, id := range candidates {
+		n, err := store.CountAPIResponses(ctx, q, id)
+		if err != nil {
+			return false, err
+		}
+		f, err := store.GetFetch(ctx, q, id)
+		if err != nil {
+			return false, err
+		}
+		if n != len(g.pages) || f.Kind != fetchCapture || f.AccountKey == nil || *f.AccountKey != first.account ||
+			f.PeriodStart == nil || !f.PeriodStart.Equal(first.since) || f.PeriodEnd == nil || !f.PeriodEnd.Equal(first.before) {
+			continue
+		}
+		completed, err := store.FetchCompleted(ctx, q, id)
+		if err != nil {
+			return false, err
+		}
+		if completed {
+			return true, nil
+		}
+		if holder == 0 {
+			holder = id
+		}
+	}
+	if holder == 0 {
+		return false, nil
+	}
+	if _, err := store.InsertFetchComplete(ctx, q, store.FetchComplete{
+		FetchID: holder, CompletedAt: last.fetchedAt, Pages: len(g.pages),
+	}); err != nil {
+		return false, err
+	}
+	res.FetchesCompleted++
+	return true, nil
 }
 
 func exists(ctx context.Context, q store.DBTX, r *response) (bool, error) {
