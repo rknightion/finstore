@@ -23,19 +23,26 @@ WITH request AS (
   WHERE source = 'monzo' AND endpoint IN ('/accounts', '/pots') AND status = 200
 ),
 -- The newest readable response of each request: newest first, the first whose body is JSON with
--- the list in it. OFFSET 0 keeps the sort below the filter, so LIMIT 1 stops at the first readable
--- body instead of parsing every one.
+-- the list in it. The sort carries only seq and fetched_at, never a body, so it stays small however
+-- many responses accumulate (hourly /pots and /accounts bodies are large). A body is then fetched by
+-- seq, one candidate at a time from the newest, and parsed once. The two OFFSET 0 keep the sort below
+-- the LATERAL lookup and the parse inside it: the lookup makes a nested loop, so LIMIT 1 stops at the
+-- first readable body instead of reading and parsing every one, and the planner cannot copy the
+-- parse into the filter and the output as well.
 latest_doc AS (
-  SELECT q.endpoint, d.seq, d.fetched_at, raw.json_body(d.body) -> q.list_key AS list
+  SELECT q.endpoint, d.seq, d.fetched_at, d.list
   FROM request q
   CROSS JOIN LATERAL (
-    SELECT s.seq, s.fetched_at, s.body
-    FROM (SELECT r.seq, r.fetched_at, r.body
+    SELECT s.seq, s.fetched_at, b.list
+    FROM (SELECT r.seq, r.fetched_at
           FROM raw.api_response r
           WHERE r.source = 'monzo' AND r.endpoint = q.endpoint AND r.params = q.params AND r.status = 200
           ORDER BY r.fetched_at DESC, r.seq DESC
           OFFSET 0) s
-    WHERE jsonb_typeof(raw.json_body(s.body) -> q.list_key) = 'array'
+    CROSS JOIN LATERAL (SELECT raw.json_body(r.body) -> q.list_key AS list
+                        FROM raw.api_response r WHERE r.seq = s.seq
+                        OFFSET 0) b
+    WHERE jsonb_typeof(b.list) = 'array'
     LIMIT 1
   ) d
 ),

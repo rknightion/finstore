@@ -186,6 +186,19 @@ a connect day uses three. A `raw.api_response` row with status 0 and no body rec
 no whole response (a transport failure): it may still have reached the bank, so it counts toward the
 daily limit.
 
+**Catching up after a restart.** A slot that passes while the service is down is not run late by
+the schedule: the connection waits for the next one, which can be many hours, and its "no
+successful sync" alert stays open until then. So at start, after the restart work above, `serve`
+checks each TrueLayer connection once. A connection with an active consent whose newest successful
+run is older than the most recent slot (a connect run counts, and with no successful run at all the
+approval stands in for it) gets one sync, a random moment up to a minute after start. It goes
+through the normal scheduled path: the writer lock, a `sync` run row and the same metrics, under the
+job name of the slot it makes up. A connection that is up to date is left alone, and so is one with
+no consent, one awaiting approval, or one that is `lost`, `expired` or past its expected expiry: no
+run and no bank call. The schedule itself does not change, the catch-up runs once per start, and the
+four calls a day to each endpoint still apply (the run is `partial` with `rate_limited` rather than
+over the limit). A sync that fails does not count as a success, so the next start tries again.
+
 **Reconnecting.** finstore holds three consents, each on its own 90-day clock: Monzo's own and the
 two TrueLayer ones. The status page lists them together, so renew all three in one sitting. A
 reconnect is a fresh connect: the old consent becomes `replaced` and the new one active, and Lloyds
@@ -351,7 +364,7 @@ current balances.
 
 | Command | Database role | Behaviour |
 |---|---|---|
-| `finstore bootstrap` | superuser | Creates the four roles (`finstore_owner` and `finstore_app` with their passwords, and `finstore_agent` and `finstore_mcp`, which start with no login), sets the settings of `finstore_mcp`, gives `finstore_mcp` its login and password when `FINSTORE_MCP_PASSWORD` is set (and takes them away when it is not), and creates the schemas. Safe to run again. Run it before `migrate` |
+| `finstore bootstrap` | superuser | Creates the four roles (`finstore_owner` and `finstore_app` with their passwords, and `finstore_agent` and `finstore_mcp`, which start with no login), sets the settings of `finstore_mcp`, gives `finstore_mcp` its login and password when `FINSTORE_MCP_PASSWORD` is set (and takes them away when it is not), revokes `TEMPORARY` on the database from every role but the owner, warns on stderr when `finstore_mcp` had changed its own settings (and resets them), and creates the schemas. Safe to run again. Run it before `migrate` |
 | `finstore migrate` | owner | Applies the migrations and the grants. Says so when a `renormalise` is required |
 | `finstore serve` | app | The HTTP server, the scheduler, the Monzo worker and, when TrueLayer is configured, the two TrueLayer workers |
 | `finstore account add`, `finstore account list` | app | Create and list file-fed accounts |
@@ -378,7 +391,7 @@ Environment variables only.
 | `FINSTORE_SUPERUSER_DATABASE_URL` | `bootstrap` | none | Connection string for the Postgres superuser |
 | `FINSTORE_APP_PASSWORD`, `FINSTORE_OWNER_PASSWORD` | `bootstrap` | none | Passwords `bootstrap` sets on the two login roles |
 | `FINSTORE_MCP_PASSWORD` | `bootstrap` | empty | Password `bootstrap` sets on the read-only `finstore_mcp` login. Empty leaves the role without a login (and takes one away if it had one). Letters and digits only, like the other passwords. No command requires it |
-| `FINSTORE_LISTEN_ADDR` | `serve`, `healthcheck` | `:8080` | Address the HTTP server binds |
+| `FINSTORE_LISTEN_ADDR` | `serve`, `healthcheck` | `:8080` | Address the HTTP server binds. It is bound before anything else reaches a bank, so a start that cannot bind (the port is taken) exits at once with no bank call and no background work; requests that arrive while the service resumes wait until it is done |
 | `FINSTORE_PUBLIC_URL` | `serve` | none | Base URL users reach the service at |
 | `FINSTORE_ALLOWED_EMAILS` | `serve` | none | Comma-separated addresses allowed to use the pages |
 | `FINSTORE_AUTH_HEADER` | `serve` | `X-Auth-Request-Email` | Header carrying the signed-in address (`Tailscale-User-Login` with the sidecar) |
@@ -444,12 +457,20 @@ session. Its settings are defaults, not locks: a login as the role can change th
 (`SET`, and `ALTER ROLE finstore_mcp ...`, which any role may run on itself), so a direct login is
 trusted with the role's reads and not with its limits. What it cannot change is `temp_file_limit`
 (1 GB, superuser only). The defaults are every transaction read only, `statement_timeout` 15 s,
-`lock_timeout` 2 s, `idle_in_transaction_session_timeout` 30 s, and at most four connections. A
-direct login can still create temporary tables, which the database grants to every role. The
-endpoint's own reader does not rely on the defaults: it sends the four timeouts and read-only mode
+`lock_timeout` 2 s, `idle_in_transaction_session_timeout` 30 s, and at most four connections. The
+database grants `TEMPORARY` to every role by default, which would let a direct login that turned
+read-only off fill the disk with temporary tables, so `bootstrap` revokes it from `PUBLIC` and
+from the app, agent and MCP roles: only `finstore_owner` holds it, and a `CREATE TEMP TABLE` as
+`finstore_mcp` fails with SQLSTATE 42501. The endpoint's own reader does not rely on the defaults: it sends the four timeouts and read-only mode
 as startup parameters of each connection, and runs each statement in an explicitly read-only
 transaction. Running `bootstrap` again resets anything the role changed for itself, role-wide or
-per database.
+per database, and says so: when it finds the role's settings different from the ones above it
+resets them and writes one warning line to stderr for each kind, `mcp role settings drifted and were
+reset`, with `kind` (`role_setting` or `database_setting`) and `count` (how many settings
+differed, whether changed, added or removed). It never names a setting or a value, because the
+role chose them. A fresh role, and a run that finds nothing different, write nothing. Nothing
+notices a change made between two runs of `bootstrap`, and `bootstrap` does not detect a changed
+password: it sets the password again every run.
 `bootstrap` creates the role and applies the settings, and gives it a login when
 `FINSTORE_MCP_PASSWORD` is set; `migrate` grants it its reads, again after every `renormalise` swap,
 so `bootstrap` must have run first. No view or function in those schemas depends on `secret`, and
@@ -577,6 +598,15 @@ Two views follow the money into and out of pots:
   | `matches` | The transfers sum to the balance |
   | `interest_not_listed` | A savings pot whose balance is above its transfers. Monzo pays the interest inside the pot and does not list it. Only the types `instant_access` and `flexible_savings` count as savings pots; a pot of any other type falls to `unexplained` |
   | `unexplained` | Anything else, including a pot with no balance reading (its balance and difference are null) |
+
+  A pot that shows `unexplained` for a single run next to a transfer made at about the same time is
+  a timing effect of the balance reading, not a fault. The view compares the pot's balance, which
+  Monzo reports as it stood when finstore read it, with the transfers whose Monzo `created` time is at
+  or before the time of that read, which is finstore's clock. A transfer made a few seconds either
+  side of the reading, or a small difference between the two clocks, can fall on the wrong side for
+  one run. The next reading counts it on the right side, and the pot shows `matches` again with
+  nothing changed. Look again after the next sync before treating it as a gap; a pot that stays
+  `unexplained` over several readings is a different matter.
 
 ### How the data is checked
 
@@ -840,10 +870,10 @@ error text: only fixed words.
 |---|---|---|
 | `connect` | A connect post (`POST /connect/...`) that passed the sign-in; a request answered 404 has its server span only | `finstore.source`, `finstore.connect.outcome` |
 | `callback` | A request to a callback route that reached its handler, for Monzo's route and for the TrueLayer route they share | `finstore.source`, `finstore.connect.outcome`, and `error.type` when the outcome is `failed` |
-| `scheduler.job` | Each scheduled job run: a new root span, never a child of anything | `finstore.job` (the job's registered name: `status`, `hourly`, `nightly` and one per TrueLayer connection and time of day), `finstore.job.outcome` (`ok`, `error`, `panic` or `cancelled`; only `error` and `panic` mark the span failed) |
+| `scheduler.job` | Each scheduled job run: a new root span, never a child of anything | `finstore.job` (the job's registered name: `status`, `hourly`, `nightly` and one per TrueLayer connection and time of day; a catch-up sync at start runs under the name of the slot it makes up), `finstore.job.outcome` (`ok`, `error`, `panic` or `cancelled`; only `error` and `panic` mark the span failed) |
 | `sync.run` | One run of a source: a scheduled sync, a connect-time fetch or a Monzo full-history fetch. Under a scheduled job it is a child of that job's span; background work a callback or a restart started is a new root (see below) | `finstore.source`, `finstore.run.kind` (`hourly`, `nightly`, `sync`, `connect`, `backfill`), `finstore.run.id` (the `sync.run` row), `finstore.run.outcome` (`ok`, `partial` or `failed`), `error.type` (the run's error category), `finstore.run.rows` and, for Monzo, `finstore.run.pages`. A run that did not end `ok` is marked failed with its category. Its bank calls and queries are its children |
 | `monzo.fetch_range` | Each range of a Monzo full-history fetch that was attempted: a new root span in its own trace, linked to the `sync.run` span, because a fetch of years of history makes tens of thousands of spans | `finstore.source`, `finstore.range.start` and `finstore.range.end` (dates) |
-| `resume` | Each worker's start-up recovery (`serve` runs it for Monzo and for each TrueLayer connection before it listens): a new root span | `finstore.source`, `finstore.run.outcome` (`ok`, or `failed` with `error.type`, such as `consent_lost` for a consent whose token is missing) |
+| `resume` | Each worker's start-up recovery (`serve` runs it for Monzo and for each TrueLayer connection after it has bound its address and before it serves a request): a new root span | `finstore.source`, `finstore.run.outcome` (`ok`, or `failed` with `error.type`, such as `consent_lost` for a consent whose token is missing) |
 
 **Links.** Work that outlives the span that started it gets its own trace with a link back, never a
 child span. The history fetch (Monzo) or connect-time fetch (TrueLayer) that a callback starts is a

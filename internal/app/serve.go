@@ -1,9 +1,11 @@
 package app
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
@@ -31,12 +33,60 @@ const (
 	trueLayerRunLimit = 2 * truelayer.DefaultRunTimeout
 	// trueLayerJitter is the most a scheduled TrueLayer sync starts after its time.
 	trueLayerJitter = 5 * time.Minute
+	// trueLayerCatchUpJitter is the most a catch-up sync starts after the service does, the same
+	// spread as Monzo's first hourly run, so a restart loop does not reach the bank at every start.
+	trueLayerCatchUpJitter = time.Minute
 )
 
 // trueLayerSyncTimes are the times of day, in FINSTORE_TIMEZONE, of the scheduled TrueLayer syncs.
 // A connect day spends three of the four calls a day each endpoint allows: the connect and these
 // two.
 var trueLayerSyncTimes = []config.TimeOfDay{{Hour: 6, Minute: 20}, {Hour: 18, Minute: 20}}
+
+// latestTrueLayerSlot returns the most recent scheduled TrueLayer sync time at or before now, and
+// the name of the job registered for it.
+func latestTrueLayerSlot(tw *truelayer.Worker, now time.Time, loc *time.Location) (time.Time, string) {
+	var slot time.Time
+	var name string
+	for _, at := range trueLayerSyncTimes {
+		if s := scheduler.PrevDaily(now, at.Hour, at.Minute, loc); s.After(slot) {
+			slot, name = s, trueLayerJobName(tw, at)
+		}
+	}
+	return slot, name
+}
+
+func trueLayerJobName(tw *truelayer.Worker, at config.TimeOfDay) string {
+	return fmt.Sprintf("%s %02d:%02d", tw.Source(), at.Hour, at.Minute)
+}
+
+// catchUpTrueLayer schedules one sync of tw shortly after start when the service was down for a
+// slot it should have run: the connection's newest successful sync is before the most recent slot
+// (see Worker.SyncMissedSince). Without it a connection stays stale until the next slot, hours
+// later. The sync is the slot's own scheduled job run late (the same name, so the job's metrics
+// and last-run state are the slot's), through the normal scheduled-run path; the schedule is not
+// changed. It runs once, and asks again when it starts, in case a scheduled run got there first.
+// Call it after Resume, which settles a consent whose token is missing.
+func catchUpTrueLayer(ctx context.Context, sched *scheduler.Scheduler, tw *truelayer.Worker, now time.Time, loc *time.Location,
+	jitter time.Duration, log *slog.Logger) {
+	slot, name := latestTrueLayerSlot(tw, now, loc)
+	missed, err := tw.SyncMissedSince(ctx, slot)
+	if err != nil {
+		log.ErrorContext(ctx, "truelayer catch-up not checked", semconv.LogSource, tw.Source(), semconv.LogOutcome, "error")
+		return
+	}
+	if !missed {
+		return
+	}
+	log.InfoContext(ctx, "truelayer catch-up sync scheduled", semconv.LogSource, tw.Source(), semconv.LogState, "missed")
+	run := trueLayerJob(tw)
+	sched.Once(name, jitter, func(ctx context.Context) error {
+		if missed, err := tw.SyncMissedSince(ctx, slot); err != nil || !missed {
+			return err
+		}
+		return run(ctx)
+	})
+}
 
 // trueLayerJob runs one scheduled sync of tw within trueLayerRunLimit.
 func trueLayerJob(tw *truelayer.Worker) scheduler.Job {
@@ -85,6 +135,9 @@ type Hooks struct {
 	TrueLayerWorker func(w *truelayer.Worker)
 	// NoSchedule leaves the scheduler's jobs unregistered, so a test drives every run itself.
 	NoSchedule bool
+	// CatchUpJitter is the most a TrueLayer catch-up sync starts after the service does; zero takes
+	// the default, a minute.
+	CatchUpJitter time.Duration
 	// Scheduler is called with the scheduler once its jobs are registered, before it runs.
 	Scheduler func(s *scheduler.Scheduler)
 }
@@ -236,9 +289,16 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 	if err != nil {
 		return err
 	}
+	// Bind the socket before anything reaches a bank: a start that cannot listen (the port is taken
+	// and the container restarts in a loop) must make no bank call and start no background work.
+	// Connections that arrive before the server starts wait in the kernel's backlog.
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
+	}
 	// Pick up an approval wait or a full-history fetch that a restart interrupted. Each worker's
-	// Resume runs before the listener opens: a callback that arrived first could start a connect
-	// run that Resume would then end as interrupted while it ran.
+	// Resume runs before the server starts serving: a callback that arrived first could start a
+	// connect run that Resume would then end as interrupted while it ran.
 	if err := worker.Resume(ctx); err != nil {
 		log.ErrorContext(ctx, "monzo background work not resumed", semconv.LogOutcome, "error")
 	}
@@ -256,10 +316,6 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 		}
 	}
 
-	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.ListenAddr)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
-	}
 	srv := web.NewHTTPServer(cfg.ListenAddr, telemetry.HTTPHandler(pages.Handler(), providers))
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
@@ -291,9 +347,14 @@ func serve(ctx context.Context, e Env, hooks *Hooks) (err error) {
 			bounded(monzo.KindNightly, nightlyRunLimit))
 		for _, tw := range tlWorkers {
 			for _, at := range trueLayerSyncTimes {
-				sched.Daily(fmt.Sprintf("%s %02d:%02d", tw.Source(), at.Hour, at.Minute), at.Hour, at.Minute, cfg.Timezone, trueLayerJitter,
+				sched.Daily(trueLayerJobName(tw, at), at.Hour, at.Minute, cfg.Timezone, trueLayerJitter,
 					trueLayerJob(tw))
 			}
+		}
+		// After Resume, so a consent it ended is not caught up; the jobs above are unchanged.
+		catchUpJitter := cmp.Or(hooks.CatchUpJitter, trueLayerCatchUpJitter)
+		for _, tw := range tlWorkers {
+			catchUpTrueLayer(ctx, sched, tw, e.now(), cfg.Timezone, catchUpJitter, log)
 		}
 	}
 	if hooks.Scheduler != nil {
