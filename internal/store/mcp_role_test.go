@@ -252,6 +252,127 @@ func TestMCPRoleSettings(t *testing.T) {
 	}
 }
 
+// A direct login as finstore_mcp that turns read-only off still cannot create a temporary table:
+// TEMPORARY on the database is revoked from PUBLIC (which temp_file_limit does not bound), and only
+// the owner, which nothing but migrations and renormalise use, keeps it.
+func TestMCPRoleCannotCreateTempTablesInAReadWriteSession(t *testing.T) {
+	c := newCluster(t)
+	ctx := context.Background()
+	mcp := connect(t, c.mcpURL(t))
+	if _, err := mcp.Exec(ctx, "SET default_transaction_read_only = off"); err != nil {
+		t.Fatal(err)
+	}
+	var ro string
+	if err := mcp.QueryRow(ctx, "SHOW default_transaction_read_only").Scan(&ro); err != nil || ro != "off" {
+		t.Fatalf("could not turn read-only off for the test: %q %v", ro, err)
+	}
+	for _, stmt := range []string{"CREATE TEMP TABLE scratch (x int)", "CREATE TEMP TABLE scratch2 AS SELECT 1 AS x"} {
+		_, err := mcp.Exec(ctx, stmt)
+		if got := pgCode(err); got != "42501" {
+			t.Errorf("%s as finstore_mcp in a read-write session: SQLSTATE %q (%v), want 42501", stmt, got, err)
+		}
+	}
+
+	// Who holds TEMPORARY: the owner alone. PUBLIC does not, so no login role created later does.
+	var public, owner, app, agent, mcpHas bool
+	if err := connect(t, c.super).QueryRow(ctx, `SELECT
+		  EXISTS (SELECT 1 FROM pg_database d, aclexplode(d.datacl) a
+		          WHERE d.datname = current_database() AND a.grantee = 0 AND a.privilege_type = 'TEMPORARY'),
+		  has_database_privilege($1, current_database(), 'TEMPORARY'),
+		  has_database_privilege($2, current_database(), 'TEMPORARY'),
+		  has_database_privilege($3, current_database(), 'TEMPORARY'),
+		  has_database_privilege($4, current_database(), 'TEMPORARY')`,
+		store.RoleOwner, store.RoleApp, store.RoleAgent, store.RoleMCP).Scan(&public, &owner, &app, &agent, &mcpHas); err != nil {
+		t.Fatal(err)
+	}
+	if public || !owner || app || agent || mcpHas {
+		t.Errorf("TEMPORARY on the database: PUBLIC %v, owner %v, app %v, agent %v, mcp %v; want only the owner", public, owner, app, agent, mcpHas)
+	}
+
+	// A database that bootstrapped before the revoke (PUBLIC holds TEMPORARY again) is corrected by
+	// running bootstrap again.
+	super := connect(t, c.super)
+	var db string
+	if err := super.QueryRow(ctx, "SELECT current_database()").Scan(&db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := super.Exec(ctx, "GRANT TEMPORARY ON DATABASE "+pgx.Identifier{db}.Sanitize()+" TO PUBLIC"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Bootstrap(ctx, c.super, "owner-secret", "app-secret"); err != nil {
+		t.Fatal(err)
+	}
+	mcp2 := connect(t, testpg.UserURL(t, c.super, store.RoleMCP))
+	if _, err := mcp2.Exec(ctx, "SET default_transaction_read_only = off"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := mcp2.Exec(ctx, "CREATE TEMP TABLE scratch (x int)")
+	if got := pgCode(err); got != "42501" {
+		t.Errorf("after bootstrap ran again over a PUBLIC grant: SQLSTATE %q (%v), want 42501", got, err)
+	}
+}
+
+// A direct login as finstore_mcp can rewrite its own settings, role-wide and per database. Bootstrap
+// reports that to the caller as counts (never the names or values the login chose) and resets them
+// as it always did; a clean role reports nothing.
+func TestBootstrapReportsWhatTheMCPRoleChangedForItself(t *testing.T) {
+	c := newCluster(t)
+	ctx := context.Background()
+	var reports []store.MCPDrift
+	bootstrap := func() {
+		t.Helper()
+		if err := store.Bootstrap(ctx, c.super, "owner-secret", "app-secret",
+			store.WithMCPDriftReport(func(d store.MCPDrift) { reports = append(reports, d) })); err != nil {
+			t.Fatalf("Bootstrap: %v", err)
+		}
+	}
+
+	bootstrap()
+	bootstrap()
+	if len(reports) != 0 {
+		t.Fatalf("bootstrap over an untouched role reported drift: %+v", reports)
+	}
+
+	var db string
+	if err := connect(t, c.super).QueryRow(ctx, "SELECT current_database()").Scan(&db); err != nil {
+		t.Fatal(err)
+	}
+	mcp := connect(t, c.mcpURL(t))
+	// The role's default makes ALTER ROLE itself fail until the session turns read-only off.
+	if _, err := mcp.Exec(ctx, "SET default_transaction_read_only = off"); err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		"ALTER ROLE finstore_mcp SET statement_timeout = '1h'", // a limit loosened
+		"ALTER ROLE finstore_mcp RESET lock_timeout",           // a limit removed
+		"ALTER ROLE finstore_mcp SET work_mem = '1GB'",         // one added
+		"ALTER ROLE finstore_mcp IN DATABASE " + pgx.Identifier{db}.Sanitize() + " SET default_transaction_read_only = off",
+		"ALTER ROLE finstore_mcp IN DATABASE " + pgx.Identifier{db}.Sanitize() + " SET statement_timeout = 0",
+	} {
+		if _, err := mcp.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	bootstrap()
+	if want := (store.MCPDrift{Role: 3, Database: 2}); len(reports) != 1 || reports[0] != want {
+		t.Fatalf("bootstrap after the role changed its own settings reported %+v, want exactly %+v", reports, want)
+	}
+
+	// Reset as before: a new login has the expected settings, and the next run finds nothing.
+	fresh := connect(t, testpg.UserURL(t, c.super, store.RoleMCP))
+	for setting, want := range map[string]string{"statement_timeout": "15s", "lock_timeout": "2s",
+		"default_transaction_read_only": "on", "work_mem": "4MB"} {
+		var got string
+		if err := fresh.QueryRow(ctx, "SELECT current_setting($1)", setting).Scan(&got); err != nil || got != want {
+			t.Errorf("%s after bootstrap = %q (%v), want %q", setting, got, err, want)
+		}
+	}
+	bootstrap()
+	if len(reports) != 1 {
+		t.Errorf("a bootstrap after the reset reported drift again: %+v", reports)
+	}
+}
+
 func TestMCPRoleReadsCoreAfterSwapCore(t *testing.T) {
 	c := newCluster(t)
 	ctx := context.Background()

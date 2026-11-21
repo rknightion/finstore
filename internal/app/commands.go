@@ -186,12 +186,32 @@ func observeLock(t cliTelemetry, st *store.Store) error {
 	return t.Metrics.ObserveWriterLock(st.CurrentHold)
 }
 
+// Values of the kind field on the line bootstrap logs when finstore_mcp had changed its own settings.
+const (
+	driftKindRoleSetting     = "role_setting"
+	driftKindDatabaseSetting = "database_setting"
+)
+
 // Bootstrap creates the roles and the schemas as the superuser.
 func Bootstrap(ctx context.Context, e Env) int {
 	if err := e.Cfg.Require("bootstrap"); err != nil {
 		return e.fail(err)
 	}
-	if err := store.Bootstrap(ctx, e.Cfg.SuperuserDatabaseURL, e.Cfg.OwnerPassword, e.Cfg.AppPassword); err != nil {
+	// Bootstrap exports no telemetry (see withTelemetry), so drift is reported as a log line on
+	// stderr behind the same allow-list filter: counts and a kind, never the setting a login chose.
+	log := telemetry.NewLogger(e.Stderr, e.Cfg.LogLevel)
+	report := func(d store.MCPDrift) {
+		for _, x := range []struct {
+			kind string
+			n    int
+		}{{driftKindRoleSetting, d.Role}, {driftKindDatabaseSetting, d.Database}} {
+			if x.n > 0 {
+				log.WarnContext(ctx, "mcp role settings drifted and were reset", semconv.LogKind, x.kind, semconv.LogCount, x.n)
+			}
+		}
+	}
+	if err := store.Bootstrap(ctx, e.Cfg.SuperuserDatabaseURL, e.Cfg.OwnerPassword, e.Cfg.AppPassword,
+		store.WithMCPDriftReport(report)); err != nil {
 		return e.fail(err)
 	}
 	// The MCP login follows FINSTORE_MCP_PASSWORD: set turns it on with that password, empty turns it
