@@ -24,10 +24,41 @@ func detailJSON(t *testing.T, raw json.RawMessage, want string) {
 	}
 }
 
-// Revision 3 of the normaliser adds core.account.detail and the two pending tables.
-func TestNormaliserRevisionIsThree(t *testing.T) {
-	if ledger.NormaliserRev != 3 {
-		t.Fatalf("NormaliserRev = %d, want 3", ledger.NormaliserRev)
+// Revision 3 of the normaliser added core.account.detail and the two pending tables; revision 4
+// checks credit cards by balance_movement, with core.reconciliation.anchor_diff_minor.
+func TestNormaliserRevisionIsFour(t *testing.T) {
+	if ledger.NormaliserRev != 4 {
+		t.Fatalf("NormaliserRev = %d, want 4", ledger.NormaliserRev)
+	}
+}
+
+// A core built by revision 3 holds its cards as balances_only, with no anchor_diff_minor.
+// Renormalise rebuilds it with the cards checked by balance_movement, from raw.
+func TestRenormaliseOverARevisionThreeCoreChecksTheCards(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.cardAccounts("card:5678")
+	e.cardRun(1, "card:5678", -1000, txn("c1", "card:5678", -1000, cardDay))
+	e.cardRun(2, "card:5678", -1000)
+	for _, stmt := range []string{
+		`ALTER TABLE core.reconciliation DROP COLUMN anchor_diff_minor`,
+		`UPDATE core.reconciliation SET method = 'balances_only', last_check_at = NULL, last_check_ok = NULL,
+		  last_diff_minor = NULL, last_pass_at = NULL`,
+		`UPDATE core.projection_state SET normaliser_rev = 3`,
+	} {
+		if _, err := e.owner.DB().Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	if diffs := e.renormalise(true); len(diffs) == 0 {
+		t.Fatal("verify over a revision-3 core reported no difference")
+	}
+	e.renormalise(false)
+	if r := e.recon(wantAccountID(lloydsSource, "card:5678")); r.Method != "balance_movement" || r.LastCheckOK == nil || !*r.LastCheckOK {
+		t.Fatalf("the card after renormalise: %+v", r)
+	}
+	if diffs := e.renormalise(true); len(diffs) != 0 {
+		t.Fatalf("verify after renormalise: %+v", diffs)
 	}
 }
 

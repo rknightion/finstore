@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,8 +23,10 @@ import (
 const (
 	methodMonzoAbsolute  = "monzo_absolute"
 	methodRunningBalance = "running_balance"
-	methodFileContinuity = "file_continuity"
-	methodBalancesOnly   = "balances_only"
+	// methodBalanceMovement checks a credit card: see balanceMovementCheck.
+	methodBalanceMovement = "balance_movement"
+	methodFileContinuity  = "file_continuity"
+	methodBalancesOnly    = "balances_only"
 )
 
 // SourceTrueLayerLloyds is the source of the TrueLayer connection to Lloyds. Its accounts are
@@ -113,6 +116,9 @@ func (a *applier) apiResponse(ctx context.Context, r *store.APIResponse) error {
 			return err
 		}
 		if err := a.runningBalanceCheck(ctx, acc, r.FetchedAt, b); err != nil {
+			return err
+		}
+		if err := a.balanceMovementCheck(ctx, acc, r.FetchedAt, b); err != nil {
 			return err
 		}
 	}
@@ -284,10 +290,13 @@ func (a *applier) applyAccounts(ctx context.Context, source string, recs []Accou
 		if !ok {
 			method = methodMonzoAbsolute
 		}
-		if rec.Type == typePot || rec.Type == typeCreditCard {
-			// A pot has only balances; nothing is checked against a card's yet (a card's rows may
-			// carry no running balance).
+		switch rec.Type {
+		case typePot:
+			// A pot has only balances.
 			method = methodBalancesOnly
+		case typeCreditCard:
+			// A card's history may not reach its opening and its rows may carry no running balance.
+			method = methodBalanceMovement
 		}
 		if err := a.core.EnsureReconciliation(ctx, id, method); err != nil {
 			return err
@@ -686,6 +695,92 @@ func (a *applier) runningBalanceCheck(ctx context.Context, acc store.Account, at
 		rec.LastPassAt = &at
 	}
 	return a.core.PutReconciliation(ctx, rec)
+}
+
+// balanceMovementCheck reconciles an account whose method is balance_movement (a credit card)
+// against a balance reading. A card's history may not reach back to its opening, so its balance
+// need not equal its running sum; what must hold is that the difference between the two (the
+// reading minus the running sum) stays the same, so that between two readings the balance moves by
+// exactly the transactions the ledger took in between them, in raw order, whatever their dates.
+//
+//   - The difference is anchored once two readings in a row give the same one: until then
+//     anchor_diff_minor holds the latest reading's difference and nothing is checked (last_check_at
+//     stays null, so agent.coverage says not_checked). The anchoring reading's raw row and day are
+//     kept with it.
+//   - The anchoring balance may already hold transactions the bank had not listed yet. Each one
+//     the ledger takes in later moves the difference by minus its amount, once, for good. Such a
+//     transaction is dated on or before the anchoring day and arrives after the anchoring row, but
+//     a date-only row cannot say whether it was in that balance or not, so the reading's
+//     difference from the anchor is explained when minus it is the sum of some of those
+//     transactions (none included). An explained difference counts as 0. When there are too many
+//     of them to try, the difference is taken as explained: an unexplained mismatch must be sure.
+//   - Otherwise last_diff_minor is the difference from the anchor. As for running_balance, it
+//     fails the check only when the previous check recorded the same non-zero difference and it is
+//     not the accepted one: a purchase can reach the balance before the bank lists it, and the
+//     next run's transactions then catch up.
+//
+// last_check_ok is a passing comparison (and no shared bank reference).
+func (a *applier) balanceMovementCheck(ctx context.Context, acc store.Account, at time.Time, b BalanceRec) error {
+	rec, err := a.core.GetReconciliation(ctx, acc.ID)
+	if err != nil {
+		return err
+	}
+	if rec.Method != methodBalanceMovement {
+		return nil
+	}
+	offset := b.BalanceMinor - rec.RunningSumMinor
+	if rec.LastCheckAt == nil {
+		if rec.AnchorDiffMinor == nil || *rec.AnchorDiffMinor != offset {
+			rec.AnchorDiffMinor = &offset
+			return a.core.PutReconciliation(ctx, rec)
+		}
+		readAt := at
+		if !b.At.IsZero() {
+			readAt = b.At
+		}
+		local := readAt.In(a.l.loc)
+		day := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, time.UTC)
+		seq := a.row.Seq
+		rec.AnchorRawSeq, rec.AnchorOn = &seq, &day
+	}
+	d := offset - *rec.AnchorDiffMinor
+	if d != 0 && rec.AnchorRawSeq != nil && rec.AnchorOn != nil {
+		late, err := a.core.AmountsArrivedAfter(ctx, acc.ID, *rec.AnchorRawSeq, *rec.AnchorOn)
+		if err != nil {
+			return err
+		}
+		if subsetSums(late, -d) {
+			d = 0
+		}
+	}
+	confirmed := rec.LastDiffMinor != nil && *rec.LastDiffMinor == d
+	accepted := rec.AcceptedDiffMinor != nil && *rec.AcceptedDiffMinor == d
+	ok := (d == 0 || accepted || !confirmed) && !sharedFlag(rec)
+	rec.LastCheckAt = &at
+	rec.LastDiffMinor = &d
+	rec.LastCheckOK = &ok
+	if ok {
+		rec.LastPassAt = &at
+	}
+	return a.core.PutReconciliation(ctx, rec)
+}
+
+// maxSubsetSums bounds the distinct sums subsetSums keeps.
+const maxSubsetSums = 1 << 14
+
+// subsetSums reports whether some of amounts (none included) sum to target. Past maxSubsetSums
+// distinct sums it gives up and reports true.
+func subsetSums(amounts []int64, target int64) bool {
+	sums := map[int64]bool{0: true}
+	for _, n := range amounts {
+		for s := range maps.Clone(sums) {
+			sums[s+n] = true
+		}
+		if len(sums) > maxSubsetSums {
+			return true
+		}
+	}
+	return sums[target]
 }
 
 // rbDay is one day of running_balance rows: the sum of their amounts, and the balances after and

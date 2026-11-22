@@ -109,7 +109,7 @@ TrueLayer's Data API adds two connections, each its own source with its own cons
   and direct debits, their [pending transactions](#pending-transactions), and the Lloyds credit
   cards. Its accounts are `lloyds-joint`, `lloyds-current` and so on, and are checked by running
   balance (see [How the data is checked](#how-the-data-is-checked)). A credit card is an account
-  of its own, `lloyds-card-<last four digits>`, of type `credit_card`.
+  of its own, `lloyds-card-<last four digits>`, of type `credit_card`, checked by balance movement.
 - **`truelayer:ob-monzo`**: standing orders and direct debits for the Monzo accounts finstore
   already holds from Monzo's own API, and the list of Monzo's cards, which is only stored. It
   creates no account: each mandate attaches to the Monzo account with the same
@@ -548,10 +548,12 @@ A Lloyds credit card is an account of type `credit_card`, `lloyds-card-<last fou
 no bank reference. In the ledger a card is a liability: a purchase is negative, a repayment is
 positive, and the balance is minus what is owed. The sign comes from the transaction's
 `transaction_type`, not from the sign the bank wrote, and a card transaction whose type is neither
-`DEBIT` nor `CREDIT` is rejected as an unexpected body. A card is reconciled `balances_only`:
-balances are recorded and nothing is compared, so `agent.coverage` reports no gaps for it and a
-wrong sign is caught only by reading its figures against the bank's app. A connect fetches a card's
-history from 2021-01-01, and a scheduled run the last 35 days.
+`DEBIT` nor `CREDIT` is rejected as an unexpected body. A card is reconciled `balance_movement`
+(see [How the data is checked](#how-the-data-is-checked)): its balance must move by exactly the
+transactions stored between two readings, so a transaction with the wrong sign shows as a
+`mismatch` of twice its amount. Like any checked account, a card has gaps in `agent.coverage`
+for days no completed fetch covers. A connect fetches a card's history from 2021-01-01, and a
+scheduled run the last 35 days.
 
 A card transaction's `running_balance` in `agent.transactions.detail` is the bank's own record and
 keeps the bank's sign. It is not flipped to the ledger's: the sign change that makes a purchase
@@ -621,8 +623,20 @@ Two views follow the money into and out of pots:
   and `agent.coverage.failed_on` names the earliest. The newest closing balance is also compared
   with the bank's balance; because the two are read moments apart, a difference counts only when
   the next reading shows the same one.
-- **Credit cards** (`balances_only`): balances are recorded and nothing is compared. Nothing
-  checks a card's transactions against its balance yet.
+- **Credit cards** (`balance_movement`): a card's history may not reach back to its opening, so its
+  balance need not equal the sum of its stored transactions. What is checked is that the
+  difference between the two (the balance minus that sum) stays the same: between two readings the
+  balance must move by exactly the transactions stored in between, whatever their dates. The
+  difference is anchored once two readings in a row agree on it; until then the card is
+  `not_checked`, never `reconciled`. After that `last_diff_minor` is how far the difference has
+  moved from the anchor, and as for running balances it counts only when the next reading shows the
+  same one, because a purchase can reach the balance a run before the bank lists it. A purchase
+  already in the balance when the check was anchored but listed only later moves the difference
+  for good; since a row carries a date and no time, a difference is not counted when it is
+  explained by transactions dated on or before the anchoring reading's day that were listed after
+  it. Pending card
+  transactions are not counted: the check assumes the bank's balance holds settled transactions
+  only. A difference that will never clear can be accepted with `account accept-difference`.
 - **Bank references**: two accounts from different sources with the same bank reference, neither
   ended, are both a mismatch.
 - **Pots** have balances only; Monzo's API does not list a pot's own transactions. The transfers
@@ -990,5 +1004,6 @@ means the release stuck, and a command holder is just a long command).
 | Coverage shows "the Monzo window closed before this range was fetched" | The five minutes ran out | Reconnect: unfinished ranges are fetched first |
 | Coverage shows "no completed fetch covers this period" | The service was down or disconnected for more than 90 days | Reconnect: the full-history fetch fills it |
 | A Monzo account shows `mismatch` | The stored transactions do not add up to the bank's balance | A sync usually clears it. If it lasts, compare `raw` with `core` and run `renormalise --verify`. A closed account with a difference that will never change can be accepted with `account accept-difference` |
+| A credit card shows `mismatch` | Its balance moved by something other than the transactions stored since the last readings: a transaction with the wrong sign (a difference of twice its amount), or one the bank never listed | Compare the card's transactions in `agent.transactions` with the bank's app over the days since `reconciled_through`. A difference that will never change can be accepted with `account accept-difference` |
 | An import exits 2 | The statement failed a check, belongs to another bank account, was given with the wrong `--format`, or its layout changed | The message says which. The file is kept in `raw.import_file` and nothing was stored. A wrong format: give it again with the right one. A changed layout: the reader needs updating, then `renormalise` |
 | Coverage shows "no file covers these days" | A statement was skipped | Import the missing statement |
