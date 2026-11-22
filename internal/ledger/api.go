@@ -22,8 +22,10 @@ import (
 const (
 	methodMonzoAbsolute  = "monzo_absolute"
 	methodRunningBalance = "running_balance"
-	methodFileContinuity = "file_continuity"
-	methodBalancesOnly   = "balances_only"
+	// methodBalanceMovement checks a credit card: see balanceMovementCheck.
+	methodBalanceMovement = "balance_movement"
+	methodFileContinuity  = "file_continuity"
+	methodBalancesOnly    = "balances_only"
 )
 
 // SourceTrueLayerLloyds is the source of the TrueLayer connection to Lloyds. Its accounts are
@@ -113,6 +115,9 @@ func (a *applier) apiResponse(ctx context.Context, r *store.APIResponse) error {
 			return err
 		}
 		if err := a.runningBalanceCheck(ctx, acc, r.FetchedAt, b); err != nil {
+			return err
+		}
+		if err := a.balanceMovementCheck(ctx, acc, r.FetchedAt, b); err != nil {
 			return err
 		}
 	}
@@ -284,10 +289,13 @@ func (a *applier) applyAccounts(ctx context.Context, source string, recs []Accou
 		if !ok {
 			method = methodMonzoAbsolute
 		}
-		if rec.Type == typePot || rec.Type == typeCreditCard {
-			// A pot has only balances; nothing is checked against a card's yet (a card's rows may
-			// carry no running balance).
+		switch rec.Type {
+		case typePot:
+			// A pot has only balances.
 			method = methodBalancesOnly
+		case typeCreditCard:
+			// A card's history may not reach its opening and its rows may carry no running balance.
+			method = methodBalanceMovement
 		}
 		if err := a.core.EnsureReconciliation(ctx, id, method); err != nil {
 			return err
@@ -681,6 +689,47 @@ func (a *applier) runningBalanceCheck(ctx context.Context, acc store.Account, at
 		rec.ReconciledThrough = newest
 	}
 	ok := len(failing) == 0 && balanceOK && !sharedFlag(rec)
+	rec.LastCheckOK = &ok
+	if ok {
+		rec.LastPassAt = &at
+	}
+	return a.core.PutReconciliation(ctx, rec)
+}
+
+// balanceMovementCheck reconciles an account whose method is balance_movement (a credit card)
+// against a balance reading. A card's history may not reach back to its opening, so its balance
+// need not equal its running sum; what must hold is that the difference between the two (the
+// reading minus the running sum) stays the same, so that between two readings the balance moves by
+// exactly the transactions the ledger took in between them, in raw order, whatever their dates.
+//
+//   - The difference is anchored once two readings in a row give the same one: until then
+//     anchor_diff_minor holds the latest reading's difference and nothing is checked (last_check_at
+//     stays null, so agent.coverage says not_checked).
+//   - From then on last_diff_minor is the reading's difference minus the anchor. As for
+//     running_balance, it fails the check only when the previous check recorded the same non-zero
+//     difference and it is not the accepted one: a purchase can reach the balance before the bank
+//     lists it, and the next run's transactions then catch up.
+//
+// last_check_ok is a passing comparison (and no shared bank reference).
+func (a *applier) balanceMovementCheck(ctx context.Context, acc store.Account, at time.Time, b BalanceRec) error {
+	rec, err := a.core.GetReconciliation(ctx, acc.ID)
+	if err != nil {
+		return err
+	}
+	if rec.Method != methodBalanceMovement {
+		return nil
+	}
+	offset := b.BalanceMinor - rec.RunningSumMinor
+	if rec.LastCheckAt == nil && (rec.AnchorDiffMinor == nil || *rec.AnchorDiffMinor != offset) {
+		rec.AnchorDiffMinor = &offset
+		return a.core.PutReconciliation(ctx, rec)
+	}
+	d := offset - *rec.AnchorDiffMinor
+	confirmed := rec.LastDiffMinor != nil && *rec.LastDiffMinor == d
+	accepted := rec.AcceptedDiffMinor != nil && *rec.AcceptedDiffMinor == d
+	ok := (d == 0 || accepted || !confirmed) && !sharedFlag(rec)
+	rec.LastCheckAt = &at
+	rec.LastDiffMinor = &d
 	rec.LastCheckOK = &ok
 	if ok {
 		rec.LastPassAt = &at

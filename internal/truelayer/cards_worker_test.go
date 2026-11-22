@@ -55,7 +55,7 @@ func (h *harness) amounts(account store.Account) []int64 {
 }
 
 // A Lloyds card is a credit_card ledger account keyed card:<last4>, slugged lloyds-card-<last4>,
-// with no bank reference, balances_only reconciliation and the card object as its detail. Its
+// with no bank reference, balance_movement reconciliation and the card object as its detail. Its
 // purchases are negative, its repayments positive, and its balance minus what is owed.
 func TestLloydsCardsAreLedgerAccounts(t *testing.T) {
 	h := newHarness(t)
@@ -78,7 +78,7 @@ func TestLloydsCardsAreLedgerAccounts(t *testing.T) {
 		detail["card_type"] != "CREDIT" {
 		t.Fatalf("detail = %s, %v; want the card object", acc.Detail, err)
 	}
-	if rec, err := h.core().GetReconciliation(ctx, acc.ID); err != nil || rec.Method != "balances_only" {
+	if rec, err := h.core().GetReconciliation(ctx, acc.ID); err != nil || rec.Method != "balance_movement" {
 		t.Fatalf("reconciliation %+v, %v", rec, err)
 	}
 	if got := h.amounts(acc); !slices.Equal(got, []int64{-2425, 5000}) {
@@ -103,6 +103,58 @@ func TestLloydsCardsAreLedgerAccounts(t *testing.T) {
 	var n int
 	if err := h.st.DB().QueryRow(ctx, `SELECT type, (SELECT count(*) FROM agent.accounts) FROM agent.accounts WHERE slug = 'lloyds-card-5678'`).Scan(&typ, &n); err != nil || typ != "credit_card" || n != 4 {
 		t.Errorf("agent.accounts: type %q, %d rows, %v", typ, n, err)
+	}
+}
+
+// cardCoverage reads a card's reconciliation state and last difference from agent.coverage.
+func (h *harness) cardCoverage(slug string) (string, *int64) {
+	h.t.Helper()
+	var state string
+	var diff *int64
+	if err := h.st.DB().QueryRow(context.Background(), `SELECT reconciliation_state, last_diff_minor FROM agent.coverage
+		WHERE account_slug = $1`, slug).Scan(&state, &diff); err != nil {
+		h.t.Fatal(err)
+	}
+	return state, diff
+}
+
+// Through the TrueLayer normaliser: a card's balance must move by its transactions. A purchase the
+// bank types as a repayment (CREDIT), so that the ledger holds it with its sign flipped, is a
+// mismatch once two runs show it, while a purchase typed right keeps its card reconciled.
+func TestCardWithAFlippedTransactionIsAMismatch(t *testing.T) {
+	h := newHarness(t)
+	card, other := h.cardFixture()
+	w := h.worker(ConnLloyds, nil)
+	h.connect(w)
+	if s, _ := h.cardCoverage("lloyds-card-5678"); s != "not_checked" {
+		t.Fatalf("a card after one reading: %s, want not_checked", s)
+	}
+	run := func() {
+		t.Helper()
+		h.fake.Advance(24 * time.Hour)
+		if err := w.RunScheduled(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		requireRun(t, h.lastRun(Source(ConnLloyds)), KindSync, outcomeOK, "")
+	}
+	run()
+	for _, slug := range []string{"lloyds-card-5678", "lloyds-card-9012"} {
+		if s, d := h.cardCoverage(slug); s != "reconciled" || d == nil || *d != 0 {
+			t.Fatalf("%s after two readings: %s %v", slug, s, d)
+		}
+	}
+	// Each card spends 10.00 and owes 10.00 more; 9012's purchase comes typed CREDIT.
+	h.fake.AddCardTransaction(card, truelayertest.CardTxn{Type: "DEBIT", Amount: "10.00", Date: date(2026, 11, 12), Description: "MADE UP SHOP"})
+	h.fake.SetCardBalance(card, 12345+1000, 137655-1000)
+	h.fake.AddCardTransaction(other, truelayertest.CardTxn{Type: "CREDIT", Amount: "10.00", Date: date(2026, 11, 12), Description: "MADE UP SHOP"})
+	h.fake.SetCardBalance(other, 1000, 149000)
+	run()
+	run()
+	if s, d := h.cardCoverage("lloyds-card-5678"); s != "reconciled" || *d != 0 {
+		t.Errorf("the card typed right: %s %v", s, *d)
+	}
+	if s, d := h.cardCoverage("lloyds-card-9012"); s != "mismatch" || d == nil || *d != -2000 {
+		t.Errorf("the flipped card: %s %v, want mismatch with -2000", s, d)
 	}
 }
 

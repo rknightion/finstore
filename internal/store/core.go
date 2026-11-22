@@ -172,7 +172,7 @@ type BalanceSnapshot struct {
 // Reconciliation is a core.reconciliation row: an account's current reconciliation state.
 type Reconciliation struct {
 	AccountID         uuid.UUID
-	Method            string // monzo_absolute | running_balance | file_continuity | balances_only | none
+	Method            string // monzo_absolute | running_balance | balance_movement | file_continuity | balances_only | none
 	RunningSumMinor   int64
 	LastCheckAt       *time.Time
 	LastCheckOK       *bool
@@ -185,6 +185,9 @@ type Reconciliation struct {
 	AcceptedDiffMinor *int64
 	// FailedOn is, for running_balance, the earliest day that does not add up (a date).
 	FailedOn *time.Time
+	// AnchorDiffMinor is, for balance_movement, the balance minus the running sum the check is
+	// anchored on once LastCheckAt is set, and the latest reading's before that.
+	AnchorDiffMinor *int64
 }
 
 // FileGap is a core.file_gap row: two imported files that do not join up.
@@ -703,14 +706,14 @@ func (c Core) UnendedCardKeys(ctx context.Context, source string) ([]string, err
 }
 
 const reconciliationColumns = `account_id, method, running_sum_minor, last_check_at, last_check_ok, last_diff_minor,
-	last_pass_at, reconciled_through, break_count, known_exception, accepted_diff_minor, failed_on`
+	last_pass_at, reconciled_through, break_count, known_exception, accepted_diff_minor, failed_on, anchor_diff_minor`
 
 // GetReconciliation returns the account's reconciliation row, or ErrNotFound.
 func (c Core) GetReconciliation(ctx context.Context, accountID uuid.UUID) (Reconciliation, error) {
 	var r Reconciliation
 	err := c.q.QueryRow(ctx, c.sql(`SELECT `+reconciliationColumns+` FROM core.reconciliation WHERE account_id = $1`), accountID).
 		Scan(&r.AccountID, &r.Method, &r.RunningSumMinor, &r.LastCheckAt, &r.LastCheckOK, &r.LastDiffMinor,
-			&r.LastPassAt, &r.ReconciledThrough, &r.BreakCount, &r.KnownException, &r.AcceptedDiffMinor, &r.FailedOn)
+			&r.LastPassAt, &r.ReconciledThrough, &r.BreakCount, &r.KnownException, &r.AcceptedDiffMinor, &r.FailedOn, &r.AnchorDiffMinor)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Reconciliation{}, ErrNotFound
 	}
@@ -723,15 +726,16 @@ func (c Core) GetReconciliation(ctx context.Context, accountID uuid.UUID) (Recon
 // PutReconciliation inserts r or replaces every column of the account's row.
 func (c Core) PutReconciliation(ctx context.Context, r Reconciliation) error {
 	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.reconciliation (`+reconciliationColumns+`)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT (account_id) DO UPDATE SET method = EXCLUDED.method,
 		  running_sum_minor = EXCLUDED.running_sum_minor, last_check_at = EXCLUDED.last_check_at,
 		  last_check_ok = EXCLUDED.last_check_ok, last_diff_minor = EXCLUDED.last_diff_minor,
 		  last_pass_at = EXCLUDED.last_pass_at, reconciled_through = EXCLUDED.reconciled_through,
 		  break_count = EXCLUDED.break_count, known_exception = EXCLUDED.known_exception,
-		  accepted_diff_minor = EXCLUDED.accepted_diff_minor, failed_on = EXCLUDED.failed_on`),
+		  accepted_diff_minor = EXCLUDED.accepted_diff_minor, failed_on = EXCLUDED.failed_on,
+		  anchor_diff_minor = EXCLUDED.anchor_diff_minor`),
 		r.AccountID, r.Method, r.RunningSumMinor, r.LastCheckAt, r.LastCheckOK, r.LastDiffMinor,
-		r.LastPassAt, r.ReconciledThrough, r.BreakCount, r.KnownException, r.AcceptedDiffMinor, r.FailedOn)
+		r.LastPassAt, r.ReconciledThrough, r.BreakCount, r.KnownException, r.AcceptedDiffMinor, r.FailedOn, r.AnchorDiffMinor)
 	if err != nil {
 		return fmt.Errorf("store: put reconciliation: %w", err)
 	}
@@ -1254,7 +1258,7 @@ func (c Core) ListReconciliations(ctx context.Context) ([]Reconciliation, error)
 	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Reconciliation, error) {
 		var x Reconciliation
 		err := r.Scan(&x.AccountID, &x.Method, &x.RunningSumMinor, &x.LastCheckAt, &x.LastCheckOK, &x.LastDiffMinor,
-			&x.LastPassAt, &x.ReconciledThrough, &x.BreakCount, &x.KnownException, &x.AcceptedDiffMinor, &x.FailedOn)
+			&x.LastPassAt, &x.ReconciledThrough, &x.BreakCount, &x.KnownException, &x.AcceptedDiffMinor, &x.FailedOn, &x.AnchorDiffMinor)
 		return x, err
 	})
 	if err != nil {

@@ -68,7 +68,10 @@ CREATE TABLE {{schema}}.reconciliation (
   failed_on date,
   -- the difference (balance minus running sum) the operator accepted; a check whose difference
   -- equals it passes. Set only by an accept_difference operator entry, with known_exception.
-  accepted_diff_minor bigint);
+  accepted_diff_minor bigint,
+  -- balance_movement only: the balance minus the running sum the check is anchored on, once two
+  -- readings in a row agreed on it (last_check_at set); before that, the latest reading's.
+  anchor_diff_minor bigint);
 
 CREATE TABLE {{schema}}.file_gap (
   account_id uuid NOT NULL REFERENCES {{schema}}.account(id), after_date date NOT NULL,
