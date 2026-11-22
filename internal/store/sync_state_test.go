@@ -159,6 +159,44 @@ func TestLastRateLimitedListsOnlySourcesWithARateLimitedRun(t *testing.T) {
 	}
 }
 
+func TestLastMandateReadsCountsOnlyStoredSuccesses(t *testing.T) {
+	c := newCluster(t)
+	ctx := context.Background()
+	q := openStore(t, c.app).DB()
+	now := time.Date(2030, 5, 1, 12, 0, 0, 0, time.UTC)
+	const so, dd = "/data/v1/accounts/{id}/standing_orders", "/data/v1/accounts/{id}/direct_debits"
+	eps := []string{so, dd}
+	put := func(source, endpoint string, status int, at time.Time) {
+		t.Helper()
+		fid, err := store.InsertFetch(ctx, q, store.Fetch{Source: source, Kind: "sync", RunID: 1, StartedAt: at})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.InsertAPIResponse(ctx, q, store.APIResponse{FetchID: fid, Source: source, Endpoint: endpoint,
+			Status: status, ContentType: "application/json", FetchedAt: at, Body: []byte("{}")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srcs := []string{"truelayer:ob-lloyds", "truelayer:ob-monzo"}
+	if got, err := store.LastMandateReads(ctx, q, srcs, eps); err != nil || len(got) != 0 {
+		t.Fatalf("empty database: %+v, %v", got, err)
+	}
+	put("truelayer:ob-lloyds", so, 200, now.Add(-30*time.Hour))
+	put("truelayer:ob-lloyds", dd, 200, now.Add(-29*time.Hour))
+	put("truelayer:ob-lloyds", so, 403, now.Add(-time.Hour))
+	put("truelayer:ob-lloyds", "/data/v1/accounts/{id}/balance", 200, now)
+	put("truelayer:ob-monzo", dd, 429, now)
+	put("truelayer:old", so, 200, now)
+
+	got, err := store.LastMandateReads(ctx, q, srcs, eps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Source != "truelayer:ob-lloyds" || !got[0].FetchedAt.Equal(now.Add(-29*time.Hour)) {
+		t.Fatalf("LastMandateReads = %+v, want only truelayer:ob-lloyds at -29h", got)
+	}
+}
+
 func TestConsentHistoryNeedsAnOkFetchRunSinceApproval(t *testing.T) {
 	c := newCluster(t)
 	ctx := context.Background()

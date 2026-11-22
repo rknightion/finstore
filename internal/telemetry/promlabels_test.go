@@ -197,6 +197,7 @@ func TestNoRecordedMetricAttributeCollidesWithPrometheusLabels(t *testing.T) {
 	m.SyncRunWithCategory(ctx, "monzo", "sync", "partial", "rate_limited")
 	m.LastRun(ctx, "monzo", "sync", true, now)
 	m.LastRateLimited(ctx, "monzo", now)
+	m.MandatesLastRead(ctx, "truelayer:ob-lloyds", now)
 	m.ConsentHistory(ctx, "monzo", true)
 	m.ConnectsUnanswered(ctx, "monzo", 1)
 	m.MandatesUnresolved(ctx, "monzo", 1)
@@ -277,7 +278,7 @@ func TestNoRecordedMetricAttributeCollidesWithPrometheusLabels(t *testing.T) {
 		semconv.MetricSchedulerJobRuns, semconv.MetricSchedulerJobDuration, semconv.MetricSchedulerJobLastOK,
 		semconv.MetricWriterLockHeld, semconv.MetricTelemetryExportFailures, semconv.MetricTelemetrySpanAttributesDropped,
 		semconv.MetricSyncLastRunOK, semconv.MetricSyncLastRunTime, semconv.MetricSyncLastRateLimitedTime,
-		semconv.MetricConsentHistoryOK, semconv.MetricConnectUnanswered,
+		semconv.MetricConsentHistoryOK, semconv.MetricConnectUnanswered, semconv.MetricTrueLayerMandatesLastReadTime,
 	}
 	for _, name := range want {
 		if !seen[name] {

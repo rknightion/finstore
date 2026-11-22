@@ -20,28 +20,29 @@ import (
 // Metrics holds the service's instruments. Other packages record through its
 // methods and never see an instrument name.
 type Metrics struct {
-	meter           metric.Meter
-	syncLastSuccess metric.Int64Gauge
-	syncRuns        metric.Int64Counter
-	bankRequests    metric.Int64Counter
-	consentState    metric.Int64Gauge
-	consentExpiry   metric.Int64Gauge
-	mismatch        metric.Int64Gauge
-	importLast      metric.Int64Gauge
-	dumpLastSuccess metric.Int64Gauge
-	up              metric.Int64Gauge
-	unresolved      metric.Int64Gauge
-	optionalReads   metric.Int64Counter
-	cardsUnlisted   metric.Int64Gauge
-	processStart    metric.Int64Gauge
-	jobRuns         metric.Int64Counter
-	jobDuration     metric.Float64Histogram
-	jobLastOK       metric.Int64Gauge
-	syncRunDuration metric.Float64Histogram
-	lastRunOK       metric.Int64Gauge
-	lastRunTime     metric.Int64Gauge
-	lastRateLimited metric.Int64Gauge
-	unanswered      metric.Int64Gauge
+	meter            metric.Meter
+	syncLastSuccess  metric.Int64Gauge
+	syncRuns         metric.Int64Counter
+	bankRequests     metric.Int64Counter
+	consentState     metric.Int64Gauge
+	consentExpiry    metric.Int64Gauge
+	mismatch         metric.Int64Gauge
+	importLast       metric.Int64Gauge
+	dumpLastSuccess  metric.Int64Gauge
+	up               metric.Int64Gauge
+	unresolved       metric.Int64Gauge
+	optionalReads    metric.Int64Counter
+	cardsUnlisted    metric.Int64Gauge
+	processStart     metric.Int64Gauge
+	jobRuns          metric.Int64Counter
+	jobDuration      metric.Float64Histogram
+	jobLastOK        metric.Int64Gauge
+	syncRunDuration  metric.Float64Histogram
+	lastRunOK        metric.Int64Gauge
+	lastRunTime      metric.Int64Gauge
+	lastRateLimited  metric.Int64Gauge
+	mandatesLastRead metric.Int64Gauge
+	unanswered       metric.Int64Gauge
 	// history is the source-to-value snapshot the historyOK observable gauge reports at each
 	// collection; a source left out of the snapshot has no series.
 	history      historySnapshot
@@ -89,6 +90,7 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 	gauge(&m.lastRunOK, semconv.MetricSyncLastRunOK, "1", "1 when the newest finished run of a source and kind ended ok, 0 when it ended partial or failed")
 	gauge(&m.lastRunTime, semconv.MetricSyncLastRunTime, "s", "Unix time the newest finished run of a source and kind ended")
 	gauge(&m.lastRateLimited, semconv.MetricSyncLastRateLimitedTime, "s", "Unix time the newest rate-limited run of a source ended; absent for a source that never had one")
+	gauge(&m.mandatesLastRead, semconv.MetricTrueLayerMandatesLastReadTime, "s", "Unix time a TrueLayer connection last read its standing orders or direct debits successfully; absent for a connection that never has")
 	gauge(&m.unanswered, semconv.MetricConnectUnanswered, "1", "Connect attempts of a source that expired unused in the last 24 hours")
 	counter(&m.mcpToolCalls, semconv.MetricMCPToolCalls, "MCP tool calls, by tool, outcome (ok, invalid, busy, timeout, refused or error) and client (the grant group of the caller)")
 	if err == nil {
@@ -212,6 +214,12 @@ func (m *Metrics) LastRun(ctx context.Context, source, kind string, ok bool, fin
 // only for a source that has had one.
 func (m *Metrics) LastRateLimited(ctx context.Context, source string, at time.Time) {
 	m.lastRateLimited.Record(ctx, at.Unix(), metric.WithAttributes(attribute.String(semconv.AttrSource, source)))
+}
+
+// MandatesLastRead records when a TrueLayer connection last read its mandates successfully. The
+// caller records it only for a connection that has.
+func (m *Metrics) MandatesLastRead(ctx context.Context, source string, at time.Time) {
+	m.mandatesLastRead.Record(ctx, at.Unix(), metric.WithAttributes(attribute.String(semconv.AttrSource, source)))
 }
 
 // historySnapshot is what the consent history gauge reports: a value for each source in it.

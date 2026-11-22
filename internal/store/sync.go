@@ -502,6 +502,37 @@ func LastRateLimited(ctx context.Context, q DBTX) ([]RateLimitedRun, error) {
 	return out, nil
 }
 
+// MandateRead is the newest successful read of a source's mandates.
+type MandateRead struct {
+	Source    string
+	FetchedAt time.Time
+}
+
+// LastMandateReads returns, for each of the given sources that has one, when its newest stored
+// 2xx answer to any of the given mandate endpoints was fetched. A refused read (403 sca_exceeded
+// on a scheduled sync) is stored with its status and never counts; a source without a successful
+// read is not listed. Ordered by source.
+func LastMandateReads(ctx context.Context, q DBTX, sources, endpoints []string) ([]MandateRead, error) {
+	if len(sources) == 0 || len(endpoints) == 0 {
+		return nil, nil
+	}
+	rows, err := q.Query(ctx, `SELECT source, max(fetched_at) FROM raw.api_response
+		WHERE source = ANY($1) AND endpoint = ANY($2) AND status BETWEEN 200 AND 299
+		GROUP BY source ORDER BY source`, sources, endpoints)
+	if err != nil {
+		return nil, fmt.Errorf("store: last mandate reads: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (MandateRead, error) {
+		var m MandateRead
+		err := r.Scan(&m.Source, &m.FetchedAt)
+		return m, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: last mandate reads: %w", err)
+	}
+	return out, nil
+}
+
 // HistoryStatus is whether a source's current consent has its history.
 type HistoryStatus struct {
 	Source string
