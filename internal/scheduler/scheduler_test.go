@@ -535,17 +535,69 @@ func TestNextDaily(t *testing.T) {
 }
 
 // Once runs its job a single time, after the jitter, and never again however long Run goes on.
+//
+// The once job's delay is held on a channel the test releases, so nothing depends on how the
+// goroutines are scheduled: the job is seen not to have run while its jitter is pending, then to
+// run once the jitter is up, and a busy neighbour keeps ticking afterwards without it running again.
 func TestOnceRunsASingleTimeAfterItsJitter(t *testing.T) {
 	s, clk, _ := newTest(t) // rnd gives the largest jitter
+	release := make(chan time.Time)
+	s.after = func(d time.Duration) <-chan time.Time {
+		if d == time.Minute { // only the once job asks for this delay
+			clk.mu.Lock()
+			clk.delays = append(clk.delays, d)
+			clk.mu.Unlock()
+			return release
+		}
+		return clk.after(d)
+	}
 	var once, ticks atomic.Int32
 	s.Once("catch-up", time.Minute, func(context.Context) error { once.Add(1); return nil })
 	s.Every("tick", time.Millisecond, 0, func(context.Context) error { ticks.Add(1); return nil })
-	runUntil(t, s, func() bool { return ticks.Load() >= 20 })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() { errc <- s.Run(ctx) }()
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for !cond() {
+			if time.Now().After(deadline) {
+				cancel()
+				t.Fatalf("not reached: %s", what)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	// While the jitter is pending the once job has not run, however much the other job does.
+	waitFor("20 ticks", func() bool { return ticks.Load() >= 20 })
+	if got := once.Load(); got != 0 {
+		cancel()
+		t.Fatalf("the once job ran %d times before its jitter was up, want 0", got)
+	}
+
+	release <- time.Time{} // the jitter is up
+	waitFor("the once job to run", func() bool { return once.Load() >= 1 })
+
+	// It never runs again, however long Run goes on.
+	after := ticks.Load()
+	waitFor("20 more ticks", func() bool { return ticks.Load() >= after+20 })
+	cancel()
+	if err := <-errc; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
 	if got := once.Load(); got != 1 {
 		t.Fatalf("the once job ran %d times, want 1", got)
 	}
-	if d := clk.delaysCopy(); !slices.Contains(d, time.Minute) {
-		t.Fatalf("delays %v lack the once job's jitter of a minute", d)
+	var minutes int
+	for _, d := range clk.delaysCopy() {
+		if d == time.Minute {
+			minutes++
+		}
+	}
+	if minutes != 1 {
+		t.Fatalf("delays %v hold %d jitters of a minute, want exactly the once job's one", clk.delaysCopy(), minutes)
 	}
 }
 
