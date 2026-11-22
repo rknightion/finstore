@@ -266,7 +266,7 @@ type FileNormaliser interface {
 // NormaliserRev is the revision of the normalising code. Bump it whenever a change to a
 // normaliser or to the core schema would give different core rows for the same raw rows; a
 // deployment must then run `finstore renormalise`.
-const NormaliserRev = 4
+const NormaliserRev = 5
 
 // Stats counts what one CatchUp did.
 type Stats struct {
