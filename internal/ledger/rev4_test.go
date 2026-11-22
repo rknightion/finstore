@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/rknightion/finstore/internal/ledger"
 )
@@ -72,5 +73,28 @@ func TestRenormaliseOverARevisionThreeCoreDropsRepeatedVersions(t *testing.T) {
 	ps, err := e.core().GetProjectionState(ctx)
 	if err != nil || ps.NormaliserRev != ledger.NormaliserRev {
 		t.Fatalf("projection state %+v, %v", ps, err)
+	}
+}
+
+// Codex's sequence through the ledger: A at t1, A at t3, B at t2 loaded late, B at t4. The row
+// ends at B and the running sum follows it.
+func TestRunningSumFollowsANewerSightingThatAddsNoVersion(t *testing.T) {
+	e := newEnv(t)
+	e.accounts(fAcc{ID: "acc_1", Type: "current", Opened: "2029-01-01"})
+	t1 := e.clock.Add(time.Hour)
+	for i, v := range []struct {
+		amount int64
+		seen   time.Time
+	}{{-100, t1}, {-100, t1.Add(2 * time.Hour)}, {-150, t1.Add(time.Hour)}, {-150, t1.Add(3 * time.Hour)}} {
+		e.respondAt(e.fetch(int64(i+2), "acc_1", nil), "/transactions", body(fBody{Transactions: []json.RawMessage{txn("tx_1", "acc_1", v.amount, jan5)}}), v.seen)
+		e.catchUp()
+	}
+	accID := wantAccountID(fakeSource, "acc_1")
+	txID := wantTxnID(accID, fakeSource, "tx_1")
+	if got := e.txn(txID); got.AmountMinor != -150 || got.VersionCount != 2 {
+		t.Fatalf("transaction %+v, want amount -150 and 2 versions", got)
+	}
+	if r := e.recon(accID); r.RunningSumMinor != -150 {
+		t.Fatalf("running sum %d, want -150", r.RunningSumMinor)
 	}
 }
