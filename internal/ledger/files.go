@@ -106,11 +106,13 @@ func (a *applier) importFile(ctx context.Context, f *store.ImportFile) error {
 // overlaps or joins on the same day and is not checked. Either way reach moves to the
 // statement's last date and closing balance when that is later than reach.
 //
-// break_count is the number of gaps. reconciled_through is the last date reached when there is
-// no gap, else the after_date of the earliest gap. The check fields follow the gaps:
-// last_check_at is the time of the row being applied, last_check_ok whether there is no gap (and
-// no shared bank reference), last_diff_minor the earliest gap's difference (0 with none), and
-// last_pass_at moves to last_check_at on a pass.
+// A gap with a difference of 0 that an accept_gap operator entry names is recorded with that
+// entry's reason and is not open (see acceptGaps). break_count is the number of open gaps.
+// reconciled_through is the last date reached when there is no open gap, else the after_date of
+// the earliest open gap. The check fields follow the open gaps: last_check_at is the time of the
+// row being applied, last_check_ok whether there is no open gap (and no shared bank reference),
+// last_diff_minor the earliest open gap's difference (0 with none), and last_pass_at moves to
+// last_check_at on a pass.
 //
 // For an account with an end (ended_on), statements whose first date is after it are left out of
 // the walk and no gap is recorded whose later side is after it: the account that continues it
@@ -131,6 +133,9 @@ func (a *applier) recomputeContinuity(ctx context.Context, acc store.Account, at
 	if acc.EndedOn != nil {
 		gaps = slices.DeleteFunc(gaps, func(g store.FileGap) bool { return g.BeforeDate.After(*acc.EndedOn) })
 	}
+	if err := a.acceptGaps(ctx, acc, gaps); err != nil {
+		return err
+	}
 	if err := a.core.ReplaceFileGaps(ctx, acc.ID, gaps); err != nil {
 		return err
 	}
@@ -142,15 +147,13 @@ func (a *applier) recomputeContinuity(ctx context.Context, acc store.Account, at
 		rec.BreakCount, rec.ReconciledThrough, rec.LastCheckOK, rec.LastDiffMinor, rec.LastCheckAt = 0, nil, nil, nil, nil
 		return a.core.PutReconciliation(ctx, rec)
 	}
-	if len(gaps) > 0 {
-		through = gaps[0].AfterDate
-	}
+	open := slices.DeleteFunc(slices.Clone(gaps), func(g store.FileGap) bool { return g.AcceptedReason != nil })
 	var diff int64
-	if len(gaps) > 0 {
-		diff = gaps[0].DiffMinor
+	if len(open) > 0 {
+		through, diff = open[0].AfterDate, open[0].DiffMinor
 	}
-	ok := len(gaps) == 0 && !sharedFlag(rec)
-	rec.BreakCount = len(gaps)
+	ok := len(open) == 0 && !sharedFlag(rec)
+	rec.BreakCount = len(open)
 	rec.ReconciledThrough = &through
 	rec.LastCheckAt = &at
 	rec.LastCheckOK = &ok
@@ -161,8 +164,35 @@ func (a *applier) recomputeContinuity(ctx context.Context, acc store.Account, at
 	return a.core.PutReconciliation(ctx, rec)
 }
 
+// acceptGaps sets AcceptedReason on each gap with a difference of 0 that an accept_gap entry for
+// the account, up to and including the row being applied, names by its dates: the newest such
+// entry's reason. A gap with a difference is never accepted.
+func (a *applier) acceptGaps(ctx context.Context, acc store.Account, gaps []store.FileGap) error {
+	if !slices.ContainsFunc(gaps, func(g store.FileGap) bool { return g.DiffMinor == 0 }) {
+		return nil
+	}
+	entries, err := store.OperatorEntriesBefore(ctx, a.q, EntryAcceptGap, acc.Slug, a.row.Seq+1)
+	if err != nil {
+		return err
+	}
+	for i := range gaps {
+		g := &gaps[i]
+		if g.DiffMinor != 0 {
+			continue
+		}
+		for _, e := range entries {
+			p, ok := parseAcceptGap(e.Payload)
+			if ok && p.AfterDate == g.AfterDate.Format(time.DateOnly) && p.BeforeDate == g.BeforeDate.Format(time.DateOnly) {
+				g.AcceptedReason = &p.Reason
+				break
+			}
+		}
+	}
+	return nil
+}
+
 // continuity walks statements, which must be in ListStatements order and not empty, and returns
-// the gaps in walk order and the reconciled-through date.
+// the gaps in walk order and the last date reached.
 func continuity(stmts []store.Statement) ([]store.FileGap, time.Time) {
 	var gaps []store.FileGap
 	var reachDate time.Time
@@ -183,8 +213,5 @@ func continuity(stmts []store.Statement) ([]store.FileGap, time.Time) {
 			reachDate, reachBalance, reachExact = s.LastDate, s.ClosingMinor, s.ExactPeriod
 		}
 	}
-	if len(gaps) > 0 {
-		return gaps, gaps[0].AfterDate
-	}
-	return nil, reachDate
+	return gaps, reachDate
 }

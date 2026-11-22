@@ -247,3 +247,128 @@ func TestReconciliationAndProjectionState(t *testing.T) {
 		t.Fatalf("by source: %+v %v", got, err)
 	}
 }
+
+// A sighting in a state already recorded next to it in seen time adds no version, so
+// version_count counts distinct states: a late-loaded sighting of the state that was current at
+// its time, or of the state that came next, adds none. A return to an earlier state after a change
+// is a new transition and adds one.
+func TestASightingOfARecordedStateAddsNoVersion(t *testing.T) {
+	c := newCluster(t)
+	ctx := context.Background()
+	core := mustCore(t, openStore(t, c.app).DB(), store.SchemaCore)
+	acc := testAccount("monzo-current", "current", "api")
+	if err := core.UpsertAccount(ctx, acc); err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Date(2030, 1, 5, 12, 0, 0, 0, time.UTC)
+	tx := testTxn(acc, "tx_1", -100, t0)
+	for i, v := range []struct {
+		state string
+		seen  time.Time
+		want  store.ApplyOutcome
+		count int
+	}{
+		{"pending", t0, store.TransactionCreated, 1},
+		{"settled", t0.Add(2 * time.Hour), store.TransactionChanged, 2},
+		{"pending", t0.Add(-time.Hour), store.TransactionUnchanged, 2},    // the state current at its time, loaded late
+		{"settled", t0.Add(time.Hour), store.TransactionUnchanged, 2},     // the state that came next, loaded late
+		{"settled", t0.Add(3 * time.Hour), store.TransactionUnchanged, 2}, // the current state again
+		{"pending", t0.Add(4 * time.Hour), store.TransactionChanged, 3},   // back to pending: a new transition
+	} {
+		r, err := core.ApplyTransaction(ctx, tx, []byte(`{"state":"`+v.state+`"}`), []byte(v.state), v.seen, int64(i+1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := core.GetTransaction(ctx, tx.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		vs, err := core.ListTransactionVersions(ctx, tx.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Outcome != v.want || got.VersionCount != v.count || len(vs) != v.count {
+			t.Fatalf("sighting %d (%s at %v): outcome %s, version_count %d, %d versions; want %s and %d",
+				i+1, v.state, v.seen, r.Outcome, got.VersionCount, len(vs), v.want, v.count)
+		}
+	}
+	got, err := core.GetTransaction(ctx, tx.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.FirstSeenAt.Equal(t0.Add(-time.Hour)) || !got.LastSeenAt.Equal(t0.Add(4*time.Hour)) || string(got.CurrentHash) != "pending" {
+		t.Fatalf("row %+v", got)
+	}
+}
+
+// agent.transactions shows the version the row mirrors, which need not have the highest version
+// number: a distinct state loaded late, seen before the current one, is numbered after it.
+func TestAgentTransactionsShowsTheCurrentVersionNotTheHighestNumbered(t *testing.T) {
+	c := newCluster(t)
+	ctx := context.Background()
+	db := openStore(t, c.app).DB()
+	core := mustCore(t, db, store.SchemaCore)
+	acc := testAccount("monzo-current", "current", "api")
+	if err := core.UpsertAccount(ctx, acc); err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Date(2030, 1, 5, 12, 0, 0, 0, time.UTC)
+	tx := testTxn(acc, "tx_1", -100, t0)
+	for i, v := range []struct {
+		content string
+		seen    time.Time
+	}{
+		{`{"v":"first"}`, t0},
+		{`{"v":"current"}`, t0.Add(2 * time.Hour)},
+		{`{"v":"between, loaded late"}`, t0.Add(time.Hour)},
+	} {
+		if _, err := core.ApplyTransaction(ctx, tx, []byte(v.content), []byte(v.content), v.seen, int64(i+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var n int
+	var detail string
+	if err := db.QueryRow(ctx, `SELECT version_count, detail->>'v' FROM agent.transactions WHERE id = $1`, tx.ID).Scan(&n, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 || detail != "current" {
+		t.Fatalf("agent.transactions: version_count %d, detail %q; want 3 and the current version", n, detail)
+	}
+}
+
+// A standing order follows the same version rule as a transaction, and agent.standing_orders
+// shows the current version, not the highest numbered.
+func TestAMandateSightingOfARecordedStateAddsNoVersion(t *testing.T) {
+	c := newCluster(t)
+	ctx := context.Background()
+	db := openStore(t, c.app).DB()
+	core := mustCore(t, db, store.SchemaCore)
+	t0 := time.Date(2030, 1, 5, 12, 0, 0, 0, time.UTC)
+	so := store.StandingOrder{ID: uuid.NewSHA1(testNS, []byte("so/1")), BankRef: "11-22-33 12345678", Source: "test", MandateKey: "so_1"}
+	for i, v := range []struct {
+		state string
+		seen  time.Time
+		want  store.ApplyOutcome
+	}{
+		{"first", t0, store.TransactionCreated},
+		{"current", t0.Add(2 * time.Hour), store.TransactionChanged},
+		{"first", t0.Add(-time.Hour), store.TransactionUnchanged},     // the state current at its time, loaded late
+		{"between", t0.Add(time.Hour), store.TransactionOlderVersion}, // a distinct state, loaded late
+	} {
+		got, err := core.ApplyStandingOrder(ctx, so, []byte(`{"v":"`+v.state+`"}`), []byte(v.state), v.seen, int64(i+1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != v.want {
+			t.Fatalf("sighting %d (%s): outcome %s, want %s", i+1, v.state, got, v.want)
+		}
+	}
+	var n int
+	var detail string
+	if err := db.QueryRow(ctx, `SELECT version_count, detail->>'v' FROM agent.standing_orders WHERE id = $1`, so.ID).Scan(&n, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 || detail != "current" {
+		t.Fatalf("agent.standing_orders: version_count %d, detail %q; want 3 and the current version", n, detail)
+	}
+}

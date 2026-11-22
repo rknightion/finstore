@@ -17,7 +17,21 @@ const (
 	EntryAcceptDifference = "accept_difference"
 	// EntryAccountEnd ends an account at a date, or clears its end. Payload: AccountEnd.
 	EntryAccountEnd = "account_end"
+	// EntryAcceptGap accepts a gap between two statements of a file-fed account. Payload: AcceptGap.
+	EntryAcceptGap = "accept_gap"
 )
+
+// AcceptGap is the payload of an accept_gap operator entry: the file gap of the account from
+// AfterDate (the last date of the earlier statement) to BeforeDate (the first date of the later
+// one), both YYYY-MM-DD, is accepted with Reason. It applies only while such a gap exists with a
+// difference of 0: the statements either side of it join, and the bank issued none in between.
+// A later entry for the same gap replaces the reason.
+type AcceptGap struct {
+	Slug       string `json:"slug"`
+	AfterDate  string `json:"after_date"`
+	BeforeDate string `json:"before_date"`
+	Reason     string `json:"reason"`
+}
 
 // AccountEnd is the payload of an account_end operator entry: the account has no transactions
 // after LastDate (YYYY-MM-DD). A null LastDate clears the end. A later entry for the same account
@@ -52,6 +66,8 @@ func (a *applier) operatorEntry(ctx context.Context, e *store.OperatorEntry) err
 		return a.acceptDifference(ctx, e.Payload)
 	case EntryAccountEnd:
 		return a.accountEnd(ctx, e.Payload, e.EnteredAt)
+	case EntryAcceptGap:
+		return a.acceptGap(ctx, e.Payload, e.EnteredAt)
 	}
 	return unparseable("unknown_entry")
 }
@@ -121,6 +137,41 @@ func (a *applier) acceptDifference(ctx context.Context, payload []byte) error {
 	// The reason replaced known_exception; a shared bank reference that still holds is reported
 	// again in its place.
 	return a.checkSharedBankRefs(ctx)
+}
+
+// acceptGap recomputes the continuity of a file-fed account, which reads every accept_gap entry
+// for it up to this one (see acceptGaps). The entry changes nothing unless the gap it names exists
+// with a difference of 0.
+func (a *applier) acceptGap(ctx context.Context, payload []byte, at time.Time) error {
+	p, ok := parseAcceptGap(payload)
+	if !ok {
+		return unparseable("bad_payload")
+	}
+	acc, err := a.core.GetAccountBySlug(ctx, p.Slug)
+	if errors.Is(err, store.ErrNotFound) {
+		return unparseable("unknown_account")
+	}
+	if err != nil {
+		return err
+	}
+	if acc.Feed != feedFile {
+		return unparseable("api_account")
+	}
+	return a.recomputeContinuity(ctx, acc, at)
+}
+
+// parseAcceptGap reads an accept_gap payload; ok is false when a field is missing or a date is
+// not YYYY-MM-DD.
+func parseAcceptGap(payload []byte) (p AcceptGap, ok bool) {
+	if json.Unmarshal(payload, &p) != nil || p.Slug == "" || p.Reason == "" {
+		return p, false
+	}
+	for _, d := range []string{p.AfterDate, p.BeforeDate} {
+		if _, err := time.Parse(time.DateOnly, d); err != nil {
+			return p, false
+		}
+	}
+	return p, true
 }
 
 // accountEnd sets or clears the account's ended_on. A later entry for the same account replaces

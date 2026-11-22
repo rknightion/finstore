@@ -577,3 +577,66 @@ func TestRecorderRefusesAResponseOutsideAFetch(t *testing.T) {
 		t.Fatalf("get outside a fetch: %v, want errNoFetch", err)
 	}
 }
+
+// The last range of a full-history fetch ends in the future and is fetched only up to the run's
+// now. It is recorded complete up to that moment and no further, the run still ends ok, and the
+// next connect fetches the rest of it from that moment before refetching complete ranges.
+func TestLastRangeIsCompleteOnlyUpToWhenItWasFetchedAndTheNextConnectFetchesTheRest(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil, func(o *Options) { o.Concurrency = 1 })
+	now := h.fake.Now()
+	created := now.AddDate(0, 0, -200)
+	h.fake.AddAccount(monzotest.Account{ID: "acc_test_last", Type: "uk_retail", Created: created})
+	generate(h, "acc_test_last", 40, created, now.Add(-time.Hour), 1)
+	// Every request moves the clock, so the last page arrives after the moment asked up to.
+	h.fake.WithDelay(time.Second)
+	h.connect(nil)
+
+	if r := h.lastRun(kindBackfill); r.Outcome == nil || *r.Outcome != outcomeOK {
+		t.Fatalf("first run outcome %v (%v), want ok: an unfinished last range is the normal case", r.Outcome, r.ErrorCategory)
+	}
+	ws := h.windows("acc_test_last")
+	last := ws[len(ws)-1]
+	firstRun := h.txRequests(0)
+	var asked time.Time
+	for _, r := range firstRun {
+		if windowOf(t, ws, r).ID == last.ID {
+			b, err := time.Parse(time.RFC3339Nano, r.Query.Get("before"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			asked = b
+		}
+	}
+	if asked.IsZero() || !asked.Before(last.PeriodEnd) {
+		t.Fatalf("the last range %v..%v was asked up to %v; the scenario needs its end in the future", last.PeriodStart, last.PeriodEnd, asked)
+	}
+	if last.CompletedAt == nil || !last.CompletedAt.Equal(asked) {
+		t.Fatalf("last range recorded complete at %v, want exactly the moment it was fetched up to, %v", last.CompletedAt, asked)
+	}
+	for _, w := range ws[:len(ws)-1] {
+		if w.CompletedAt == nil || w.CompletedAt.Before(w.PeriodEnd) {
+			t.Fatalf("range %v..%v is not complete through its end: %v", w.PeriodStart, w.PeriodEnd, w.CompletedAt)
+		}
+	}
+
+	// A transaction made after the first run's moment, then a second connect.
+	h.fake.Advance(time.Hour)
+	later := h.fake.AddTransaction(monzotest.Transaction{AccountID: "acc_test_last", Amount: -123, Created: asked.Add(30 * time.Minute)})
+	from := len(h.fake.Requests())
+	h.connect(nil)
+	second := h.txRequests(from)
+	if len(second) == 0 {
+		t.Fatal("the second connect asked for no transactions")
+	}
+	if w := windowOf(t, h.windows("acc_test_last"), second[0]); w.ID != last.ID || second[0].Query.Get("since") != formatTime(asked) {
+		t.Fatalf("the second connect first asked for range %v since %q, want the last range since %q",
+			w.PeriodStart, second[0].Query.Get("since"), formatTime(asked))
+	}
+	if !storedTxIDs(t, h)[later.ID] {
+		t.Fatal("the transaction made after the first run was not fetched")
+	}
+	if r := h.lastRun(kindBackfill); r.Outcome == nil || *r.Outcome != outcomeOK {
+		t.Fatalf("second run outcome %v (%v), want ok", r.Outcome, r.ErrorCategory)
+	}
+}

@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -201,6 +200,8 @@ type FileGap struct {
 	BeforeDate time.Time // first date of the later file
 	DiffMinor  int64
 	RawSeq     int64
+	// AcceptedReason is the reason the operator accepted the gap with; nil while it is open.
+	AcceptedReason *string
 }
 
 // ProjectionState is the single core.projection_state row.
@@ -397,11 +398,16 @@ func (c Core) ListTransactionVersions(ctx context.Context, id uuid.UUID) ([]Tran
 //
 // The row mirrors the version seen latest (by seen time; at equal times, the later raw row), so a
 // response stored late but fetched early, such as an old capture loaded after live data, never
-// becomes the current state. Version numbers follow raw seq order.
+// becomes the current state. Version numbers follow raw seq order, so the current version need not
+// be the highest numbered: it is the one whose content_hash is current_hash. A version is a
+// distinct state: a sighting adds one only when its state differs from both versions beside it in
+// seen time (see recordedBeside).
 //
 //   - No stored row: inserts t as version 1 with first and last seen at seenAt.
-//   - Stored hash equals hash: first_seen_at moves back to seenAt if earlier and last_seen_at
-//     forward to it if later; nothing else changes.
+//   - The state is recorded beside the sighting: first_seen_at moves back to seenAt if earlier and
+//     last_seen_at forward to it if later; nothing else changes. In seen-time order this is a
+//     repeat of the current state, or a late sighting of the state current at its time or of the
+//     one that came next.
 //   - Otherwise, seenAt not before last_seen_at: inserts the next version and rewrites the row to
 //     mirror it, keeping disappeared_at; first_seen_at is the earlier of the two, last_seen_at
 //     becomes seenAt.
@@ -430,7 +436,11 @@ func (c Core) ApplyTransaction(ctx context.Context, t Transaction, content json.
 	case err != nil:
 		return ApplyResult{}, err
 	}
-	if bytes.Equal(prev.CurrentHash, hash) {
+	recorded, err := c.recordedBeside(ctx, "core.transaction_version", "transaction_id", t.ID, hash, seenAt, rawSeq)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if recorded {
 		if _, err := c.q.Exec(ctx, c.sql(`UPDATE core.transaction
 			SET first_seen_at = least(first_seen_at, $2), last_seen_at = greatest(last_seen_at, $2) WHERE id = $1`),
 			t.ID, seenAt); err != nil {
@@ -469,6 +479,24 @@ func (c Core) ApplyTransaction(ctx context.Context, t Transaction, content json.
 		return ApplyResult{}, err
 	}
 	return ApplyResult{Outcome: TransactionChanged, Previous: &prev, Current: stateOf(t)}, nil
+}
+
+// recordedBeside reports whether hash is the state of a version beside a sighting at (seenAt,
+// rawSeq) in seen-time order (seen_at, then raw_seq): the newest version before it, or the oldest
+// after it. A sighting that matches either repeats a state already recorded at that time and adds
+// no version. One that matches only a version further away is a return to an earlier state after a
+// change, which is a new transition. versions and idColumn name a version table and its id column.
+func (c Core) recordedBeside(ctx context.Context, versions, idColumn string, id uuid.UUID, hash []byte, seenAt time.Time, rawSeq int64) (bool, error) {
+	var recorded bool
+	err := c.q.QueryRow(ctx, c.sql(`SELECT
+		  coalesce((SELECT content_hash = $4 FROM `+versions+` WHERE `+idColumn+` = $1 AND (seen_at, raw_seq) < ($2, $3)
+		            ORDER BY seen_at DESC, raw_seq DESC LIMIT 1), false)
+		  OR coalesce((SELECT content_hash = $4 FROM `+versions+` WHERE `+idColumn+` = $1 AND (seen_at, raw_seq) > ($2, $3)
+		            ORDER BY seen_at, raw_seq LIMIT 1), false)`), id, seenAt, rawSeq, hash).Scan(&recorded)
+	if err != nil {
+		return false, fmt.Errorf("store: compare with recorded versions: %w", err)
+	}
+	return recorded, nil
 }
 
 func stateOf(t Transaction) TransactionState {
@@ -778,8 +806,8 @@ func (c Core) AddToRunningSum(ctx context.Context, accountID uuid.UUID, delta in
 
 // InsertFileGap inserts g.
 func (c Core) InsertFileGap(ctx context.Context, g FileGap) error {
-	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.file_gap (account_id, after_date, before_date, diff_minor, raw_seq)
-		VALUES ($1, $2, $3, $4, $5)`), g.AccountID, g.AfterDate, g.BeforeDate, g.DiffMinor, g.RawSeq)
+	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.file_gap (account_id, after_date, before_date, diff_minor, raw_seq, accepted_reason)
+		VALUES ($1, $2, $3, $4, $5, $6)`), g.AccountID, g.AfterDate, g.BeforeDate, g.DiffMinor, g.RawSeq, g.AcceptedReason)
 	if err != nil {
 		return fmt.Errorf("store: insert file gap: %w", err)
 	}
@@ -851,14 +879,14 @@ func (c Core) ListStatements(ctx context.Context, accountID uuid.UUID) ([]Statem
 
 // ListFileGaps returns the account's file gaps in raw_seq order.
 func (c Core) ListFileGaps(ctx context.Context, accountID uuid.UUID) ([]FileGap, error) {
-	rows, err := c.q.Query(ctx, c.sql(`SELECT account_id, after_date, before_date, diff_minor, raw_seq
+	rows, err := c.q.Query(ctx, c.sql(`SELECT account_id, after_date, before_date, diff_minor, raw_seq, accepted_reason
 		FROM core.file_gap WHERE account_id = $1 ORDER BY raw_seq`), accountID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list file gaps: %w", err)
 	}
 	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (FileGap, error) {
 		var g FileGap
-		err := r.Scan(&g.AccountID, &g.AfterDate, &g.BeforeDate, &g.DiffMinor, &g.RawSeq)
+		err := r.Scan(&g.AccountID, &g.AfterDate, &g.BeforeDate, &g.DiffMinor, &g.RawSeq, &g.AcceptedReason)
 		return g, err
 	})
 	if err != nil {
@@ -1159,7 +1187,11 @@ func (c Core) applyMandate(ctx context.Context, kind string, id uuid.UUID, accou
 	case err != nil:
 		return "", fmt.Errorf("store: get %s state: %w", kind, err)
 	}
-	if bytes.Equal(prev.CurrentHash, hash) {
+	recorded, err := c.recordedBeside(ctx, versions, idColumn, id, hash, seenAt, rawSeq)
+	if err != nil {
+		return "", err
+	}
+	if recorded {
 		if _, err := c.q.Exec(ctx, c.sql(`UPDATE `+table+` SET account_id = $2,
 			first_seen_at = least(first_seen_at, $3), last_seen_at = greatest(last_seen_at, $3) WHERE id = $1`),
 			id, accountID, seenAt); err != nil {

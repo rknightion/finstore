@@ -39,6 +39,7 @@ commands:
   account add                 create an account fed by statement files
   account list                list accounts
   account accept-difference   record a known balance difference as accepted
+  account accept-gap          record a gap between two statements as accepted
   account end                 end an account at a date, or clear its end
   import                      import one statement from standard input
   load-capture                load API responses captured before the service existed
@@ -159,7 +160,7 @@ func runAccount(ctx context.Context, env app.Env, args []string,
 	flags func(string) *flag.FlagSet, parse func(*flag.FlagSet, []string) bool,
 ) int {
 	if len(args) == 0 {
-		_, _ = fmt.Fprintln(env.Stderr, "finstore account: expected add, list, accept-difference or end")
+		_, _ = fmt.Fprintln(env.Stderr, "finstore account: expected add, list, accept-difference, accept-gap or end")
 		return exitUsage
 	}
 	switch args[0] {
@@ -192,6 +193,26 @@ func runAccount(ctx context.Context, env app.Env, args []string,
 			return exitUsage
 		}
 		return app.AcceptDifference(ctx, env, *slug, *reason)
+	case "accept-gap":
+		fs := flags("account accept-gap")
+		slug := fs.String("slug", "", "slug of the account")
+		from := fs.String("from", "", "the last date of the statement before the gap, YYYY-MM-DD, as coverage shows it")
+		to := fs.String("to", "", "the first date of the statement after the gap, YYYY-MM-DD, as coverage shows it")
+		reason := fs.String("reason", "", "why the gap is accepted")
+		if !parse(fs, args[1:]) {
+			return exitUsage
+		}
+		if *slug == "" || *from == "" || *to == "" {
+			_, _ = fmt.Fprintln(env.Stderr, "finstore account accept-gap: --slug, --from and --to are required")
+			return exitUsage
+		}
+		after, err1 := time.Parse(time.DateOnly, *from)
+		before, err2 := time.Parse(time.DateOnly, *to)
+		if err1 != nil || err2 != nil {
+			_, _ = fmt.Fprintln(env.Stderr, "finstore account accept-gap: --from and --to must be YYYY-MM-DD")
+			return exitUsage
+		}
+		return app.AcceptGap(ctx, env, *slug, after, before, *reason)
 	case "end":
 		fs := flags("account end")
 		slug := fs.String("slug", "", "slug of the account")
