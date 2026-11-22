@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/rknightion/finstore/internal/consent"
+	"github.com/rknightion/finstore/internal/semconv"
 	"github.com/rknightion/finstore/internal/store"
 	"github.com/rknightion/finstore/internal/truelayertest"
 )
@@ -117,6 +118,34 @@ func TestInfoRefusedLeavesTheConsentActiveAndTheRunOK(t *testing.T) {
 				t.Errorf("last request %s, want the refused /info", last.Path)
 			}
 		})
+	}
+}
+
+// A bank that answers an optional read only shortly after the owner authenticates (Monzo's /info)
+// refuses a scheduled read with 403 sca_exceeded. That is expected, not a fault: it is counted
+// sca_required, not refused, and logged at info level; the run stays ok and the consent active.
+func TestInfoScaExceededIsCountedScaRequired(t *testing.T) {
+	h := newHarness(t)
+	w := h.connectedNextDay()
+	h.fake.FailWith(ConnLloyds, pathInfo, http.StatusForbidden, "sca_exceeded", 1)
+	if err := w.RunScheduled(context.Background()); err != nil {
+		t.Fatalf("RunScheduled: %v", err)
+	}
+	requireOKRunWithActiveConsent(t, h)
+	if n := h.optional(pathInfo, semconv.ResultSCARequired); n != 1 {
+		t.Errorf("optional_reads{info, sca_required} = %d, want 1", n)
+	}
+	if n := h.optional(pathInfo, "refused"); n != 0 {
+		t.Errorf("optional_reads{info, refused} = %d, want 0", n)
+	}
+	const msg = "truelayer optional read needs a fresh authentication"
+	if got := h.logs.messages(slog.LevelInfo); !slices.Contains(got, msg) {
+		t.Errorf("info lines %v lack %q", got, msg)
+	}
+	for _, w := range h.logs.messages(slog.LevelWarn) {
+		if strings.Contains(w, "optional read") {
+			t.Errorf("an sca_exceeded answer logged a warning: %s", w)
+		}
 	}
 }
 
