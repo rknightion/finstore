@@ -25,7 +25,9 @@ type optionalRun struct{ limited bool }
 // is counted and logged by result:
 //
 //   - 501, or a bank code that says the endpoint is unsupported: info level, unsupported;
-//   - 401, 403 or access_denied: warning, refused. The consent is not ended;
+//   - 403 sca_exceeded: info level, sca_required. The bank answers this read only shortly after the
+//     owner authenticates (Monzo's /info), so a scheduled read is refused as expected;
+//   - any other 401, 403 or access_denied: warning, refused. The consent is not ended;
 //   - 429 or the daily limit: warning, rate_limited, and no further optional read this run;
 //   - any other bank failure or unreadable body: warning, failed.
 //
@@ -51,6 +53,8 @@ func (w *Worker) stepOptional(ctx context.Context, run *optionalRun, endpoint st
 		run.limited = true
 	case isUnsupported(err):
 		result, msg = resultUnsupported, "truelayer optional read unsupported"
+	case isSCAExceeded(err):
+		result, msg = semconv.ResultSCARequired, "truelayer optional read needs a fresh authentication"
 	case isRefused(err):
 		result, msg = resultRefused, "truelayer optional read refused"
 	default:
@@ -58,12 +62,12 @@ func (w *Worker) stepOptional(ctx context.Context, run *optionalRun, endpoint st
 	}
 	w.metrics.OptionalRead(ctx, w.source, endpoint, result)
 	cat := category(err)
-	if result == resultRefused || result == resultUnsupported {
+	if result == resultRefused || result == resultUnsupported || result == semconv.ResultSCARequired {
 		// category would call a refusal consent_lost, which an optional read never causes.
 		cat = result
 	}
 	attrs := []any{semconv.LogEndpoint, endpoint, semconv.LogErrorCategory, cat}
-	if result == resultUnsupported {
+	if result == resultUnsupported || result == semconv.ResultSCARequired {
 		w.log.InfoContext(ctx, msg, attrs...)
 	} else {
 		w.log.WarnContext(ctx, msg, attrs...)
