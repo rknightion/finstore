@@ -71,6 +71,9 @@ const (
 	MetricSyncLastRunTime = "finstore.sync.last_run.time"
 	// MetricSyncLastRateLimitedTime is when a source's newest rate-limited run finished.
 	MetricSyncLastRateLimitedTime = "finstore.sync.last_rate_limited.time"
+	// MetricTrueLayerMandatesLastReadTime is when a TrueLayer connection last read its standing
+	// orders or direct debits successfully (a stored 2xx answer; a refusal never counts).
+	MetricTrueLayerMandatesLastReadTime = "finstore.truelayer.mandates.last_read.time"
 	// MetricConsentHistoryOK is 1 when the current consent's history fetch ended ok, else 0.
 	MetricConsentHistoryOK = "finstore.consent.history_ok"
 	// MetricConnectUnanswered counts connect attempts that expired unused in the last 24 hours.

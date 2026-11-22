@@ -19,6 +19,10 @@ const (
 	ConnMonzo  = "ob-monzo"
 )
 
+// MandateEndpoints are the endpoint templates of the mandate reads (standing orders and direct
+// debits), as raw.api_response.endpoint stores them.
+func MandateEndpoints() []string { return []string{pathStandingOrders, pathDirectDebits} }
+
 // Endpoint templates, as raw.api_response.endpoint stores them.
 const (
 	pathMe               = "/data/v1/me"

@@ -231,6 +231,56 @@ func TestStatusPublishesWhenASourceWasLastRateLimited(t *testing.T) {
 	}
 }
 
+// response stores a bank answer of one source and endpoint with the given status.
+func (r *stateRig) response(source, endpoint string, status int, at time.Time) {
+	r.t.Helper()
+	ctx := context.Background()
+	fid, err := store.InsertFetch(ctx, r.st.DB(), store.Fetch{Source: source, Kind: "sync", RunID: 1, StartedAt: at})
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	if _, err := store.InsertAPIResponse(ctx, r.st.DB(), store.APIResponse{FetchID: fid, Source: source, Endpoint: endpoint,
+		Status: status, ContentType: "application/json", FetchedAt: at, Body: []byte(`{"results":[]}`)}); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+// The mandate read gauge comes from the stored answers, not from process memory: a fresh process
+// (new metrics, new publisher) on the same database publishes the same value, a refused scheduled
+// read (403) does not move it, and a connection that never had a successful read publishes nothing.
+func TestStatusPublishesWhenMandatesWereLastReadAcrossARestart(t *testing.T) {
+	now := time.Date(2030, 4, 1, 12, 0, 0, 0, time.UTC)
+	r := newStateRig(t, now)
+	const so, dd = "/data/v1/accounts/{id}/standing_orders", "/data/v1/accounts/{id}/direct_debits"
+	lloyds := map[string]string{"source": "truelayer:ob-lloyds"}
+	connect := now.Add(-30 * time.Hour)
+
+	r.response("truelayer:ob-lloyds", so, 200, connect.Add(-time.Minute))
+	r.response("truelayer:ob-lloyds", dd, 200, connect)
+	// Scheduled syncs since the connect were refused, and another endpoint read fine.
+	r.response("truelayer:ob-lloyds", so, 403, now.Add(-2*time.Hour))
+	r.response("truelayer:ob-lloyds", dd, 403, now.Add(-time.Hour))
+	r.response("truelayer:ob-lloyds", "/data/v1/accounts/{id}/balance", 200, now.Add(-time.Minute))
+	// A connection that was only ever refused.
+	r.response("truelayer:ob-monzo", so, 403, now.Add(-time.Hour))
+	r.status()
+	r.want(semconv.MetricTrueLayerMandatesLastReadTime, lloyds, connect.Unix())
+
+	// Restart: nothing is carried over but the database.
+	reader := sdkmetric.NewManualReader()
+	metrics, err := telemetry.NewMetrics(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2 := &stateRig{t: t, st: r.st, now: now, reader: reader}
+	r2.p = &statusPublisher{st: r.st, m: metrics, log: slog.New(slog.DiscardHandler), now: func() time.Time { return now }, sources: r.p.sources}
+	r2.status()
+	r2.want(semconv.MetricTrueLayerMandatesLastReadTime, lloyds, connect.Unix())
+	if got := r2.points(semconv.MetricTrueLayerMandatesLastReadTime); got != 1 {
+		t.Errorf("mandates.last_read.time has %d points, want 1 (a refused-only connection publishes none)", got)
+	}
+}
+
 // Connect Not Completed reads finstore.connect.unanswered: an attempt that expired unused within
 // the last 24 hours reads 1, and one older than that reads 0.
 func TestStatusPublishesConnectAttemptsThatExpiredUnused(t *testing.T) {

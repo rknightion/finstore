@@ -12,6 +12,7 @@ import (
 	"github.com/rknightion/finstore/internal/semconv"
 	"github.com/rknightion/finstore/internal/store"
 	"github.com/rknightion/finstore/internal/telemetry"
+	"github.com/rknightion/finstore/internal/truelayer"
 )
 
 // consentStates is every state the consent gauge reports, so a state the consent has left reads 0
@@ -76,6 +77,13 @@ func (p *statusPublisher) publishRunState(ctx context.Context) error {
 	}
 	for _, r := range limited {
 		p.m.LastRateLimited(ctx, r.Source, r.FinishedAt)
+	}
+	reads, err := store.LastMandateReads(ctx, db, p.sources, truelayer.MandateEndpoints())
+	if err != nil {
+		return err
+	}
+	for _, r := range reads {
+		p.m.MandatesLastRead(ctx, r.Source, r.FetchedAt)
 	}
 	history, err := store.ConsentHistory(ctx, db)
 	if err != nil {
