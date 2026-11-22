@@ -96,7 +96,10 @@ SELECT t.id, a.slug AS account_slug, t.txn_date, t.created_at, t.settled_at,
        v.content AS detail, pot.slug AS pot_slug
 FROM core.transaction t
 JOIN core.account a ON a.id = t.account_id
-LEFT JOIN core.transaction_version v ON v.transaction_id = t.id AND v.version_no = t.version_count
+-- The current version is the one with the row's hash, which a late-loaded older version numbered
+-- after it does not have.
+LEFT JOIN LATERAL (SELECT content FROM core.transaction_version
+  WHERE transaction_id = t.id AND content_hash = t.current_hash ORDER BY version_no DESC LIMIT 1) v ON true
 LEFT JOIN core.account pot
   ON t.source = 'monzo' AND pot.source = 'monzo' AND pot.type = 'pot'
  AND pot.source_key = v.content -> 'metadata' ->> 'pot_id'
@@ -113,7 +116,8 @@ SELECT t.id AS transaction_id, pot.slug AS pot_slug, a.slug AS account_slug, t.t
        v.content -> 'metadata' ->> 'trigger' AS trigger, t.status, v.content AS detail
 FROM core.transaction t
 JOIN core.account a ON a.id = t.account_id
-JOIN core.transaction_version v ON v.transaction_id = t.id AND v.version_no = t.version_count
+JOIN LATERAL (SELECT content FROM core.transaction_version
+  WHERE transaction_id = t.id AND content_hash = t.current_hash ORDER BY version_no DESC LIMIT 1) v ON true
 JOIN core.account pot
   ON pot.source = 'monzo' AND pot.type = 'pot' AND pot.source_key = v.content -> 'metadata' ->> 'pot_id'
 WHERE t.source = 'monzo' AND t.disappeared_at IS NULL AND t.status <> 'declined';
@@ -188,8 +192,8 @@ WHERE a.ended_on IS NULL
 -- yesterday for an open account, or to the last covered day for a closed one, and to its
 -- ended_on at the latest. Today is never a gap, so the time between the last hourly fetch and now
 -- is not reported. Pots and balances-only accounts have no transaction gaps. For a file account
--- the gaps are core.file_gap (from is the last date of the earlier file, to the first date of the
--- later one) plus "import due" for an account that expects imports, whatever its type, has not
+-- the gaps are the open core.file_gap rows, not those the operator accepted (from is the last
+-- date of the earlier file, to the first date of the later one) plus "import due" for an account that expects imports, whatever its type, has not
 -- ended, and whose latest statement date (its newest transaction date or balance snapshot date)
 -- is more than 35 days old. An ended account counts only its rows and readings up to ended_on.
 -- An account that shares its bank reference with an account of another source, neither ended, is
@@ -214,8 +218,8 @@ fetch_days AS (
   WHERE p.period_end > p.period_start
   UNION ALL
   -- A completed full-history range is covered even when it took more than one fetch to finish
-  -- (a resumed fetch completes only the part it listed). Its last slot may end in the future, so
-  -- it covers no further than the moment it was completed.
+  -- (a resumed fetch completes only the part it listed). Its last slot may end in the future: its
+  -- completed_at is then the moment it was fetched up to, and it covers no further.
   SELECT a.id,
          (w.period_start AT TIME ZONE 'Europe/London')::date,
          ((least(w.period_end, w.completed_at) - interval '1 microsecond') AT TIME ZONE 'Europe/London')::date
@@ -299,6 +303,7 @@ gap_rows AS (
          jsonb_build_object('from', fg.after_date, 'to', fg.before_date,
                             'reason', 'no file covers these days', 'diff_minor', fg.diff_minor)
   FROM core.file_gap fg
+  WHERE fg.accepted_reason IS NULL
   UNION ALL
   SELECT ls.account_id, ls.d + 1,
          jsonb_build_object('from', ls.d + 1, 'to', (SELECT d FROM today), 'reason', 'import due')
@@ -397,7 +402,8 @@ SELECT s.id, a.slug AS account_slug, s.source, s.bank_ref, s.mandate_key,
        v.content AS detail
 FROM core.standing_order s
 LEFT JOIN core.account a ON a.id = s.account_id
-LEFT JOIN core.standing_order_version v ON v.standing_order_id = s.id AND v.version_no = s.version_count;
+LEFT JOIN LATERAL (SELECT content FROM core.standing_order_version
+  WHERE standing_order_id = s.id AND content_hash = s.current_hash ORDER BY version_no DESC LIMIT 1) v ON true;
 
 CREATE VIEW agent.direct_debits AS
 SELECT d.id, a.slug AS account_slug, d.source, d.bank_ref, d.mandate_key,
@@ -406,7 +412,8 @@ SELECT d.id, a.slug AS account_slug, d.source, d.bank_ref, d.mandate_key,
        v.content AS detail
 FROM core.direct_debit d
 LEFT JOIN core.account a ON a.id = d.account_id
-LEFT JOIN core.direct_debit_version v ON v.direct_debit_id = d.id AND v.version_no = d.version_count;
+LEFT JOIN LATERAL (SELECT content FROM core.direct_debit_version
+  WHERE direct_debit_id = d.id AND content_hash = d.current_hash ORDER BY version_no DESC LIMIT 1) v ON true;
 
 -- identity: the newest readable /info response per TrueLayer source. TrueLayer returns the
 -- account holder's name, date of birth, addresses, phone numbers and email addresses. A body that

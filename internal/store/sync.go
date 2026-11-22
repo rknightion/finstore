@@ -394,7 +394,9 @@ func SetBackfillCursor(ctx context.Context, q DBTX, id int64, cursor string) err
 	return nil
 }
 
-// CompleteBackfillWindow marks window id complete at at (the arrival of its last page).
+// CompleteBackfillWindow marks window id complete at at: the arrival of its last page, or for a
+// range whose end lies in the future, the moment it was listed up to. A window completed at a
+// time before its period_end is complete only up to then.
 func CompleteBackfillWindow(ctx context.Context, q DBTX, id int64, at time.Time) error {
 	tag, err := q.Exec(ctx, `UPDATE sync.backfill_window SET completed_at = $2 WHERE id = $1`, id, at)
 	if err != nil {

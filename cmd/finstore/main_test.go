@@ -119,6 +119,26 @@ func TestAccountEndNeedsASlugAndExactlyOneOfLastDateAndClear(t *testing.T) {
 	}
 }
 
+func TestAccountAcceptGapNeedsASlugAndBothDates(t *testing.T) {
+	for _, args := range [][]string{
+		{"account", "accept-gap", "--from", "2030-01-31", "--to", "2030-03-01"},
+		{"account", "accept-gap", "--slug", "bank-joint", "--to", "2030-03-01"},
+		{"account", "accept-gap", "--slug", "bank-joint", "--from", "2030-01-31"},
+		{"account", "accept-gap", "--slug", "bank-joint", "--from", "31/01/2030", "--to", "2030-03-01"},
+	} {
+		code, _, errOut := runWith(t, nil, args...)
+		if code != exitUsage || !strings.Contains(errOut, "finstore account accept-gap") {
+			t.Errorf("%v: code %d, stderr %q", args, code, errOut)
+		}
+	}
+	// A well-formed command goes on to need the database.
+	code, _, errOut := runWith(t, nil, "account", "accept-gap", "--slug", "bank-joint", "--from", "2030-01-31",
+		"--to", "2030-03-01", "--reason", "made-up")
+	if code != 1 || !strings.Contains(errOut, "FINSTORE_DATABASE_URL") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+}
+
 func TestImportNeedsAccountAndFormat(t *testing.T) {
 	code, _, errOut := runWith(t, nil, "import", "--account", "a")
 	if code != exitUsage || !strings.Contains(errOut, "--format") {

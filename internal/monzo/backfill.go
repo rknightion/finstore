@@ -85,8 +85,9 @@ func (t *runTally) fail(category string) {
 // again: slot k of an account is [start + k*RangeLength, start + (k+1)*RangeLength), where start
 // is one day before the account was created, for every slot that starts before now. The last
 // slot ends in the future and is fetched up to now. It returns the order to fetch them in:
-// unfinished ranges (including any left by an earlier run) oldest first, then ranges already
-// complete newest first, to be fetched again.
+// unfinished ranges (including any left by an earlier run, and a last range complete only up to
+// the moment an earlier run fetched it) oldest first, then ranges complete through their end
+// newest first, to be fetched again.
 func (w *Worker) planRanges(ctx context.Context, accts []account, now time.Time) ([]rangeJob, error) {
 	q := w.st.DB()
 	var all []store.BackfillWindow
@@ -109,7 +110,7 @@ func (w *Worker) planRanges(ctx context.Context, accts []account, now time.Time)
 	}
 	var unfinished, done []rangeJob
 	for _, win := range all {
-		if win.CompletedAt == nil {
+		if win.CompletedAt == nil || win.CompletedAt.Before(win.PeriodEnd) {
 			unfinished = append(unfinished, rangeJob{win: win, before: earliest(win.PeriodEnd, now)})
 		} else {
 			done = append(done, rangeJob{win: win, refetch: true, before: earliest(win.PeriodEnd, now)})
@@ -204,6 +205,15 @@ func (w *Worker) fetchRangeAttempt(ctx context.Context, runID int64, job rangeJo
 			FetchID: fetchID, CompletedAt: res.completedAt, Pages: res.pages,
 		}); err != nil {
 			return err
+		}
+		if before.Before(win.PeriodEnd) {
+			// The last range ends in the future and was listed only up to before: it is complete
+			// up to then, and the next run resumes from there with the unfinished ranges. That is
+			// the normal end of a run, not a partial one.
+			if err := store.SetBackfillCursor(ctx, q, win.ID, formatTime(before)); err != nil {
+				return err
+			}
+			return store.CompleteBackfillWindow(ctx, q, win.ID, before)
 		}
 		return store.CompleteBackfillWindow(ctx, q, win.ID, res.completedAt)
 	default:

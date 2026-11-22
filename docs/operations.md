@@ -88,7 +88,9 @@ Three things about Monzo shape this flow:
 - **The full history is only available for about five minutes after the email link is followed.**
   The service fetches everything it can in the first 240 seconds after that moment. Approve in the
   app straight away. Ranges it could not finish keep their place, and the next connect continues
-  them first.
+  them first. The newest range reaches into the future, so it is fetched only up to the moment of
+  the fetch and recorded complete up to then; the next connect fetches the rest of it with the
+  unfinished ranges. That is the normal end of a fetch, which still ends `ok`.
 - **Following the email link replaces the previous connection at once**, before you approve
   anything. If you start a reconnect, finish it. An attempt abandoned before the email link changes
   nothing.
@@ -262,6 +264,24 @@ shown in the coverage view until the missing statement arrives. For PDF statemen
 in the printed periods or in the balance. For `manual-csv` only the balance can show it, so a
 skipped stretch in which money in equalled money out goes unnoticed.
 
+### Accepting a gap
+
+Some banks issue no statement for a month with no transactions, so the gap before the next one never
+closes. When the statements either side of such a gap join (the earlier one's closing balance is the
+later one's opening balance), accept it with the dates `coverage` prints for it:
+
+```sh
+docker exec finstore finstore account accept-gap --slug bank-joint --from 2024-01-31 --to 2024-03-01 \
+  --reason "no statement for February: no transactions"
+```
+
+The entry is kept in `raw` with its reason, so a rebuild replays it. The accepted gap is no longer
+a break: the account reconciles through its newest statement and `agent.coverage` leaves the gap
+out. The command is refused, and records nothing, when the account has no gap with those dates or
+when the balances either side of it differ: money moved in between, and only the missing statement
+closes that gap. Running it again for the same gap replaces the reason. A later statement that
+leaves a new gap counts as usual.
+
 ### Ending an account
 
 When another source takes over an account from a date (for example a bank API that continues an
@@ -369,7 +389,8 @@ current balances.
 | `finstore serve` | app | The HTTP server, the scheduler, the Monzo worker and, when TrueLayer is configured, the two TrueLayer workers |
 | `finstore account add`, `finstore account list` | app | Create and list file-fed accounts |
 | `finstore account end --slug S --last-date YYYY-MM-DD`, `finstore account end --slug S --clear` | app | Ends an account at a date, or removes its end. See [Ending an account](#ending-an-account) |
-| `finstore account accept-difference --slug S --reason TEXT` | app | For an account an API feeds: records that its current balance difference is known and accepted, so it stops counting as a mismatch. A different difference later counts again. A statement-fed account is refused: its gaps close when the missing statement is imported |
+| `finstore account accept-difference --slug S --reason TEXT` | app | For an account an API feeds: records that its current balance difference is known and accepted, so it stops counting as a mismatch. A different difference later counts again. A statement-fed account is refused: see `account accept-gap` |
+| `finstore account accept-gap --slug S --from YYYY-MM-DD --to YYYY-MM-DD --reason TEXT` | app | For an account fed by statements: records that the gap from `--from` to `--to`, as `coverage` shows it, is known and accepted, because the bank issued no statement for it. See [Accepting a gap](#accepting-a-gap) |
 | `finstore import` | app | Imports one statement from standard input |
 | `finstore load-capture --dir PATH [--dir PATH]...` | app | Loads API responses captured before the service existed. Loading twice loads once, and a capture older than what is already held never replaces newer data. A capture loaded while it was still running, then loaded again once it has finished, gets the completion of a finished fetch whose pages it already holds, without storing them again |
 | `finstore renormalise [--verify]` | owner | Rebuilds `core` from `raw`. With `--verify` it swaps nothing: exit 0 when the rebuilt copy equals the live one, 4 when it differs, listing table, key, column and kind of difference. Either way it first normalises any stored rows the live record has not caught up with, unless the live record was built by another normaliser revision: that one is left as it is, and the rows still waiting show as differences |
@@ -433,7 +454,10 @@ is fixed after the fact: correct the code, run `renormalise`, and the stored his
 from the original bytes.
 
 Amounts are integers in minor units (pence). A transaction that the bank later changes gets a new
-version; the old one is kept. A transaction that the bank stops returning is marked as disappeared,
+version; the old one is kept. Each version is a distinct state: seeing a transaction again in the
+state recorded at that time, or in the one recorded next (a capture loaded late), adds none, so
+`version_count` counts the states it has been in, in turn. Going back to an earlier state after a change is a change and adds
+one. A transaction that the bank stops returning is marked as disappeared,
 not deleted.
 
 ### Reading the data
@@ -616,7 +640,8 @@ Two views follow the money into and out of pots:
   were not declined. The check runs on every sync, using two balance readings around the fetch so
   that a transaction arriving mid-fetch does not raise a false alarm.
 - **File-fed accounts**: each statement must pass its own checks to be imported at all, and each
-  must start from the balance the previous one ended on.
+  must start from the balance the previous one ended on. A gap the operator accepted (see
+  [Accepting a gap](#accepting-a-gap)) does not count.
 - **Accounts with a running balance on every row** (`running_balance`): each day's rows must add
   up, from the previous day's closing balance, to one of that day's running balances. The rows of a
   day carry no time, so only the day's total is checked. A day that does not add up is a mismatch,
@@ -865,7 +890,7 @@ such as `main-659f3b6`, or `dev` for an unlabelled build), `deployment.environme
 | Process | `service.instance.id` | `finstore.command` |
 |---|---|---|
 | `serve` | the fixed word `serve`, so its series keep their labels across restarts | absent |
-| A command (`migrate`, `renormalise`, `account add`, `account list`, `account accept-difference`, `account end`, `import`, `load-capture`, `coverage`) | a new UUID for each run, so a command never writes `serve`'s series | the command's name |
+| A command (`migrate`, `renormalise`, `account add`, `account list`, `account accept-difference`, `account accept-gap`, `account end`, `import`, `load-capture`, `coverage`) | a new UUID for each run, so a command never writes `serve`'s series | the command's name |
 
 `bootstrap`, `healthcheck`, `version` and `help` export nothing. `bootstrap` executes `CREATE ROLE`
 with a password, and the health check runs every 30 seconds.
@@ -931,7 +956,7 @@ body. finstore sends no trace header to a bank, and a bank sees the same request
 or off.
 
 **Postgres.** `serve` and the commands that read or write through the app role (`account add`,
-`account list`, `account accept-difference`, `account end`, `import`, `coverage`) and `migrate` open
+`account list`, `account accept-difference`, `account accept-gap`, `account end`, `import`, `coverage`) and `migrate` open
 their database connection with tracing. A query, a prepare, a connect or a pool acquire made while a
 span is recording becomes a client span beneath it, named for the statement's first word (`SELECT`)
 and carrying `db.query.text` with placeholders only (`$1`), `db.operation.name`, `db.namespace`,

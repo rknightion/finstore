@@ -78,6 +78,9 @@ CREATE TABLE {{schema}}.reconciliation (
 CREATE TABLE {{schema}}.file_gap (
   account_id uuid NOT NULL REFERENCES {{schema}}.account(id), after_date date NOT NULL,
   before_date date NOT NULL, diff_minor bigint NOT NULL, raw_seq bigint NOT NULL,
+  -- the reason of the accept_gap operator entry that accepted this gap (only a gap whose
+  -- diff_minor is 0 can be accepted); null while the gap is open. An accepted gap is not a break.
+  accepted_reason text,
   PRIMARY KEY (account_id, raw_seq));
 
 -- One row per accepted imported statement. File continuity is computed from the whole set, so

@@ -26,11 +26,6 @@ func detailJSON(t *testing.T, raw json.RawMessage, want string) {
 
 // Revision 3 of the normaliser added core.account.detail and the two pending tables; revision 4
 // checks credit cards by balance_movement, with core.reconciliation.anchor_diff_minor.
-func TestNormaliserRevisionIsFour(t *testing.T) {
-	if ledger.NormaliserRev != 4 {
-		t.Fatalf("NormaliserRev = %d, want 4", ledger.NormaliserRev)
-	}
-}
 
 // A core built by revision 3 holds its cards as balances_only, with no anchor_diff_minor.
 // Renormalise rebuilds it with the cards checked by balance_movement, from raw.

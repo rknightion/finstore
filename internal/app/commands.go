@@ -55,6 +55,7 @@ const (
 	entryAccountAdd       = "account_add"
 	entryAcceptDifference = "accept_difference"
 	entryAccountEnd       = "account_end"
+	entryAcceptGap        = "accept_gap"
 )
 
 const (
@@ -436,7 +437,7 @@ func acceptDifference(ctx context.Context, e Env, t cliTelemetry, slug, reason s
 			return err
 		}
 		if account.Feed != feedAPI {
-			return fmt.Errorf("account %s is fed by statement files: a gap between two statements closes when the missing statement is imported, and cannot be accepted", slug)
+			return fmt.Errorf("account %s is fed by statement files: a gap between two statements closes when the missing statement is imported, or with account accept-gap when the bank issued none", slug)
 		}
 		rec, err := core.GetReconciliation(ctx, account.ID)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -466,6 +467,68 @@ func acceptDifference(ctx context.Context, e Env, t cliTelemetry, slug, reason s
 		return e.fail(err)
 	}
 	_, _ = fmt.Fprintf(e.Stdout, "account %s: a difference of %d minor units is recorded as accepted\n", slug, diff)
+	return ExitOK
+}
+
+// AcceptGap records that the gap between two statements of a file-fed account, from after (the last
+// date of the earlier statement) to before (the first date of the later one), as the coverage view
+// shows it, is known and accepted: the bank issued no statement for it. It is refused, with nothing
+// recorded, unless the account has that gap and the statements either side of it join (the
+// earlier one's closing balance is the later one's opening balance).
+func AcceptGap(ctx context.Context, e Env, slug string, after, before time.Time, reason string) int {
+	return e.withTelemetry(ctx, "account accept-gap", func(ctx context.Context, t cliTelemetry) int {
+		return acceptGap(ctx, e, t, slug, after, before, reason)
+	})
+}
+
+func acceptGap(ctx context.Context, e Env, t cliTelemetry, slug string, after, before time.Time, reason string) int {
+	if strings.TrimSpace(reason) == "" {
+		return e.fail(errors.New("--reason is required"))
+	}
+	from, to := after.Format(time.DateOnly), before.Format(time.DateOnly)
+	err := withWriter(ctx, e, t, "account", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
+		core, err := store.NewCore(tx, store.SchemaCore)
+		if err != nil {
+			return err
+		}
+		account, err := core.GetAccountBySlug(ctx, slug)
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("no account has the slug %q", slug)
+		} else if err != nil {
+			return err
+		}
+		if account.Feed == feedAPI {
+			return fmt.Errorf("account %s is fed by an API and has no statement gaps: use account accept-difference", slug)
+		}
+		gaps, err := core.ListFileGaps(ctx, account.ID)
+		if err != nil {
+			return err
+		}
+		i := slices.IndexFunc(gaps, func(g store.FileGap) bool {
+			return g.AfterDate.Format(time.DateOnly) == from && g.BeforeDate.Format(time.DateOnly) == to
+		})
+		if i < 0 {
+			return fmt.Errorf("account %s has no gap from %s to %s: finstore coverage lists its gaps", slug, from, to)
+		}
+		if gaps[i].DiffMinor != 0 {
+			return fmt.Errorf("the gap from %s to %s cannot be accepted: the closing balance before it differs from the opening balance after it, so money moved in between; import the missing statement", from, to)
+		}
+		payload, err := json.Marshal(ledger.AcceptGap{Slug: slug, AfterDate: from, BeforeDate: to, Reason: reason})
+		if err != nil {
+			return err
+		}
+		if _, err := store.InsertOperatorEntry(ctx, tx, store.OperatorEntry{
+			Kind: entryAcceptGap, Payload: payload, EnteredAt: e.now(),
+		}); err != nil {
+			return err
+		}
+		_, err = l.CatchUp(ctx, tx, store.SchemaCore)
+		return err
+	})
+	if err != nil {
+		return e.fail(err)
+	}
+	_, _ = fmt.Fprintf(e.Stdout, "account %s: the gap from %s to %s is recorded as accepted\n", slug, from, to)
 	return ExitOK
 }
 

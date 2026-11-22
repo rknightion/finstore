@@ -143,10 +143,10 @@ type ApplyOutcome string
 // ApplyTransaction outcomes.
 const (
 	TransactionCreated   ApplyOutcome = "created"   // a new transaction and its version 1
-	TransactionChanged   ApplyOutcome = "changed"   // a new version; the row now mirrors it
-	TransactionUnchanged ApplyOutcome = "unchanged" // same hash as the row; only the seen times moved
-	// TransactionOlderVersion: a new version seen before the row's last_seen_at (an old capture
-	// loaded late). The version is recorded; the row, and so its effective amount, is unchanged.
+	TransactionChanged   ApplyOutcome = "changed"   // the newest sighting, in another state: the row now mirrors it
+	TransactionUnchanged ApplyOutcome = "unchanged" // no version added and the state unchanged; only the seen times moved
+	// TransactionOlderVersion: a new version that did not change the current state (an old
+	// capture loaded late). The version is recorded; the row's effective amount is unchanged.
 	TransactionOlderVersion ApplyOutcome = "older_version"
 )
 
@@ -201,6 +201,8 @@ type FileGap struct {
 	BeforeDate time.Time // first date of the later file
 	DiffMinor  int64
 	RawSeq     int64
+	// AcceptedReason is the reason the operator accepted the gap with; nil while it is open.
+	AcceptedReason *string
 }
 
 // ProjectionState is the single core.projection_state row.
@@ -395,18 +397,22 @@ func (c Core) ListTransactionVersions(ctx context.Context, id uuid.UUID) ([]Tran
 // VersionCount, CurrentHash, FirstSeenAt, LastSeenAt and DisappearedAt are ignored); content and
 // hash are the version content and its hash; seenAt and rawSeq say when and from which raw row.
 //
-// The row mirrors the version seen latest (by seen time; at equal times, the later raw row), so a
-// response stored late but fetched early, such as an old capture loaded after live data, never
-// becomes the current state. Version numbers follow raw seq order.
+// Two things are decided separately:
 //
-//   - No stored row: inserts t as version 1 with first and last seen at seenAt.
-//   - Stored hash equals hash: first_seen_at moves back to seenAt if earlier and last_seen_at
-//     forward to it if later; nothing else changes.
-//   - Otherwise, seenAt not before last_seen_at: inserts the next version and rewrites the row to
-//     mirror it, keeping disappeared_at; first_seen_at is the earlier of the two, last_seen_at
-//     becomes seenAt.
-//   - Otherwise (seenAt before last_seen_at): inserts the next version, counts it in
-//     version_count and moves first_seen_at back if earlier; the row keeps mirroring its version.
+//   - Versions. A version is a distinct state: the sighting adds one unless its state is the state
+//     of a version beside it in seen time (see recordedBeside), so a repeat of the current state or
+//     a late sighting of the state current at its time, or of the one that came next, adds none.
+//     Version numbers follow raw seq order, so the current version need not be the highest
+//     numbered: it is the one whose content_hash is current_hash.
+//   - The current state. The row mirrors the newest sighting by seen time (at equal times, the
+//     later raw row): last_seen_at is the greatest seen time so far, and rows are applied in raw seq
+//     order. A sighting not before last_seen_at in another state than the row's rewrites the row to
+//     mirror it (TransactionChanged), keeping disappeared_at, whether or not it added a version. An
+//     older sighting, such as an old capture loaded after live data, never changes the row.
+//
+// Otherwise only version_count (when a version was added: TransactionOlderVersion, else
+// TransactionUnchanged), first_seen_at (back to seenAt if earlier) and last_seen_at (forward to it
+// if later) change. A new transaction is inserted as version 1 with first and last seen at seenAt.
 //
 // The returned Previous state lets the caller adjust the running sum by
 // Current.EffectiveAmount() - Previous.EffectiveAmount(), which is 0 for TransactionOlderVersion.
@@ -430,45 +436,70 @@ func (c Core) ApplyTransaction(ctx context.Context, t Transaction, content json.
 	case err != nil:
 		return ApplyResult{}, err
 	}
-	if bytes.Equal(prev.CurrentHash, hash) {
-		if _, err := c.q.Exec(ctx, c.sql(`UPDATE core.transaction
-			SET first_seen_at = least(first_seen_at, $2), last_seen_at = greatest(last_seen_at, $2) WHERE id = $1`),
-			t.ID, seenAt); err != nil {
-			return ApplyResult{}, fmt.Errorf("store: touch transaction: %w", err)
-		}
-		return ApplyResult{Outcome: TransactionUnchanged, Previous: &prev, Current: prev}, nil
-	}
 	var firstSeen, lastSeen time.Time
 	if err := c.q.QueryRow(ctx, c.sql(`SELECT first_seen_at, last_seen_at FROM core.transaction WHERE id = $1`), t.ID).
 		Scan(&firstSeen, &lastSeen); err != nil {
 		return ApplyResult{}, fmt.Errorf("store: read transaction times: %w", err)
 	}
-	if seenAt.Before(firstSeen) {
-		firstSeen = seenAt
-	}
-	versionNo := prev.VersionCount + 1
-	if err := c.InsertTransactionVersion(ctx, TransactionVersion{TransactionID: t.ID, VersionNo: versionNo,
-		Content: content, ContentHash: hash, SeenAt: seenAt, RawSeq: rawSeq}); err != nil {
+	// Versions and the current state are separate: the sighting adds a version unless its state is
+	// recorded beside it in seen time, and it becomes the current state when it is the newest
+	// sighting so far (last_seen_at is the greatest seen time of every sighting; rows are applied in
+	// raw seq order, so at an equal time this one is the later).
+	recorded, err := c.recordedBeside(ctx, "core.transaction_version", "transaction_id", t.ID, hash, seenAt, rawSeq)
+	if err != nil {
 		return ApplyResult{}, err
 	}
-	if seenAt.Before(lastSeen) {
-		if _, err := c.q.Exec(ctx, c.sql(`UPDATE core.transaction SET version_count = $2, first_seen_at = $3 WHERE id = $1`),
-			t.ID, versionNo, firstSeen); err != nil {
-			return ApplyResult{}, fmt.Errorf("store: count older version: %w", err)
+	versionNo := prev.VersionCount
+	if !recorded {
+		versionNo++
+		if err := c.InsertTransactionVersion(ctx, TransactionVersion{TransactionID: t.ID, VersionNo: versionNo,
+			Content: content, ContentHash: hash, SeenAt: seenAt, RawSeq: rawSeq}); err != nil {
+			return ApplyResult{}, err
 		}
-		cur := prev
-		cur.VersionCount = versionNo
-		return ApplyResult{Outcome: TransactionOlderVersion, Previous: &prev, Current: cur}, nil
 	}
-	t.VersionCount = versionNo
-	t.CurrentHash = hash
-	t.FirstSeenAt = firstSeen
-	t.LastSeenAt = seenAt
-	t.DisappearedAt = prev.DisappearedAt
-	if err := c.UpsertTransaction(ctx, t); err != nil {
-		return ApplyResult{}, err
+	if !seenAt.Before(lastSeen) && !bytes.Equal(prev.CurrentHash, hash) {
+		t.VersionCount = versionNo
+		t.CurrentHash = hash
+		t.FirstSeenAt = firstSeen
+		if seenAt.Before(firstSeen) {
+			t.FirstSeenAt = seenAt
+		}
+		t.LastSeenAt = seenAt
+		t.DisappearedAt = prev.DisappearedAt
+		if err := c.UpsertTransaction(ctx, t); err != nil {
+			return ApplyResult{}, err
+		}
+		return ApplyResult{Outcome: TransactionChanged, Previous: &prev, Current: stateOf(t)}, nil
 	}
-	return ApplyResult{Outcome: TransactionChanged, Previous: &prev, Current: stateOf(t)}, nil
+	if _, err := c.q.Exec(ctx, c.sql(`UPDATE core.transaction SET version_count = $2,
+		first_seen_at = least(first_seen_at, $3), last_seen_at = greatest(last_seen_at, $3) WHERE id = $1`),
+		t.ID, versionNo, seenAt); err != nil {
+		return ApplyResult{}, fmt.Errorf("store: touch transaction: %w", err)
+	}
+	if recorded {
+		return ApplyResult{Outcome: TransactionUnchanged, Previous: &prev, Current: prev}, nil
+	}
+	cur := prev
+	cur.VersionCount = versionNo
+	return ApplyResult{Outcome: TransactionOlderVersion, Previous: &prev, Current: cur}, nil
+}
+
+// recordedBeside reports whether hash is the state of a version beside a sighting at (seenAt,
+// rawSeq) in seen-time order (seen_at, then raw_seq): the newest version before it, or the oldest
+// after it. A sighting that matches either repeats a state already recorded at that time and adds
+// no version. One that matches only a version further away is a return to an earlier state after a
+// change, which is a new transition. versions and idColumn name a version table and its id column.
+func (c Core) recordedBeside(ctx context.Context, versions, idColumn string, id uuid.UUID, hash []byte, seenAt time.Time, rawSeq int64) (bool, error) {
+	var recorded bool
+	err := c.q.QueryRow(ctx, c.sql(`SELECT
+		  coalesce((SELECT content_hash = $4 FROM `+versions+` WHERE `+idColumn+` = $1 AND (seen_at, raw_seq) < ($2, $3)
+		            ORDER BY seen_at DESC, raw_seq DESC LIMIT 1), false)
+		  OR coalesce((SELECT content_hash = $4 FROM `+versions+` WHERE `+idColumn+` = $1 AND (seen_at, raw_seq) > ($2, $3)
+		            ORDER BY seen_at, raw_seq LIMIT 1), false)`), id, seenAt, rawSeq, hash).Scan(&recorded)
+	if err != nil {
+		return false, fmt.Errorf("store: compare with recorded versions: %w", err)
+	}
+	return recorded, nil
 }
 
 func stateOf(t Transaction) TransactionState {
@@ -778,8 +809,8 @@ func (c Core) AddToRunningSum(ctx context.Context, accountID uuid.UUID, delta in
 
 // InsertFileGap inserts g.
 func (c Core) InsertFileGap(ctx context.Context, g FileGap) error {
-	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.file_gap (account_id, after_date, before_date, diff_minor, raw_seq)
-		VALUES ($1, $2, $3, $4, $5)`), g.AccountID, g.AfterDate, g.BeforeDate, g.DiffMinor, g.RawSeq)
+	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.file_gap (account_id, after_date, before_date, diff_minor, raw_seq, accepted_reason)
+		VALUES ($1, $2, $3, $4, $5, $6)`), g.AccountID, g.AfterDate, g.BeforeDate, g.DiffMinor, g.RawSeq, g.AcceptedReason)
 	if err != nil {
 		return fmt.Errorf("store: insert file gap: %w", err)
 	}
@@ -851,14 +882,14 @@ func (c Core) ListStatements(ctx context.Context, accountID uuid.UUID) ([]Statem
 
 // ListFileGaps returns the account's file gaps in raw_seq order.
 func (c Core) ListFileGaps(ctx context.Context, accountID uuid.UUID) ([]FileGap, error) {
-	rows, err := c.q.Query(ctx, c.sql(`SELECT account_id, after_date, before_date, diff_minor, raw_seq
+	rows, err := c.q.Query(ctx, c.sql(`SELECT account_id, after_date, before_date, diff_minor, raw_seq, accepted_reason
 		FROM core.file_gap WHERE account_id = $1 ORDER BY raw_seq`), accountID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list file gaps: %w", err)
 	}
 	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (FileGap, error) {
 		var g FileGap
-		err := r.Scan(&g.AccountID, &g.AfterDate, &g.BeforeDate, &g.DiffMinor, &g.RawSeq)
+		err := r.Scan(&g.AccountID, &g.AfterDate, &g.BeforeDate, &g.DiffMinor, &g.RawSeq, &g.AcceptedReason)
 		return g, err
 	})
 	if err != nil {
@@ -1159,34 +1190,39 @@ func (c Core) applyMandate(ctx context.Context, kind string, id uuid.UUID, accou
 	case err != nil:
 		return "", fmt.Errorf("store: get %s state: %w", kind, err)
 	}
-	if bytes.Equal(prev.CurrentHash, hash) {
-		if _, err := c.q.Exec(ctx, c.sql(`UPDATE `+table+` SET account_id = $2,
-			first_seen_at = least(first_seen_at, $3), last_seen_at = greatest(last_seen_at, $3) WHERE id = $1`),
-			id, accountID, seenAt); err != nil {
-			return "", fmt.Errorf("store: touch %s: %w", kind, err)
+	// As ApplyTransaction: a version unless the state is recorded beside the sighting, and the
+	// current state when it is the newest sighting so far.
+	recorded, err := c.recordedBeside(ctx, versions, idColumn, id, hash, seenAt, rawSeq)
+	if err != nil {
+		return "", err
+	}
+	no := prev.VersionCount
+	if !recorded {
+		no++
+		if err := insertVersion(no); err != nil {
+			return "", err
 		}
+	}
+	if !seenAt.Before(prev.LastSeenAt) && !bytes.Equal(prev.CurrentHash, hash) {
+		first := prev.FirstSeenAt
+		if seenAt.Before(first) {
+			first = seenAt
+		}
+		if err := write(MandateState{VersionCount: no, CurrentHash: hash, FirstSeenAt: first, LastSeenAt: seenAt,
+			DisappearedAt: prev.DisappearedAt}); err != nil {
+			return "", err
+		}
+		return TransactionChanged, nil
+	}
+	if _, err := c.q.Exec(ctx, c.sql(`UPDATE `+table+` SET version_count = $2, account_id = $3,
+		first_seen_at = least(first_seen_at, $4), last_seen_at = greatest(last_seen_at, $4) WHERE id = $1`),
+		id, no, accountID, seenAt); err != nil {
+		return "", fmt.Errorf("store: touch %s: %w", kind, err)
+	}
+	if recorded {
 		return TransactionUnchanged, nil
 	}
-	first := prev.FirstSeenAt
-	if seenAt.Before(first) {
-		first = seenAt
-	}
-	no := prev.VersionCount + 1
-	if err := insertVersion(no); err != nil {
-		return "", err
-	}
-	if seenAt.Before(prev.LastSeenAt) {
-		if _, err := c.q.Exec(ctx, c.sql(`UPDATE `+table+` SET version_count = $2, first_seen_at = $3, account_id = $4
-			WHERE id = $1`), id, no, first, accountID); err != nil {
-			return "", fmt.Errorf("store: count older %s version: %w", kind, err)
-		}
-		return TransactionOlderVersion, nil
-	}
-	if err := write(MandateState{VersionCount: no, CurrentHash: hash, FirstSeenAt: first, LastSeenAt: seenAt,
-		DisappearedAt: prev.DisappearedAt}); err != nil {
-		return "", err
-	}
-	return TransactionChanged, nil
+	return TransactionOlderVersion, nil
 }
 
 // SetMandatesDisappeared applies a complete list of source's mandates of kind for bankRef, seen at
