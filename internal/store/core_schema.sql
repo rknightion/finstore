@@ -70,8 +70,10 @@ CREATE TABLE {{schema}}.reconciliation (
   -- equals it passes. Set only by an accept_difference operator entry, with known_exception.
   accepted_diff_minor bigint,
   -- balance_movement only: the balance minus the running sum the check is anchored on, once two
-  -- readings in a row agreed on it (last_check_at set); before that, the latest reading's.
-  anchor_diff_minor bigint);
+  -- readings in a row agreed on it (last_check_at set); before that, the latest reading's. Once
+  -- anchored, anchor_raw_seq is the raw row of the reading that anchored it and anchor_on that
+  -- reading's day.
+  anchor_diff_minor bigint, anchor_raw_seq bigint, anchor_on date);
 
 CREATE TABLE {{schema}}.file_gap (
   account_id uuid NOT NULL REFERENCES {{schema}}.account(id), after_date date NOT NULL,

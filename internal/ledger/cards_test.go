@@ -210,3 +210,45 @@ func TestCardListWarnsOfHeldCardsThatWentMissing(t *testing.T) {
 		t.Errorf("a card list with no source: %+v", stats)
 	}
 }
+
+// A purchase already in the balance when the check is anchored, and listed by the bank only later,
+// is not a difference once it is listed: the anchor held it before the ledger did. A purchase dated
+// before the anchoring reading that the bank lists together with its balance change moves nothing.
+// A transaction whose sign is flipped is still a mismatch after both.
+func TestCardAnchoredWhileAPurchaseWasUnlistedClearsWhenItIsListed(t *testing.T) {
+	e := newEnv(t)
+	e.cardAccounts("card:5678")
+	const slug = "lloyds-card-5678"
+	// 10.00 listed; 3.00 more is in the balance on both readings and not yet listed.
+	e.cardRun(1, "card:5678", -1300, txn("c1", "card:5678", -1000, cardDay))
+	e.cardRun(2, "card:5678", -1300)
+	if s, d := e.cardState(slug); s != store.StateReconciled || *d != 0 {
+		t.Fatalf("anchored: %s %v", s, *d)
+	}
+	// The bank lists the 3.00 (dated before the anchoring reading); the balance does not move.
+	for run := int64(3); run <= 5; run++ {
+		e.cardRun(run, "card:5678", -1300, txn("c2", "card:5678", -300, cardDay))
+		if s, d := e.cardState(slug); s != store.StateReconciled || *d != 0 {
+			t.Fatalf("run %d, the unlisted purchase listed: %s %v, want reconciled with 0", run, s, *d)
+		}
+	}
+	// A purchase of 4.00 dated before the anchoring reading, listed with its balance change.
+	for run := int64(6); run <= 7; run++ {
+		e.cardRun(run, "card:5678", -1700, txn("c3", "card:5678", -400, cardDay.AddDate(0, 0, 1)))
+		if s, d := e.cardState(slug); s != store.StateReconciled || *d != 0 {
+			t.Fatalf("run %d, a late purchase with its balance: %s %v", run, s, *d)
+		}
+	}
+	// A purchase of 5.00 stored as +5.00: -10.00 from the anchor's transactions, which with the
+	// 3.00 listed late (+3.00 from the anchor) is -7.00 from the anchor, a difference no late
+	// transactions explain.
+	for run := int64(8); run <= 9; run++ {
+		e.cardRun(run, "card:5678", -2200, txn("c4", "card:5678", 500, e.clock))
+	}
+	if s, d := e.cardState(slug); s != store.StateMismatch || *d != -700 {
+		t.Fatalf("a flipped purchase after the lag cleared: %s %v, want mismatch with -700", s, *d)
+	}
+	if diffs := e.renormalise(true); len(diffs) != 0 {
+		t.Fatalf("verify: %+v", diffs)
+	}
+}

@@ -188,6 +188,10 @@ type Reconciliation struct {
 	// AnchorDiffMinor is, for balance_movement, the balance minus the running sum the check is
 	// anchored on once LastCheckAt is set, and the latest reading's before that.
 	AnchorDiffMinor *int64
+	// AnchorRawSeq and AnchorOn are, for balance_movement once anchored, the raw row of the
+	// reading that anchored the check and that reading's day (a date).
+	AnchorRawSeq *int64
+	AnchorOn     *time.Time
 }
 
 // FileGap is a core.file_gap row: two imported files that do not join up.
@@ -706,14 +710,16 @@ func (c Core) UnendedCardKeys(ctx context.Context, source string) ([]string, err
 }
 
 const reconciliationColumns = `account_id, method, running_sum_minor, last_check_at, last_check_ok, last_diff_minor,
-	last_pass_at, reconciled_through, break_count, known_exception, accepted_diff_minor, failed_on, anchor_diff_minor`
+	last_pass_at, reconciled_through, break_count, known_exception, accepted_diff_minor, failed_on, anchor_diff_minor,
+	anchor_raw_seq, anchor_on`
 
 // GetReconciliation returns the account's reconciliation row, or ErrNotFound.
 func (c Core) GetReconciliation(ctx context.Context, accountID uuid.UUID) (Reconciliation, error) {
 	var r Reconciliation
 	err := c.q.QueryRow(ctx, c.sql(`SELECT `+reconciliationColumns+` FROM core.reconciliation WHERE account_id = $1`), accountID).
 		Scan(&r.AccountID, &r.Method, &r.RunningSumMinor, &r.LastCheckAt, &r.LastCheckOK, &r.LastDiffMinor,
-			&r.LastPassAt, &r.ReconciledThrough, &r.BreakCount, &r.KnownException, &r.AcceptedDiffMinor, &r.FailedOn, &r.AnchorDiffMinor)
+			&r.LastPassAt, &r.ReconciledThrough, &r.BreakCount, &r.KnownException, &r.AcceptedDiffMinor, &r.FailedOn, &r.AnchorDiffMinor,
+			&r.AnchorRawSeq, &r.AnchorOn)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Reconciliation{}, ErrNotFound
 	}
@@ -726,16 +732,18 @@ func (c Core) GetReconciliation(ctx context.Context, accountID uuid.UUID) (Recon
 // PutReconciliation inserts r or replaces every column of the account's row.
 func (c Core) PutReconciliation(ctx context.Context, r Reconciliation) error {
 	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.reconciliation (`+reconciliationColumns+`)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		ON CONFLICT (account_id) DO UPDATE SET method = EXCLUDED.method,
 		  running_sum_minor = EXCLUDED.running_sum_minor, last_check_at = EXCLUDED.last_check_at,
 		  last_check_ok = EXCLUDED.last_check_ok, last_diff_minor = EXCLUDED.last_diff_minor,
 		  last_pass_at = EXCLUDED.last_pass_at, reconciled_through = EXCLUDED.reconciled_through,
 		  break_count = EXCLUDED.break_count, known_exception = EXCLUDED.known_exception,
 		  accepted_diff_minor = EXCLUDED.accepted_diff_minor, failed_on = EXCLUDED.failed_on,
-		  anchor_diff_minor = EXCLUDED.anchor_diff_minor`),
+		  anchor_diff_minor = EXCLUDED.anchor_diff_minor, anchor_raw_seq = EXCLUDED.anchor_raw_seq,
+		  anchor_on = EXCLUDED.anchor_on`),
 		r.AccountID, r.Method, r.RunningSumMinor, r.LastCheckAt, r.LastCheckOK, r.LastDiffMinor,
-		r.LastPassAt, r.ReconciledThrough, r.BreakCount, r.KnownException, r.AcceptedDiffMinor, r.FailedOn, r.AnchorDiffMinor)
+		r.LastPassAt, r.ReconciledThrough, r.BreakCount, r.KnownException, r.AcceptedDiffMinor, r.FailedOn, r.AnchorDiffMinor,
+		r.AnchorRawSeq, r.AnchorOn)
 	if err != nil {
 		return fmt.Errorf("store: put reconciliation: %w", err)
 	}
@@ -1258,11 +1266,30 @@ func (c Core) ListReconciliations(ctx context.Context) ([]Reconciliation, error)
 	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Reconciliation, error) {
 		var x Reconciliation
 		err := r.Scan(&x.AccountID, &x.Method, &x.RunningSumMinor, &x.LastCheckAt, &x.LastCheckOK, &x.LastDiffMinor,
-			&x.LastPassAt, &x.ReconciledThrough, &x.BreakCount, &x.KnownException, &x.AcceptedDiffMinor, &x.FailedOn, &x.AnchorDiffMinor)
+			&x.LastPassAt, &x.ReconciledThrough, &x.BreakCount, &x.KnownException, &x.AcceptedDiffMinor, &x.FailedOn, &x.AnchorDiffMinor,
+			&x.AnchorRawSeq, &x.AnchorOn)
 		return x, err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("store: list reconciliations: %w", err)
+	}
+	return out, nil
+}
+
+// AmountsArrivedAfter returns the amounts of the account's transactions that have not disappeared
+// and are not declined, dated on or before onOrBefore, whose first version came from a raw row
+// after seq, ordered by id.
+func (c Core) AmountsArrivedAfter(ctx context.Context, accountID uuid.UUID, seq int64, onOrBefore time.Time) ([]int64, error) {
+	rows, err := c.q.Query(ctx, c.sql(`SELECT t.amount_minor FROM core.transaction t
+		WHERE t.account_id = $1 AND t.disappeared_at IS NULL AND t.status <> 'declined' AND t.txn_date <= $3
+		  AND (SELECT min(v.raw_seq) FROM core.transaction_version v WHERE v.transaction_id = t.id) > $2
+		ORDER BY t.id`), accountID, seq, onOrBefore)
+	if err != nil {
+		return nil, fmt.Errorf("store: amounts arrived after: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return nil, fmt.Errorf("store: amounts arrived after: %w", err)
 	}
 	return out, nil
 }

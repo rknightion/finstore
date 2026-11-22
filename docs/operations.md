@@ -630,7 +630,11 @@ Two views follow the money into and out of pots:
   difference is anchored once two readings in a row agree on it; until then the card is
   `not_checked`, never `reconciled`. After that `last_diff_minor` is how far the difference has
   moved from the anchor, and as for running balances it counts only when the next reading shows the
-  same one, because a purchase can reach the balance a run before the bank lists it. Pending card
+  same one, because a purchase can reach the balance a run before the bank lists it. A purchase
+  already in the balance when the check was anchored but listed only later moves the difference
+  for good; since a row carries a date and no time, a difference is not counted when it is
+  explained by transactions dated on or before the anchoring reading's day that were listed after
+  it. Pending card
   transactions are not counted: the check assumes the bank's balance holds settled transactions
   only. A difference that will never clear can be accepted with `account accept-difference`.
 - **Bank references**: two accounts from different sources with the same bank reference, neither
