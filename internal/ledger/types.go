@@ -427,7 +427,7 @@ type TradeNoteRec struct {
 //   - InvestmentKindCapture: Holdings, Valuations, Events of type contribution and
 //     CompleteContributionsFor; CapturedAt required.
 //   - InvestmentKindStatement: Statements and Events of type transfer_out.
-//   - InvestmentKindTradeNote: TradeNotes, and Accounts must be empty: a note prints no product, so
+//   - InvestmentKindTradeNote: TradeNotes, and Accounts must be empty: a note is matched by number alone, so
 //     it can never create a child.
 //
 // Every record's AccountKey, a trade note's excepted, must be listed in Accounts. Within one result

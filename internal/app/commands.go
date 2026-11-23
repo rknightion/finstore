@@ -72,8 +72,11 @@ const (
 // name to its normaliser. An importer package adds its formats here and nowhere else; NewLedger
 // registers them and `finstore import` accepts them.
 var investmentFormats = map[string]ledger.InvestmentNormaliser{
+	string(importer.FormatAvivaAnnualPDF):          importer.AvivaAnnualNormaliser{},
 	string(importer.FormatAvivaCapture):            importer.AvivaCaptureNormaliser{},
+	string(importer.FormatFidelityAnnualPDF):       importer.FidelityAnnualNormaliser{},
 	string(importer.FormatFidelitySummaryCSV):      importer.FidelitySummaryNormaliser{},
+	string(importer.FormatFidelityTradeNotePDF):    importer.FidelityTradeNoteNormaliser{},
 	string(importer.FormatFidelityTransactionsCSV): importer.FidelityTransactionsNormaliser{},
 }
 
