@@ -107,12 +107,17 @@ func TestReadIgnoresInvisibleText(t *testing.T) {
 
 func TestReadTJ(t *testing.T) {
 	// pdftext refuses TJ; this reader must accept it. The kerning moves "o" 20 units closer.
-	content := page("BT /F1 10 Tf 1 0 0 1 72 700 Tm [(Hell) 20 (o)] TJ ET\n")
+	// One value drawn by two successive TJ operators is still one string.
+	content := page("BT /F1 10 Tf 1 0 0 1 72 700 Tm [(Hell) 20 (o)] TJ ET\n",
+		"BT /F1 10 Tf 1 0 0 1 72 650 Tm [(1)] TJ [(23)] TJ ET\n")
 	got, err := pdfdoc.Read(pdfdoctest.Build([][]byte{content}, pdfdoctest.Options{}))
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	equalTexts(t, got, []pdftext.Text{{Page: 1, X: 72, Y: 700, Size: 10, S: "Hello"}})
+	equalTexts(t, got, []pdftext.Text{
+		{Page: 1, X: 72, Y: 700, Size: 10, S: "Hello"},
+		{Page: 1, X: 72, Y: 650, Size: 10, S: "123"},
+	})
 }
 
 func TestRefusals(t *testing.T) {

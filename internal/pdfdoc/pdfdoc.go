@@ -199,21 +199,18 @@ func lines(glyphs []pdf.Text) []pdftext.Text {
 	type glyph struct {
 		pdf.Text
 		size float64
-		run  int // how many TJ ends came before this glyph
 	}
 	var visible []glyph
-	run := 0
 	for _, g := range glyphs {
-		// The library marks the end of a TJ with a newline glyph.
+		// The library marks the end of a TJ with a newline glyph. Only position decides what joins.
 		if g.S == "\n" {
-			run++
 			continue
 		}
 		size := math.Abs(g.FontSize)
 		if size < minVisibleSize || !finite(g.X, g.Y, g.W, size) {
 			continue
 		}
-		visible = append(visible, glyph{Text: g, size: size, run: run})
+		visible = append(visible, glyph{Text: g, size: size})
 	}
 	// A file may draw neighbouring glyphs in any order, so order them before joining them.
 	sort.SliceStable(visible, func(i, j int) bool { return visible[i].Y > visible[j].Y })
@@ -228,11 +225,10 @@ func lines(glyphs []pdf.Text) []pdftext.Text {
 	}
 
 	var (
-		out     []pdftext.Text
-		cur     *pdftext.Text
-		b       strings.Builder
-		end     float64 // where the last glyph of cur ends
-		lastRun int
+		out []pdftext.Text
+		cur *pdftext.Text
+		b   strings.Builder
+		end float64 // where the last glyph of cur ends
 	)
 	flush := func() {
 		if cur == nil {
@@ -248,7 +244,7 @@ func lines(glyphs []pdf.Text) []pdftext.Text {
 	for _, g := range visible {
 		if cur != nil {
 			gap := g.X - end
-			if g.run != lastRun || math.Abs(g.Y-cur.Y) > sameBaseline*g.size || gap > columnGap*g.size || gap < -columnGap*g.size {
+			if math.Abs(g.Y-cur.Y) > sameBaseline*g.size || gap > columnGap*g.size || gap < -columnGap*g.size {
 				flush()
 			} else if gap > wordGap*g.size && !endsInSpace(b.String()) && !startsWithSpace(g.S) {
 				b.WriteByte(' ')
@@ -259,7 +255,6 @@ func lines(glyphs []pdf.Text) []pdftext.Text {
 		}
 		b.WriteString(g.S)
 		end = g.X + g.W
-		lastRun = g.run
 	}
 	flush()
 
