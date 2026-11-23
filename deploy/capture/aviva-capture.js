@@ -35,7 +35,14 @@ function avivaCapture(parts) {
   if (parts !== undefined) {
     const byPage = {};
     for (const raw of parts) {
-      const part = JSON.parse(raw);
+      let part;
+      try {
+        part = JSON.parse(raw);
+      } catch {
+        // The engine's own message can quote the input, so it is never passed on.
+        fail("bad_part");
+      }
+      if (part === null || typeof part !== "object") fail("bad_part");
       if (byPage[part.page]) fail("repeated_page");
       byPage[part.page] = part;
     }
