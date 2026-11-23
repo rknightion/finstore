@@ -196,11 +196,43 @@ func chargeInflated(contents pdf.Value, budget *int64) bool {
 
 // lines joins the glyphs of one page into strings and puts them in reading order.
 func lines(glyphs []pdf.Text) []pdftext.Text {
+	type glyph struct {
+		pdf.Text
+		size float64
+		run  int // how many TJ ends came before this glyph
+	}
+	var visible []glyph
+	run := 0
+	for _, g := range glyphs {
+		// The library marks the end of a TJ with a newline glyph.
+		if g.S == "\n" {
+			run++
+			continue
+		}
+		size := math.Abs(g.FontSize)
+		if size < minVisibleSize || !finite(g.X, g.Y, g.W, size) {
+			continue
+		}
+		visible = append(visible, glyph{Text: g, size: size, run: run})
+	}
+	// A file may draw neighbouring glyphs in any order, so order them before joining them.
+	sort.SliceStable(visible, func(i, j int) bool { return visible[i].Y > visible[j].Y })
+	for i := 0; i < len(visible); {
+		j := i + 1
+		for j < len(visible) && visible[i].Y-visible[j].Y <= sameBaseline*visible[i].size {
+			j++
+		}
+		row := visible[i:j]
+		sort.SliceStable(row, func(a, b int) bool { return row[a].X < row[b].X })
+		i = j
+	}
+
 	var (
-		out []pdftext.Text
-		cur *pdftext.Text
-		b   strings.Builder
-		end float64 // where the last glyph of cur ends
+		out     []pdftext.Text
+		cur     *pdftext.Text
+		b       strings.Builder
+		end     float64 // where the last glyph of cur ends
+		lastRun int
 	)
 	flush := func() {
 		if cur == nil {
@@ -213,29 +245,21 @@ func lines(glyphs []pdf.Text) []pdftext.Text {
 		cur = nil
 		b.Reset()
 	}
-	for _, g := range glyphs {
-		size := math.Abs(g.FontSize)
-		// The library marks the end of a TJ with a newline glyph.
-		if g.S == "\n" {
-			flush()
-			continue
-		}
-		if size < minVisibleSize || !finite(g.X, g.Y, g.W, size) {
-			continue
-		}
+	for _, g := range visible {
 		if cur != nil {
 			gap := g.X - end
-			if math.Abs(g.Y-cur.Y) > sameBaseline*size || gap > columnGap*size || gap < -columnGap*size {
+			if g.run != lastRun || math.Abs(g.Y-cur.Y) > sameBaseline*g.size || gap > columnGap*g.size || gap < -columnGap*g.size {
 				flush()
-			} else if gap > wordGap*size && !endsInSpace(b.String()) && !startsWithSpace(g.S) {
+			} else if gap > wordGap*g.size && !endsInSpace(b.String()) && !startsWithSpace(g.S) {
 				b.WriteByte(' ')
 			}
 		}
 		if cur == nil {
-			cur = &pdftext.Text{X: g.X, Y: g.Y, Size: size}
+			cur = &pdftext.Text{X: g.X, Y: g.Y, Size: g.size}
 		}
 		b.WriteString(g.S)
 		end = g.X + g.W
+		lastRun = g.run
 	}
 	flush()
 

@@ -74,6 +74,10 @@ func TestReadStringsAndRows(t *testing.T) {
 		pdfdoctest.Text(72, 640, 10, "Next row"),
 		// A pound sign is WinAnsi 0xA3.
 		pdfdoctest.Text(72, 600, 10, "Value \xa3500.00"),
+		// Fragments drawn out of left-to-right order still read as one value.
+		pdfdoctest.Text(77, 560, 10, "2"),
+		pdfdoctest.Text(72, 560, 10, "1"),
+		pdfdoctest.Text(82, 560, 10, "3"),
 	)
 	got, err := pdfdoc.Read(pdfdoctest.Build([][]byte{content}, pdfdoctest.Options{Predictor: true}))
 	if err != nil {
@@ -83,7 +87,7 @@ func TestReadStringsAndRows(t *testing.T) {
 	for _, tx := range got {
 		s = append(s, tx.S)
 	}
-	want := []string{"Label", "Amount", "Money paid in this year", "1,234.56", "Next row", "Value £500.00"}
+	want := []string{"Label", "Amount", "Money paid in this year", "1,234.56", "Next row", "Value £500.00", "123"}
 	if fmt.Sprint(s) != fmt.Sprint(want) {
 		t.Fatalf("strings = %q, want %q", s, want)
 	}
