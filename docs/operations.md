@@ -762,7 +762,7 @@ Start with `agent.coverage`: one row per account with the earliest and latest da
 transaction count, whether the stored transactions agree with the bank's balance, and every known
 gap with its reason. A reader should check it before trusting a total. Its `source` column says where the
 account's data comes from: `monzo` for Monzo's own API, `truelayer:<provider>` for an account
-TrueLayer feeds, and the file source for a statement-fed account. The status page shows the same
+TrueLayer feeds, `investment:<provider>` for a pension or investment account, and the file source for a statement-fed account. The status page shows the same
 as its Feed column.
 
 Each account and transaction also carries the source's own record, for anything the named columns
@@ -797,6 +797,45 @@ These columns come after the others, so a query that reads columns by position i
 (see [Ending an account](#ending-an-account)) and `pending_as_of`: when the newest pending
 response for the account was fetched, null when no pending read has succeeded. It tells a reader
 how fresh the pending list is even when that list is empty.
+
+#### Investment views
+
+Five views read the investment tables. None is additive with `agent.transactions`, and investment
+rows never reach spending. Each leaves out an ended account's rows after its end date, and each
+carries a comment with its rules.
+
+| View | One row per | Rules |
+|---|---|---|
+| `agent.holdings` | Instrument per account, at the newest capture | Units, price and value are as reported on `as_of`. `expected_units` and `unit_difference` (reported minus expected) come from the last checked snapshot, dated `checked_as_of`, which can be older than `as_of`. A position missing from either side appears, with the other side null |
+| `agent.investment_events` | Current provider ledger row | Only `cash_minor` sums to cash and only `flow_minor` sums to external flows. `gross_minor` is the printed amount and includes a dealing fee on a buy. `effective_date` is `settle_date`, else `order_date`. Trade note columns are null when no note matches |
+| `agent.valuations` | Account and date, from that date's latest capture | Values are not cash balances. A value of 0 is real |
+| `agent.pension_statements` | Winning statement | Figures are as printed, and a statement that lost to an overlapping reissue is left out. A null `charges_minor` is unknown, never zero |
+| `agent.investment_returns` | Account and measured interval | See below |
+
+`agent.investment_returns` measures each interval `(opening_date, closing_date]`, the opening day
+excluded:
+
+```text
+return = closing value - opening value - external flows with an effective date in the interval
+```
+
+It never uses a statement's growth figure, because one provider prints growth before charges and
+another prints performance after them. `interval_kind` is `statement` (a winning statement's period,
+opening the day before its first day), `since_statement` (the newest winning statement's closing to
+the newest capture) or `no_statement`. No opening value is assumed before the first statement.
+
+`return_minor` and `net_flow_minor` are null together, and `null_reason` says why. The reasons are
+tested in this order:
+
+| `null_reason` | Meaning |
+|---|---|
+| `statement_missing` | The account has no statement |
+| `flows_unverified` | A ledger account is not reconciled through the closing date, or a statement-only interval is not exactly one winning statement that passed its contribution and continuity check |
+| `flow_unsettled` | An external flow has `order_date <= boundary < settle_date` at either end of the interval |
+
+`value_change_minor` is shown whenever both values are known. `tax_year` (such as `2025-26`) is set
+only on an interval of exactly one tax year, 6 April to 5 April. Sibling transfers count as flows of
+each account, so they cancel when a platform's children are added up.
 
 ### Pending transactions
 
@@ -990,7 +1029,7 @@ tokens are needed: the tailnet and the grant are the credential.
 
 ### The tools
 
-All five are read-only (`readOnlyHint`, `idempotentHint`; not destructive; not open world) and return
+All seven are read-only (`readOnlyHint`, `idempotentHint`; not destructive; not open world) and return
 structured JSON beside a text rendering. Money is integer minor units with a currency. Dates are
 `YYYY-MM-DD`, and a `from` and `to` pair includes both ends. Invalid input (an account slug that is
 not letters, digits, hyphens, underscores and dots, or is over 100 characters; a `from` after its
@@ -1003,6 +1042,20 @@ not letters, digits, hyphens, underscores and dots, or is over 100 characters; a
 | `spending_summary` | Totals of spending (`out`) or income (`in`) by month, category, merchant, counterparty or account, per currency, declined transactions and pot transfers left out by default. Transfers between your own accounts at different banks are not detected | `limit` 100 by default, 1000 at most; 512 KiB |
 | `describe_schema` | The tables and views readable by the `finstore_mcp` login, with kind, comment and columns | none |
 | `query_sql` | One read-only SQL statement over `agent`, `core`, `raw` and `sync`; select `raw.json_body(body)` to read a stored response | `max_rows` 200 by default, 2000 at most; 1 MiB |
+| `portfolio` | Each pension or investment account at its newest valuation: slug, provider, `as_of`, total, cash, currency, reconciliation state and holdings (instrument, ticker, ISIN, units, price, price unit, value, currency, book cost, and expected units and difference from the last checked snapshot with its date). `accounts` takes child or platform slugs, and a platform stands for its children | `limit` 100 by default, 1000 at most, on the accounts and on each account's holdings; 512 KiB |
+| `pension_summary` | `tax_years` (paid in, transfers in and out, withdrawals, adjustments, sibling transfers, fees, interest), `returns` (dates, opening, closing, value change, net flow, return, reason when null, tax-year label or null), `statement_charges` (period and amount) and `missing` (account, year where relevant, reason). `accounts` as for `portfolio`; `from_tax_year` and `to_tax_year` look like `2025-26` | `limit` 100 by default, 1000 at most, on each of the four arrays; 512 KiB |
+
+Units and prices in `portfolio` are exact decimal strings. Each of the two investment tools runs one
+SQL statement, its arrays share the 512 KiB budget, and `truncated` is true when a limit or the
+budget cut any of them. An account or platform with no data gives empty lists, not an error. A child
+with a value of 0 and no holdings is a real account and is listed with 0.
+
+A null in `pension_summary` means unknown and is never zero. A statement charge is null where the
+statement's printed charges cover a different period or more than this account, and the itemised
+figures stay in `agent.pension_statements.charges`. `transfers_out_minor` is null for a
+statement-only account's tax year that winning statements do not fully cover, and that year is
+listed in `missing` with `flows_unverified`. Provider text such as an instrument name is data, and
+the tools' descriptions say so.
 
 Text from a bank (descriptions, references, names, notes) was chosen by other people. The server's
 instructions and the descriptions of the tools that return it tell the agent to treat it as data;
@@ -1018,7 +1071,7 @@ at 15 seconds and its temporary files at 1 GB. A result cut at a row or size lim
 Every tool call is one span, one increment of `finstore.mcp.tool.calls` and one log line.
 
 - **Span.** `tools/call <tool>` (a server span, child of the request's span; `tools/call` alone when
-  the tool is not one of the five) with `mcp.method.name`, `gen_ai.operation.name` (`execute_tool`),
+  the tool is not one of the seven) with `mcp.method.name`, `gen_ai.operation.name` (`execute_tool`),
   `gen_ai.tool.name`, `mcp.protocol.version` when the client sent one shaped like a date,
   `finstore.mcp.client`,
   `finstore.mcp.rows` and `finstore.mcp.truncated`. A failed call has status `error`, with the
@@ -1135,7 +1188,7 @@ metric value, a label or a log field; the log handler drops any field that is no
 | `finstore.scheduler.job.runs` (counter) | `finstore.job`, `outcome` | Scheduler job runs, by the job's registered name (the attribute is `finstore.job`, queried as `finstore_job`: Grafana Cloud's OTLP gateway sets the Prometheus `job` label from the service, so a metric attribute named `job` would be overwritten and every job would read as one series) and outcome: `ok`, `error`, `panic` or `cancelled`. `cancelled` is a job that returned an error after `serve` was told to stop, such as a deploy interrupting a running sync; it is not a failure |
 | `finstore.scheduler.job.duration` (histogram) | `finstore.job` | Seconds one job run took, with buckets from 1 s to 1 hour |
 | `finstore.scheduler.job.last_ok` | `finstore.job` | 1 when the job's last run ended `ok`, 0 for `error` or `panic`. A `cancelled` run does not change it. It is held in the `serve` process, not read from the database, so after a restart it is absent until each job has run once. The `status` job runs every minute, so a failing `status` shows within a minute and every other finstore gauge is stale until it recovers |
-| `finstore.mcp.tool.calls` (counter) | `tool`, `outcome`, `client` | MCP tool calls, by tool (`overview`, `search_transactions`, `spending_summary`, `describe_schema`, `query_sql`, or `unknown` for a name the server does not have), outcome (`ok`, `invalid`, `busy`, `timeout`, `refused`, `error`) and client (the grant group of the caller). Latency is `http.server.request.duration` for the route `/mcp`, one tool call per request |
+| `finstore.mcp.tool.calls` (counter) | `tool`, `outcome`, `client` | MCP tool calls, by tool (`overview`, `search_transactions`, `spending_summary`, `describe_schema`, `query_sql`, `portfolio`, `pension_summary`, or `unknown` for a name the server does not have), outcome (`ok`, `invalid`, `busy`, `timeout`, `refused`, `error`) and client (the grant group of the caller). Latency is `http.server.request.duration` for the route `/mcp`, one tool call per request |
 | `finstore.telemetry.export.failures` (counter) | `signal` | Exports that failed, by `traces`, `metrics` or `logs` |
 | `finstore.telemetry.span_attributes.dropped` (counter) | `key` | Span attributes the exporter allow-list removed, by key. A key here is a library that added an attribute; nothing leaked. The Postgres driver's own attributes (`pgx.rows_affected`, a count, and `pgx.prepare_stmt.name`, a hash of constant SQL) are on the list, so a plain query drops nothing: any key here is new |
 | `finstore.store.writer_lock.held` (gauge) | `holder` | Seconds the writer lock has been held so far, by who holds it (`monzo.sync`, `monzo.backfill`, `monzo.approval`, `truelayer.sync`, `truelayer.connect`, `truelayer.approve`, `renormalise`, `load-capture`, `account`, `import`). Absent while the lock is free. Every process that can hold the lock reports it: `serve` and the commands that write |
