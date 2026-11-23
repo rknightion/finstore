@@ -198,7 +198,11 @@ WHERE a.ended_on IS NULL
 -- is more than 35 days old. An ended account counts only its rows and readings up to ended_on.
 -- An account that shares its bank reference with an account of another source, neither ended, is
 -- a mismatch with a gap naming the other account. failed_on is a running_balance account's
--- earliest day that does not add up.
+-- earliest day that does not add up. A platform account is left out: its children are the accounts
+-- that hold anything. An investment child's earliest and latest dates come from its current events
+-- by effective date (settle_date, else order_date) up to its ended_on, and transaction_count stays 0;
+-- its latest_statement_date stays null, and its "import due" uses the newest valuation.as_of with a
+-- 70-day threshold (a child with no valuation is due).
 CREATE VIEW agent.coverage AS
 WITH today AS (
   SELECT (now() AT TIME ZONE 'Europe/London')::date AS d
@@ -209,6 +213,15 @@ txn AS (
   JOIN core.account a ON a.id = t.account_id
   WHERE t.disappeared_at IS NULL AND (a.ended_on IS NULL OR t.txn_date <= a.ended_on)
   GROUP BY t.account_id
+),
+investment_dates AS (
+  SELECT e.account_id, min(coalesce(e.settle_date, e.order_date)) AS earliest,
+         max(coalesce(e.settle_date, e.order_date)) AS latest
+  FROM core.investment_event e
+  JOIN core.account a ON a.id = e.account_id
+  WHERE e.disappeared_at IS NULL
+    AND (a.ended_on IS NULL OR coalesce(e.settle_date, e.order_date) <= a.ended_on)
+  GROUP BY e.account_id
 ),
 fetch_days AS (
   SELECT p.account_id,
@@ -279,7 +292,16 @@ file_latest AS (
   WHERE a.feed = 'file'
 ),
 latest_statement AS (
-  SELECT account_id, d FROM file_latest WHERE expects_imports AND ended_on IS NULL
+  SELECT fl.account_id, fl.d
+  FROM file_latest fl
+  JOIN core.account a ON a.id = fl.account_id
+  WHERE fl.expects_imports AND fl.ended_on IS NULL AND a.source NOT LIKE 'investment:%'
+),
+-- The date the import-due rule uses for an investment child: its newest valuation.
+investment_latest AS (
+  SELECT a.id AS account_id, (SELECT max(v.as_of) FROM core.valuation v WHERE v.account_id = a.id) AS d
+  FROM core.account a
+  WHERE a.source LIKE 'investment:%' AND a.parent_id IS NOT NULL AND a.expects_imports AND a.ended_on IS NULL
 ),
 shared AS (
   SELECT DISTINCT ON (a.id) a.id AS account_id, b.slug AS other_slug
@@ -310,6 +332,11 @@ gap_rows AS (
   FROM latest_statement ls
   WHERE ls.d IS NULL OR (SELECT d FROM today) - ls.d > 35
   UNION ALL
+  SELECT il.account_id, il.d + 1,
+         jsonb_build_object('from', il.d + 1, 'to', (SELECT d FROM today), 'reason', 'import due')
+  FROM investment_latest il
+  WHERE il.d IS NULL OR (SELECT d FROM today) - il.d > 70
+  UNION ALL
   SELECT s.account_id, NULL::date,
          jsonb_build_object('from', NULL, 'to', (SELECT d FROM today),
                             'reason', 'bank reference shared with ' || s.other_slug)
@@ -322,8 +349,8 @@ gaps AS (
 )
 SELECT a.slug AS account_slug,
        a.feed,
-       txn.earliest AS earliest_date,
-       txn.latest AS latest_date,
+       coalesce(txn.earliest, inv.earliest) AS earliest_date,
+       coalesce(txn.latest, inv.latest) AS latest_date,
        coalesce(txn.n, 0) AS transaction_count,
        CASE
          WHEN a.type = 'pot' OR r.method = 'balances_only' THEN 'balances_only'
@@ -340,14 +367,17 @@ SELECT a.slug AS account_slug,
        a.source
 FROM core.account a
 LEFT JOIN txn ON txn.account_id = a.id
+LEFT JOIN investment_dates inv ON inv.account_id = a.id
 LEFT JOIN core.reconciliation r ON r.account_id = a.id
 LEFT JOIN gaps g ON g.account_id = a.id
 LEFT JOIN file_latest fl ON fl.account_id = a.id
-LEFT JOIN shared sh ON sh.account_id = a.id;
+LEFT JOIN shared sh ON sh.account_id = a.id
+WHERE a.type <> 'platform';
 
 -- sync_status: one row per source seen in consents, runs or accounts. last_import_at is a JSON
 -- object from each file-fed account's slug to the time of its latest raw.import_file row (null
--- when it has none), and is null for a source with no file-fed accounts.
+-- when it has none), and is null for a source with no file-fed accounts. Files import against a
+-- platform, so an investment child's last import is its parent's.
 CREATE VIEW agent.sync_status AS
 WITH sources AS (
   SELECT source FROM sync.consent
@@ -368,8 +398,9 @@ last_run AS (
 imports AS (
   SELECT a.source,
          jsonb_object_agg(a.slug, (SELECT max(f.imported_at) FROM raw.import_file f
-                                   WHERE f.account_slug = a.slug)) AS obj
+                                   WHERE f.account_slug = coalesce(platform.slug, a.slug))) AS obj
   FROM core.account a
+  LEFT JOIN core.account platform ON a.source LIKE 'investment:%' AND platform.id = a.parent_id
   WHERE a.feed = 'file'
   GROUP BY a.source
 )
@@ -445,7 +476,7 @@ COMMENT ON VIEW agent.transaction_history IS 'Every stored version of each trans
 
 COMMENT ON VIEW agent.balances IS 'Balance readings per account: balance_minor and total_balance_minor in integer minor units (pence) with currency, at the instant (at) or day (on_date) the bank reported. Readings of an ended account after its ended_on are left out.';
 
-COMMENT ON VIEW agent.coverage IS 'One row per account: the earliest and latest transaction dates held, the transaction count, reconciliation_state (reconciled, mismatch, balances_only or not_checked: whether the stored transactions agree with the bank balance), reconciled_through, last_diff_minor and gaps. gaps is a JSON array of runs of days (from and to inclusive) that nothing covers, each with a reason; today is never a gap. Check it before stating a total for an account. source says where the data comes from: monzo, truelayer:<provider> or the file source. An ended account counts only rows up to its ended_on.';
+COMMENT ON VIEW agent.coverage IS 'One row per account: the earliest and latest transaction dates held, the transaction count, reconciliation_state (reconciled, mismatch, balances_only or not_checked: whether the stored transactions agree with the bank balance), reconciled_through, last_diff_minor and gaps. gaps is a JSON array of runs of days (from and to inclusive) that nothing covers, each with a reason; today is never a gap. Check it before stating a total for an account. source says where the data comes from: monzo, truelayer:<provider>, investment:<provider> or the file source. An ended account counts only rows up to its ended_on. A platform account is left out; an investment account has its dates from its events, a transaction_count of 0, a null latest_statement_date, and is import due when its newest valuation is over 70 days old.';
 
 COMMENT ON VIEW agent.sync_status IS 'One row per source seen in consents, runs or accounts: the current consent state and expiry (days_to_expiry), when the last successful sync was, the last finished run outcome, and last_import_at, a JSON object from each file-fed account slug to the time of its latest imported file (null for a source with no file-fed accounts).';
 

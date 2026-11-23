@@ -24,17 +24,19 @@ import (
 type Ledger struct {
 	sources map[string]SourceNormaliser
 	files   map[string]FileNormaliser
-	loc     *time.Location
-	log     *slog.Logger
-	tracer  trace.Tracer
+	// investments holds the investment formats, by format name. A format is in files or here.
+	investments map[string]InvestmentNormaliser
+	loc         *time.Location
+	log         *slog.Logger
+	tracer      trace.Tracer
 }
 
 // New returns a Ledger. sources is keyed by raw source name (for example "monzo"); files by import
 // format (for example "halifax-pdf", "manual-csv"). loc is the zone a source normaliser uses to
 // turn an instant into a day; nil means UTC. A nil log discards. tr makes the spans of the batch
 // steps (one for a catch-up, one for each step of a renormalise, never one for a row); a nil tr
-// makes none.
-func New(sources map[string]SourceNormaliser, files map[string]FileNormaliser, loc *time.Location, log *slog.Logger, tr trace.Tracer) *Ledger {
+// makes none. opts adds what the required arguments do not name, such as the investment formats.
+func New(sources map[string]SourceNormaliser, files map[string]FileNormaliser, loc *time.Location, log *slog.Logger, tr trace.Tracer, opts ...Option) *Ledger {
 	if loc == nil {
 		loc = time.UTC
 	}
@@ -44,7 +46,21 @@ func New(sources map[string]SourceNormaliser, files map[string]FileNormaliser, l
 	if tr == nil {
 		tr = tracenoop.NewTracerProvider().Tracer(semconv.ServiceName)
 	}
-	return &Ledger{sources: maps.Clone(sources), files: maps.Clone(files), loc: loc, log: log, tracer: tr}
+	l := &Ledger{sources: maps.Clone(sources), files: maps.Clone(files), loc: loc, log: log, tracer: tr}
+	for _, o := range opts {
+		o(l)
+	}
+	return l
+}
+
+// Option changes how New builds a Ledger.
+type Option func(*Ledger)
+
+// WithInvestmentNormalisers registers the investment formats, keyed by import format (for example
+// "fidelity-transactions-csv"). A file of one of them imports only against a platform account of
+// the normaliser's provider.
+func WithInvestmentNormalisers(formats map[string]InvestmentNormaliser) Option {
+	return func(l *Ledger) { l.investments = maps.Clone(formats) }
 }
 
 // batch starts the span of one batch step. The returned function ends it: count, when not

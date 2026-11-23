@@ -3,17 +3,124 @@ package ledger_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/rknightion/finstore/internal/importer"
 	"github.com/rknightion/finstore/internal/ledger"
+	"github.com/rknightion/finstore/internal/store"
+	"github.com/rknightion/finstore/internal/testpg"
 )
 
+// A revision 5 database reaches revision 6 through the usual steps: migrate asks for a renormalise,
+// verify reports each new table and the rows the old service had not read and no difference in a
+// bank-derived row, and the rebuild leaves a core that verifies clean. Going back, a build with no
+// investment formats (what the older image is to these files) rejects them, keeps the bytes and
+// creates no child, and the newer build then restores everything from raw.
+func TestUpgradeFromRevisionFiveAndBack(t *testing.T) {
+	e := newInvestmentEnv(t)
+	ctx := context.Background()
+	e.operator(ledger.EntryAccountAdd, ledger.AccountAdd{Slug: "bank-joint", Type: "joint", Currency: "GBP", Name: "Made-up"})
+	e.importFile("bank-joint", string(importer.FormatManualCSV), csvFile(0, csvRow{"2030-01-02", "PAY", 100, "made-up"}))
+	if st := e.catchUp(); st.FilesRejected != 0 {
+		t.Fatalf("bank file: %v", st.Rejections)
+	}
+
+	// What revision 5 left: no investment table, and the older revision recorded.
+	newTables := []string{"holding_check", "holding_snapshot", "instrument", "investment_event", "investment_event_version",
+		"investment_import", "pension_statement", "trade_note", "valuation"}
+	for _, table := range newTables {
+		if _, err := e.owner.DB().Exec(ctx, `DROP TABLE core.`+table+` CASCADE`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.owner.DB().Exec(ctx, `UPDATE core.projection_state SET normaliser_rev = 5`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(ctx, testpg.UserURL(t, e.super, store.RoleOwner), ledger.NormaliserRev); !errors.Is(err, store.ErrRenormaliseRequired) {
+		t.Fatalf("migrate over a revision 5 core: %v", err)
+	}
+
+	// Investment files that arrive with the new image, not yet projected.
+	const acct = "ACC00001234"
+	entry, err := json.Marshal(ledger.AccountAdd{Slug: "fid", Type: "platform", Currency: "GBP", Name: "Made-up", ExpectsImports: true,
+		Provider: ledger.ProviderFidelity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertOperatorEntry(ctx, e.app.DB(), store.OperatorEntry{Kind: ledger.EntryAccountAdd, Payload: entry, EnteredAt: e.tick()}); err != nil {
+		t.Fatal(err)
+	}
+	file, err := json.Marshal(ledgerFile(acct, cashRow(acct, "R1", ledger.EventInterest, "2030-01-05", 100)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.InsertImportFile(ctx, e.app.DB(), store.ImportFile{AccountSlug: "fid", Format: fakeFidelityFormat,
+		FileName: "made-up", ImportedAt: e.tick(), Body: file}); err != nil {
+		t.Fatal(err)
+	}
+
+	tables := map[string]bool{}
+	for _, d := range e.renormalise(true) {
+		switch {
+		case d.Kind == store.DiffTable:
+			tables[d.Table] = true
+		case d.Kind == store.DiffOnlyInCoreNext && (d.Table == "account" || d.Table == "reconciliation"):
+		case d.Table == "projection_state":
+		default:
+			t.Errorf("a difference in a bank-derived row: %+v", d)
+		}
+	}
+	for _, table := range newTables {
+		if !tables[table] {
+			t.Errorf("verify did not report the new table %s (reported %v)", table, tables)
+		}
+	}
+
+	e.renormalise(false)
+	if ps, err := e.core().GetProjectionState(ctx); err != nil || ps.NormaliserRev != ledger.NormaliserRev {
+		t.Fatalf("after the rebuild: %+v, %v", ps, err)
+	}
+	if n := e.count(`SELECT count(*) FROM core.investment_event`); n != 1 {
+		t.Fatalf("%d events after the rebuild", n)
+	}
+	if diffs := e.renormalise(true); len(diffs) != 0 {
+		t.Fatalf("verify after the rebuild: %+v", diffs)
+	}
+
+	// Back: without the formats the file is refused and no child exists; its bytes stay in raw.
+	newer := e.l
+	e.l = ledger.New(nil, map[string]ledger.FileNormaliser{string(importer.FormatManualCSV): importer.Normaliser{}},
+		time.UTC, slog.New(slog.NewJSONHandler(e.logs, nil)), nil)
+	e.renormalise(false)
+	if n := e.count(`SELECT count(*) FROM core.account WHERE parent_id IS NOT NULL`); n != 0 {
+		t.Fatalf("%d child accounts without the formats", n)
+	}
+	if n := e.count(`SELECT count(*) FROM core.account WHERE type = 'platform'`); n != 1 {
+		t.Fatalf("%d platforms without the formats", n)
+	}
+	if n := e.count(`SELECT count(*) FROM raw.import_file WHERE format = $1`, fakeFidelityFormat); n != 1 {
+		t.Fatalf("%d raw files", n)
+	}
+	if !strings.Contains(e.logs.String(), "unknown_format") {
+		t.Fatal("the refused file was not logged as unknown_format")
+	}
+	e.l = newer
+	e.renormalise(false)
+	if n := e.count(`SELECT count(*) FROM core.investment_event`); n != 1 {
+		t.Fatalf("%d events after coming back", n)
+	}
+}
+
 // Revision 5 of the normaliser adds no version for a sighting of a state already recorded beside
-// it (a late-loaded sighting of an older state), and records accepted statement gaps.
-func TestNormaliserRevisionIsFive(t *testing.T) {
-	if ledger.NormaliserRev != 5 {
-		t.Fatalf("NormaliserRev = %d, want 5", ledger.NormaliserRev)
+// it (a late-loaded sighting of an older state), and records accepted statement gaps. Revision 6
+// adds the investment tables.
+func TestNormaliserRevisionIsSix(t *testing.T) {
+	if ledger.NormaliserRev != 6 {
+		t.Fatalf("NormaliserRev = %d, want 6", ledger.NormaliserRev)
 	}
 }
 

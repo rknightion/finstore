@@ -28,6 +28,7 @@ type Metrics struct {
 	consentExpiry    metric.Int64Gauge
 	mismatch         metric.Int64Gauge
 	importLast       metric.Int64Gauge
+	importDue        metric.Int64Gauge
 	dumpLastSuccess  metric.Int64Gauge
 	up               metric.Int64Gauge
 	unresolved       metric.Int64Gauge
@@ -79,6 +80,7 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 	gauge(&m.consentExpiry, semconv.MetricConsentExpiryTime, "s", "Unix time the consent is expected to end")
 	gauge(&m.mismatch, semconv.MetricReconciliationMismatch, "1", "1 while the last reconciliation failed or the account has a file gap")
 	gauge(&m.importLast, semconv.MetricImportLastTime, "s", "Unix time of the newest statement date imported")
+	gauge(&m.importDue, semconv.MetricImportDue, "1", "1 while an investment child account has an import due gap, 0 otherwise")
 	gauge(&m.dumpLastSuccess, semconv.MetricDumpLastSuccessTime, "s", "Unix time of the last successful dump")
 	gauge(&m.up, semconv.MetricUp, "1", "1 while the service is running")
 	gauge(&m.unresolved, semconv.MetricMandatesUnresolved, "1", "Mandates whose account is not known")
@@ -373,6 +375,15 @@ func (m *Metrics) ReconciliationMismatch(ctx context.Context, account string, mi
 // ImportLast records the newest statement date imported for an account.
 func (m *Metrics) ImportLast(ctx context.Context, account string, at time.Time) {
 	m.importLast.Record(ctx, at.Unix(), metric.WithAttributes(attribute.String(semconv.AttrAccount, account)))
+}
+
+// ImportDue records whether an investment child account has an import due gap.
+func (m *Metrics) ImportDue(ctx context.Context, account string, due bool) {
+	var v int64
+	if due {
+		v = 1
+	}
+	m.importDue.Record(ctx, v, metric.WithAttributes(attribute.String(semconv.AttrAccount, account)))
 }
 
 // DumpSucceeded records the time from the dump status file.

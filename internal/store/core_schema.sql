@@ -156,3 +156,68 @@ CREATE TABLE {{schema}}.direct_debit_version (
   content jsonb NOT NULL, content_hash bytea NOT NULL,
   seen_at timestamptz NOT NULL, raw_seq bigint NOT NULL,
   PRIMARY KEY (direct_debit_id, version_no));
+
+-- Investment data (docs/designs/pension-data.md). Every identifier is a UUIDv5 and no table uses a
+-- sequence, so a rebuild gives identical rows. Money is an integer in the currency's minor unit;
+-- units and prices are numeric and cross the Go boundary as decimal text, never a float. Stored
+-- units are unsigned on an event, and event_type gives direction; a cash row stores no units.
+-- gross_minor is the row's amount as printed. An event's effective date is settle_date, or
+-- order_date when it has none.
+CREATE TABLE {{schema}}.instrument (
+  id uuid PRIMARY KEY, provider text NOT NULL, provider_key text NOT NULL, ticker text,
+  UNIQUE (provider, provider_key));
+CREATE TABLE {{schema}}.investment_import (
+  raw_seq bigint PRIMARY KEY, platform_id uuid NOT NULL REFERENCES {{schema}}.account(id),
+  format text NOT NULL, kind text NOT NULL
+    CHECK (kind IN ('ledger','holdings','capture','statement','trade_note')),
+  row_count int NOT NULL, captured_at timestamptz, imported_at timestamptz NOT NULL);
+CREATE TABLE {{schema}}.investment_event (
+  id uuid PRIMARY KEY, account_id uuid NOT NULL REFERENCES {{schema}}.account(id),
+  source text NOT NULL, source_key text NOT NULL, event_type text NOT NULL
+    CHECK (event_type IN ('contribution','buy','sell','transfer_in','transfer_out','fee','tax',
+                          'interest','withdrawal','adjustment','sibling_transfer','internal')),
+  provider_type text NOT NULL, instrument_id uuid REFERENCES {{schema}}.instrument(id),
+  instrument_name text, order_date date NOT NULL, settle_date date,
+  units numeric, price numeric, price_unit text CHECK (price_unit IN ('GBP','GBX')),
+  gross_minor bigint NOT NULL, cash_minor bigint NOT NULL, flow_minor bigint NOT NULL,
+  currency text NOT NULL, version_count int NOT NULL, current_hash bytea NOT NULL,
+  first_seen_at timestamptz NOT NULL, last_seen_at timestamptz NOT NULL, disappeared_at timestamptz,
+  UNIQUE (account_id, source, source_key));
+CREATE TABLE {{schema}}.investment_event_version (
+  event_id uuid NOT NULL REFERENCES {{schema}}.investment_event(id), version_no int NOT NULL,
+  content jsonb NOT NULL, content_hash bytea NOT NULL, seen_at timestamptz NOT NULL,
+  raw_seq bigint NOT NULL, PRIMARY KEY (event_id, version_no));
+CREATE TABLE {{schema}}.holding_snapshot (
+  account_id uuid NOT NULL REFERENCES {{schema}}.account(id), raw_seq bigint NOT NULL,
+  instrument_id uuid NOT NULL REFERENCES {{schema}}.instrument(id), instrument_name text NOT NULL,
+  as_of date NOT NULL, captured_at timestamptz NOT NULL, units numeric NOT NULL, price numeric NOT NULL,
+  price_unit text NOT NULL CHECK (price_unit IN ('GBP','GBX')), value_minor bigint NOT NULL,
+  book_cost_minor bigint, currency text NOT NULL, PRIMARY KEY (account_id, raw_seq, instrument_id));
+CREATE TABLE {{schema}}.valuation (
+  account_id uuid NOT NULL REFERENCES {{schema}}.account(id), raw_seq bigint NOT NULL,
+  as_of date NOT NULL, captured_at timestamptz NOT NULL, total_minor bigint NOT NULL,
+  cash_minor bigint NOT NULL, reported_gain_minor bigint, currency text NOT NULL,
+  PRIMARY KEY (account_id, raw_seq));
+CREATE TABLE {{schema}}.pension_statement (
+  account_id uuid NOT NULL REFERENCES {{schema}}.account(id), raw_seq bigint NOT NULL,
+  period_start date NOT NULL, period_end date NOT NULL, issued_on date NOT NULL,
+  opening_minor bigint NOT NULL, paid_in_minor bigint NOT NULL, paid_out_minor bigint NOT NULL,
+  growth_minor bigint NOT NULL, charges_minor bigint, closing_minor bigint NOT NULL,
+  charges jsonb NOT NULL, projections jsonb NOT NULL, is_winner boolean NOT NULL,
+  PRIMARY KEY (account_id, raw_seq));
+-- A trade note prints an account number and no product, so it cannot create a child account and
+-- is keyed by its platform and that number. A reader joins it with child.parent_id = platform_id
+-- AND child.source_key = account_key, then the child's event by reference; a note whose number
+-- matches no child stays stored and joins nothing.
+CREATE TABLE {{schema}}.trade_note (
+  platform_id uuid NOT NULL REFERENCES {{schema}}.account(id), account_key text NOT NULL,
+  reference text NOT NULL,
+  raw_seq bigint NOT NULL, isin text NOT NULL, executed_at timestamptz NOT NULL, venue text,
+  units numeric NOT NULL, exact_price numeric NOT NULL, gross_minor bigint NOT NULL,
+  fee_minor bigint NOT NULL, tax_minor bigint NOT NULL, net_minor bigint NOT NULL,
+  settle_date date NOT NULL, PRIMARY KEY (platform_id, account_key, reference));
+CREATE TABLE {{schema}}.holding_check (
+  account_id uuid NOT NULL REFERENCES {{schema}}.account(id),
+  instrument_id uuid NOT NULL REFERENCES {{schema}}.instrument(id), checked_as_of date NOT NULL,
+  expected_units numeric NOT NULL, reported_units numeric NOT NULL, difference numeric NOT NULL,
+  PRIMARY KEY (account_id, instrument_id));

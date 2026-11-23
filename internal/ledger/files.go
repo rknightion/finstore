@@ -4,12 +4,16 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/rknightion/finstore/internal/store"
 )
 
 // importFile applies one imported statement to its file-fed account.
+//
+// An investment format goes to importInvestment, and a bank format on an investment account is
+// rejected as account_mismatch.
 //
 // The file is rejected, with nothing written, when its account is unknown or fed by an API, its
 // format has no normaliser, the normaliser refuses it (the statement fails its own checks), or
@@ -32,6 +36,13 @@ func (a *applier) importFile(ctx context.Context, f *store.ImportFile) error {
 	}
 	if acc.Feed != feedFile {
 		return rejected("api_account")
+	}
+	investment := strings.HasPrefix(acc.Source, investmentSourcePrefix)
+	if _, bank := a.l.files[f.Format]; bank && investment {
+		return rejected("account_mismatch")
+	}
+	if in, ok := a.l.investments[f.Format]; ok {
+		return a.importInvestment(ctx, acc, in, f)
 	}
 	n, ok := a.l.files[f.Format]
 	if !ok {

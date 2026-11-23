@@ -208,6 +208,7 @@ func TestNoRecordedMetricAttributeCollidesWithPrometheusLabels(t *testing.T) {
 	m.ConsentExpiry(ctx, "monzo", now)
 	m.ReconciliationMismatch(ctx, "monzo-current", false)
 	m.ImportLast(ctx, "lloyds-joint", now)
+	m.ImportDue(ctx, "pension-sipp-1234", true)
 	m.DumpSucceeded(ctx, now)
 	m.Up(ctx)
 	m.ProcessStarted(ctx, now)
@@ -273,7 +274,7 @@ func TestNoRecordedMetricAttributeCollidesWithPrometheusLabels(t *testing.T) {
 	want := []string{
 		semconv.MetricSyncLastSuccessTime, semconv.MetricSyncRuns, semconv.MetricSyncRunDuration, semconv.MetricBankRequests,
 		semconv.MetricConsentState, semconv.MetricConsentExpiryTime, semconv.MetricReconciliationMismatch,
-		semconv.MetricImportLastTime, semconv.MetricMandatesUnresolved, semconv.MetricTrueLayerOptionalReads,
+		semconv.MetricImportLastTime, semconv.MetricImportDue, semconv.MetricMandatesUnresolved, semconv.MetricTrueLayerOptionalReads,
 		semconv.MetricTrueLayerCardsUnlisted, semconv.MetricBankRequestDuration, semconv.MetricBankRetries,
 		semconv.MetricSchedulerJobRuns, semconv.MetricSchedulerJobDuration, semconv.MetricSchedulerJobLastOK,
 		semconv.MetricWriterLockHeld, semconv.MetricTelemetryExportFailures, semconv.MetricTelemetrySpanAttributesDropped,

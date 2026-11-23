@@ -175,7 +175,8 @@ whose provider differs from the platform's is rejected as `account_mismatch` bef
 created.
 
 Files import against the platform, because one Fidelity file spans several provider accounts. The
-ledger creates one child account for each provider account a file names. Its `parent_id` is the
+ledger creates one child account for each provider account a file names, except a trade confirmation,
+which creates none (see "Trade notes"). Its `parent_id` is the
 platform, `feed` is `file`, `source` is the platform's, `source_key` is the provider's account number
 and `expects_imports` is the platform's. Its type and slug come from the product:
 
@@ -224,7 +225,7 @@ when it has none.
 | `holding_snapshot` | One holding at one capture | `account_id`, `raw_seq`, `instrument_id` | `as_of`, capture time, `units`, `price`, `price_unit`, `value_minor`, `book_cost_minor`, `currency` | See capture ordering |
 | `valuation` | One account's value at one capture | `account_id`, `raw_seq` | `as_of`, capture time, `total_minor`, `cash_minor`, `reported_gain_minor` | See capture ordering |
 | `pension_statement` | One statement file | `account_id`, `raw_seq` | period, issue date, opening, paid in, paid out, growth, charges, closing, itemised charges and projections as JSON | See reissued statements |
-| `trade_note` | One trade confirmation | `account_id`, `reference` (the event's `source_key`) | `raw_seq`, ISIN, execution time, venue, exact price, fee, tax, net, settlement date | Highest `raw_seq` |
+| `trade_note` | One trade confirmation | `platform_id`, `account_key` (the printed account number), `reference` (the event's `source_key`) | `raw_seq`, ISIN, execution time, venue, exact price, fee, tax, net, settlement date | Highest `raw_seq` |
 | `holding_check` | One instrument in an account's last checked snapshot | `account_id`, `instrument_id` | `checked_as_of`, `expected_units`, `reported_units`, `difference` | Replaced per account at each check |
 
 Statement figures stay in `pension_statement`, and a provider's past-value table stays in `raw`.
@@ -242,9 +243,11 @@ disappear.
 first. A statement is a **winner** when its period overlaps no winner already kept. A `transfer_out`
 event that only a losing statement contains gets `disappeared_at`.
 
-**Trade notes.** A note is stored even if its event is not there yet. `agent.investment_events` joins
-it to the event on account and reference when both exist, and `agent.holdings` takes each
-instrument's ISIN from that join.
+**Trade notes.** A note prints an account number and no product, so it never creates or requires a
+child account. It is stored by platform and that number, even if its child or event is not there yet,
+and a note whose number matches no child joins nothing. `agent.investment_events` joins it with
+`child.parent_id = t.platform_id AND child.source_key = t.account_key`, then to the child's event on
+`reference`, and `agent.holdings` takes each instrument's ISIN from that join.
 
 ### Reading a Fidelity transaction row
 
@@ -671,11 +674,12 @@ CREATE TABLE {{schema}}.pension_statement (
   charges jsonb NOT NULL, projections jsonb NOT NULL, is_winner boolean NOT NULL,
   PRIMARY KEY (account_id, raw_seq));
 CREATE TABLE {{schema}}.trade_note (
-  account_id uuid NOT NULL REFERENCES {{schema}}.account(id), reference text NOT NULL,
+  platform_id uuid NOT NULL REFERENCES {{schema}}.account(id), account_key text NOT NULL,
+  reference text NOT NULL,
   raw_seq bigint NOT NULL, isin text NOT NULL, executed_at timestamptz NOT NULL, venue text,
   units numeric NOT NULL, exact_price numeric NOT NULL, gross_minor bigint NOT NULL,
   fee_minor bigint NOT NULL, tax_minor bigint NOT NULL, net_minor bigint NOT NULL,
-  settle_date date NOT NULL, PRIMARY KEY (account_id, reference));
+  settle_date date NOT NULL, PRIMARY KEY (platform_id, account_key, reference));
 CREATE TABLE {{schema}}.holding_check (
   account_id uuid NOT NULL REFERENCES {{schema}}.account(id),
   instrument_id uuid NOT NULL REFERENCES {{schema}}.instrument(id), checked_as_of date NOT NULL,

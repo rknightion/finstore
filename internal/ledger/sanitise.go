@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -171,3 +172,185 @@ func sanitiseBalances(bs []BalanceRec) []BalanceRec {
 	}
 	return out
 }
+
+// decimalRE is an unsigned decimal as units and prices are carried.
+var decimalRE = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?$`)
+
+func validDecimal(s string) bool { return decimalRE.MatchString(s) }
+
+// isDay reports whether t is a calendar day at midnight UTC.
+func isDay(t time.Time) bool {
+	return !t.IsZero() && t.Location() == time.UTC && t.Equal(t.Truncate(24*time.Hour))
+}
+
+// NormaliseFundName is a fund name as an instrument key: surrounding space trimmed and inner space
+// collapsed. Aviva's provider_key is this.
+func NormaliseFundName(name string) string { return strings.Join(strings.Fields(name), " ") }
+
+// sanitiseInvestmentResult cleans every text and JSON field of r and checks the rules on
+// InvestmentResult, for a normaliser of provider. ok is false when r breaks one: the file is
+// rejected as bad_result before anything is written.
+func sanitiseInvestmentResult(provider string, r InvestmentResult) (out InvestmentResult, ok bool) {
+	p, known := investmentProviders[provider]
+	if !known || r.RowCount < 0 {
+		return out, false
+	}
+	switch r.Kind {
+	case InvestmentKindLedger, InvestmentKindStatement, InvestmentKindTradeNote:
+	case InvestmentKindHoldings, InvestmentKindCapture:
+		if r.CapturedAt == nil || r.CapturedAt.IsZero() {
+			return out, false
+		}
+	default:
+		return out, false
+	}
+	allowed := func(kinds ...string) bool { return slices.Contains(kinds, r.Kind) }
+	if (len(r.Events) > 0 && !allowed(InvestmentKindLedger, InvestmentKindCapture, InvestmentKindStatement)) ||
+		((len(r.Holdings) > 0 || len(r.Valuations) > 0) && !allowed(InvestmentKindHoldings, InvestmentKindCapture)) ||
+		(len(r.Statements) > 0 && !allowed(InvestmentKindStatement)) ||
+		(len(r.TradeNotes) > 0 && !allowed(InvestmentKindTradeNote)) ||
+		(len(r.Accounts) > 0 && allowed(InvestmentKindTradeNote)) ||
+		(len(r.CompleteContributionsFor) > 0 && !allowed(InvestmentKindCapture)) {
+		return out, false
+	}
+
+	out = InvestmentResult{Kind: r.Kind, CapturedAt: r.CapturedAt, RowCount: r.RowCount,
+		Accounts:   slices.Clone(r.Accounts),
+		Events:     slices.Clone(r.Events),
+		Holdings:   slices.Clone(r.Holdings),
+		Valuations: slices.Clone(r.Valuations),
+		Statements: slices.Clone(r.Statements),
+		TradeNotes: slices.Clone(r.TradeNotes),
+	}
+	accounts := make(map[string]bool, len(out.Accounts))
+	for i := range out.Accounts {
+		a := &out.Accounts[i]
+		a.AccountKey, a.Product = cleanText(a.AccountKey), cleanText(a.Product)
+		if a.AccountKey == "" || accounts[a.AccountKey] || !slices.Contains(p.products, a.Product) {
+			return out, false
+		}
+		if _, ok := lastFour(a.AccountKey); !ok {
+			return out, false
+		}
+		accounts[a.AccountKey] = true
+	}
+	instrument := func(key string) bool {
+		if key == "" {
+			return false
+		}
+		return provider != ProviderAviva || key == NormaliseFundName(key)
+	}
+	type rowKey struct{ account, key string }
+	seen := map[rowKey]bool{}
+	first := func(account, key string) bool {
+		k := rowKey{account, key}
+		if seen[k] {
+			return false
+		}
+		seen[k] = true
+		return true
+	}
+	for i := range out.Events {
+		e := &out.Events[i]
+		for _, f := range []*string{&e.AccountKey, &e.SourceKey, &e.EventType, &e.ProviderType, &e.InstrumentKey,
+			&e.InstrumentName, &e.Units, &e.Price, &e.PriceUnit, &e.Currency} {
+			*f = cleanText(*f)
+		}
+		e.Content = cleanJSON(e.Content)
+		if !accounts[e.AccountKey] || e.SourceKey == "" || !first(e.AccountKey, e.SourceKey) || e.ProviderType == "" ||
+			!validEventType(e.EventType) || !isDay(e.OrderDate) || (!e.SettleDate.IsZero() && !isDay(e.SettleDate)) ||
+			len(e.HashInput) == 0 || !json.Valid(e.Content) {
+			return out, false
+		}
+		if (r.Kind == InvestmentKindCapture && e.EventType != EventContribution) ||
+			(r.Kind == InvestmentKindStatement && e.EventType != EventTransferOut) {
+			return out, false
+		}
+		hasUnits := e.Units != ""
+		switch e.EventType {
+		case EventBuy, EventSell:
+			if !hasUnits {
+				return out, false
+			}
+		case EventTransferIn, EventTransferOut:
+		default:
+			if hasUnits {
+				return out, false
+			}
+		}
+		if hasUnits != (e.InstrumentKey != "") || (hasUnits && (!validDecimal(e.Units) || !instrument(e.InstrumentKey))) {
+			return out, false
+		}
+		if (e.Price != "") != (e.PriceUnit != "") || (e.Price != "" && (!hasUnits || !validDecimal(e.Price) || !validPriceUnit(e.PriceUnit))) {
+			return out, false
+		}
+	}
+	seen = map[rowKey]bool{}
+	valuedOn := make(map[string]time.Time, len(out.Valuations))
+	for i := range out.Valuations {
+		v := &out.Valuations[i]
+		v.AccountKey, v.Currency = cleanText(v.AccountKey), cleanText(v.Currency)
+		if !accounts[v.AccountKey] || !isDay(v.AsOf) || !first(v.AccountKey, "") {
+			return out, false
+		}
+		valuedOn[v.AccountKey] = v.AsOf
+	}
+	seen = map[rowKey]bool{}
+	for i := range out.Holdings {
+		h := &out.Holdings[i]
+		for _, f := range []*string{&h.AccountKey, &h.InstrumentKey, &h.InstrumentName, &h.Units, &h.Price, &h.PriceUnit, &h.Currency} {
+			*f = cleanText(*f)
+		}
+		on, valued := valuedOn[h.AccountKey]
+		if !accounts[h.AccountKey] || !valued || !isDay(h.AsOf) || !h.AsOf.Equal(on) || !instrument(h.InstrumentKey) ||
+			h.InstrumentName == "" || !first(h.AccountKey, h.InstrumentKey) || !validDecimal(h.Units) ||
+			!validDecimal(h.Price) || !validPriceUnit(h.PriceUnit) {
+			return out, false
+		}
+	}
+	seen = map[rowKey]bool{}
+	for i := range out.Statements {
+		s := &out.Statements[i]
+		s.AccountKey = cleanText(s.AccountKey)
+		s.Charges, s.Projections = cleanJSON(s.Charges), cleanJSON(s.Projections)
+		if !accounts[s.AccountKey] || !first(s.AccountKey, "") || !isDay(s.PeriodStart) || !isDay(s.PeriodEnd) ||
+			!isDay(s.IssuedOn) || s.PeriodEnd.Before(s.PeriodStart) || !json.Valid(s.Charges) || !json.Valid(s.Projections) {
+			return out, false
+		}
+	}
+	seen = map[rowKey]bool{}
+	for i := range out.TradeNotes {
+		n := &out.TradeNotes[i]
+		for _, f := range []*string{&n.AccountKey, &n.Reference, &n.ISIN, &n.Venue, &n.Units, &n.ExactPrice} {
+			*f = cleanText(*f)
+		}
+		if _, ok := lastFour(n.AccountKey); !ok {
+			return out, false
+		}
+		if n.Reference == "" || !first(n.AccountKey, n.Reference) || n.ISIN == "" ||
+			n.ExecutedAt.IsZero() || !validDecimal(n.Units) || !validDecimal(n.ExactPrice) || !isDay(n.SettleDate) {
+			return out, false
+		}
+	}
+	complete := make(map[string]bool, len(r.CompleteContributionsFor))
+	for _, k := range r.CompleteContributionsFor {
+		k = cleanText(k)
+		if _, valued := valuedOn[k]; !valued || complete[k] {
+			return out, false
+		}
+		complete[k] = true
+		out.CompleteContributionsFor = append(out.CompleteContributionsFor, k)
+	}
+	return out, true
+}
+
+func validEventType(t string) bool {
+	switch t {
+	case EventContribution, EventBuy, EventSell, EventTransferIn, EventTransferOut, EventFee, EventTax, EventInterest,
+		EventWithdrawal, EventAdjustment, EventSiblingTransfer, EventInternal:
+		return true
+	}
+	return false
+}
+
+func validPriceUnit(u string) bool { return u == PriceUnitGBP || u == PriceUnitGBX }
