@@ -243,8 +243,8 @@ disappear.
 first. A statement is a **winner** when its period overlaps no winner already kept. A `transfer_out`
 event that only a losing statement contains gets `disappeared_at`.
 
-**Trade notes.** A note prints an account number and no product, so it never creates or requires a
-child account. It is stored by platform and that number, even if its child or event is not there yet,
+**Trade notes.** A note prints an account number and product wording that the parser ignores, so it
+never creates or requires a child account. It is stored by platform and that number, even if its child or event is not there yet,
 and a note whose number matches no child joins nothing. `agent.investment_events` joins it with
 `child.parent_id = t.platform_id AND child.source_key = t.account_key`, then to the child's event on
 `reference`, and `agent.holdings` takes each instrument's ISIN from that join.
@@ -623,9 +623,26 @@ right, and rejects a file missing any required label.
 
 | Format | Required labels | Fields |
 |---|---|---|
-| `aviva-annual-pdf` | `Statement for`, `Plan number`, `Value of your pension`, `Money paid in`, `Money paid out`, `Employer Payments`, `Payments Out`, `Your plan costs and charges were` | Period, plan, opening, paid in, paid out, growth, charges, closing, dated payments |
-| `fidelity-annual-pdf` | `Your pension savings annual statement for the year to`, `Amount you transferred to Fidelity`, `Investment performance after charges`, `Money in your savings account(s) on`, `Summary of charges for the year to` | Period, account, opening, money in, money out when printed, performance, closing, itemised charges |
-| `fidelity-trade-note-pdf` | `Account Number:`, and `Investments sold` or `Investments bought` | For each trade: name, ISIN, venue, execution time, settlement date, units, exact price, reference, gross, fee, tax, net |
+| `aviva-annual-pdf` | `Statement for`, `Plan number`, `Value of your pension`, `Money paid in`, `Money paid out`, `Employer Payments`, `Payments Out`, `Your plan costs and charges were`, `Your investments have gone` | Period, plan, issue date, opening, paid in, paid out, growth, charges, closing, dated payments |
+| `fidelity-annual-pdf` | `Your pension savings annual statement for the year to`, `Amount you transferred to Fidelity`, `Investment performance after charges`, `Money in your savings account(s) on`, `Summary of charges for the year to`, `You’ll need this reference if you call:`, `If you want to speak to us please quote:` | Period end, account, letter date, opening, money in, money out when printed, performance, closing, itemised charges |
+| `fidelity-trade-note-pdf` | `Account Number:`, and `Investments sold` or `Investments bought` | For each trade: ISIN, venue, execution time, settlement date, units, exact price, reference, gross, fee, tax, net |
+
+What the printed files settle:
+
+*   **Aviva annual.** Growth is before charges. The issue date is the date in `To work these values
+    out on D MMMM YYYY we’ve assumed:`, and a file without it is rejected.
+*   **Fidelity annual.** The period start is not printed, so it is the day after the same calendar
+    date one year before the printed end. The reference under `You’ll need this reference if you call:`
+    is the account, and the page footers must agree with it. Performance is signed and after charges.
+    The charges page has its own end date and covers all pension accounts, so `charges_minor` is null
+    and the printed items are kept in `charges` with their `period_end` and `scope`. Paid out is 0 when
+    no money-out row is printed, and a row of that block the parser does not recognise rejects the file.
+*   **Trade note.** Product wording is ignored and the account number is kept byte for byte. The fee is
+    the printed total charges of the trade, which includes any stamp duty. Tax is 0 unless a row labelled
+    as tax follows that total, and a row that cannot be classified rejects the file. `venue` is stored
+    as printed, `<name> (<MIC>)`. The execution time is read as wall-clock time in `FINSTORE_TIMEZONE`.
+*   Each parser reads only what a fixed label or shape identifies. A statement's name, postal address
+    and employer are never read into a record.
 
 ### Schema
 
