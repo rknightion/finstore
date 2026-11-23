@@ -278,7 +278,7 @@ docker exec finstore finstore account add --slug <slug> --type platform --provid
 Files are imported against the platform with `--account <slug>`, because one file can span several
 provider accounts. The first file naming a provider account creates a **child** account under the
 platform. Its `source_key` is the provider's account number and its slug ends in that number's last
-four alphanumeric characters. A trade confirmation names an account number and no product, so it
+four alphanumeric characters. A trade confirmation is matched by its account number alone, so it
 never creates a child: it is stored against the platform and that number, and joins the child once one
 exists.
 
@@ -505,6 +505,72 @@ unsettled on `D`. Otherwise it is `not_checked`. A transaction export states no 
 stale export imported late can omit newer rows and raise a `mismatch`; importing a fresh export
 clears it. Import a history that was exported after the summary was, in either order, and the account reaches
 `reconciled` with the replayed units and cash equal to the summary's.
+
+#### Pension statements and trade confirmations
+
+Three PDF formats are read, each imported against its provider's platform account:
+
+```sh
+docker exec -i finstore finstore import --account <platform> --format aviva-annual-pdf < statement.pdf
+docker exec -i finstore finstore import --account <platform> --format fidelity-annual-pdf < statement.pdf
+docker exec -i finstore finstore import --account <platform> --format fidelity-trade-note-pdf < note.pdf
+```
+
+| Format | Document | Stores |
+|---|---|---|
+| `aviva-annual-pdf` | Aviva annual pension statement | One statement, and one `transfer_out` event for each dated payment out |
+| `fidelity-annual-pdf` | Fidelity annual pension benefit statement | One statement for the SIPP it names |
+| `fidelity-trade-note-pdf` | Fidelity confirmation of changes to your investments | One trade note for each trade |
+
+Each file is read strictly and rejected whole, with exit 2 and no rows stored, when a required label
+is missing, a row cannot be classified or its figures do not add up. The reason is one fixed
+category and never repeats anything from the file. A reader that refuses a file the provider has
+changed is corrected and shipped, after which `finstore renormalise` reads the stored file again.
+The name, postal address and employer printed on a document are never read into any table or view.
+They stay only in the file's bytes in `raw`.
+
+**Aviva annual statement.** The period, plan number, summary figures, payments and charges are read
+from their printed labels.
+
+- The figures must satisfy opening + paid in + growth - paid out - charges = closing. Growth is
+  before charges.
+- The employer payments must sum to paid in, the payments out to paid out, and each table to its own
+  `Total` row. A summary line that repeats a figure must agree with it.
+- The issue date is the date in the line `To work these values out on D MMMM YYYY we've assumed:`. A
+  file without that line is rejected.
+- A payment out has no reference, so its key is a hash of its date, type and amount and its position
+  among identical rows. The same payment in a reissued statement is therefore the same event.
+
+**Fidelity annual statement.** The account is the reference printed under `You'll need this
+reference if you call:`, and the reference in every page footer must match it.
+
+- The period's end is printed and its start is not: it is taken as the day after the same calendar
+  date one year earlier. The issue date is the letter date on the first page.
+- The figures must satisfy opening + money in - money out + performance = closing, using the signed
+  performance from `What happened during the year`, which is already after charges. Money out is 0
+  when no such row is printed, and an unrecognised row in that block rejects the file.
+- The charges page has its own end date and covers all your pension accounts, so the statement's
+  charges figure stays empty. The printed items are kept in its `charges` JSON with their
+  `period_end` and `scope`, and must add up to their printed totals.
+
+**Fidelity trade confirmation.** A note holds an `Investments sold` section, an `Investments bought`
+section or both, each with one or more trades. Each trade's gross, fee, tax and net must agree: gross
+minus fee and tax on a sale, or plus them on a purchase, equals net. Each section's total must equal
+the sum of its trades.
+
+- The fee is the trade's printed total charges, which includes any stamp duty. Tax is 0 unless a row
+  labelled as tax follows that total. A row that cannot be classified rejects the file.
+- The venue is stored as printed, `<name> (<MIC>)`. The execution time is read as wall-clock time in
+  `FINSTORE_TIMEZONE`: an ambiguous time takes the later instant, and a time that does not exist
+  rejects the file.
+- A note never creates an account. It is stored against the platform and the printed account number,
+  and joins its event, by the transaction reference, once the account and event are imported. It
+  makes no difference which is imported first.
+
+**Reissued statements.** A provider can issue a statement again for a period it already covered.
+Both files are kept. For each account, statements are taken newest issue date first, and one is a
+winner when its period overlaps no winner already kept, in whichever order they were imported. A
+transfer out that only a losing statement contains is marked as disappeared.
 
 ### Accepting a gap
 
