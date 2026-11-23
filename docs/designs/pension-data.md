@@ -593,7 +593,9 @@ after the line `View all account details`, whose header is exactly:
 Type,Holdings,Account number,Product,Account holder,Designation,Provider,Latest price (pence/cents/yen),Export date,Quantity,Value (£),Currency,Cash available,Book cost (£),Gain/loss (£),Gain/loss (%),Annualised return (%),Total return (all time),Total return (%)
 ```
 
-`Account` rows give each account's total and cash, and `Asset` rows give its holdings. Price is in pence
+`Account` rows give each account's total and cash, and `Asset` rows give its holdings. Amounts may drop
+trailing zeros (`12`, `12.5`). An `Asset` row may end with one extra empty field, and an account with
+nothing in it prints a zero value and blank cash. Price is in pence
 for a GBP holding. Client name and Account holder are never stored outside `raw`.
 
 **`aviva-capture-json`.** One JSON object. Every amount, unit and price is a decimal string. Unknown

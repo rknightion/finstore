@@ -289,8 +289,7 @@ exists.
 | Fidelity Cash Management Account | `investment_cash` | `<platform>-cash-<last four>` |
 | Aviva pension plan | `pension` | `<platform>-pension-<last four>` |
 
-This version holds the ledger for these accounts and registers no real provider format yet, so
-`--format` accepts only the bank formats until an importer is added.
+`--format` also accepts each provider's formats, described after this section's tables.
 
 A rejected investment file exits 2 with one of these reasons, and its bytes stay in `raw`:
 
@@ -308,6 +307,204 @@ and `account accept-gap` refuse these accounts, so a permanent difference stays 
 
 A child is **import due** when its newest valuation is more than 70 days old, or it has none, so a
 two-month routine does not raise it. The bank statement threshold stays 35 days.
+
+#### The `aviva-capture-json` format
+
+`aviva-capture-json` is a capture of an Aviva pension plan: its funds, what they are worth, and the
+contributions paid in. A capture session reads it from the provider's pages, and it imports against
+an Aviva platform:
+
+```sh
+docker exec -i finstore finstore import --account <platform> --format aviva-capture-json < capture.json
+```
+
+The file is one JSON object, schema version 1. Every amount, unit and price is a decimal string.
+This example has made-up values:
+
+```json
+{
+  "schema_version": 1,
+  "captured_at": "2026-01-31T12:00:00Z",
+  "as_of": "2026-01-31",
+  "plan_ref": "PLAN00001234",
+  "total_value": "1234.50",
+  "funds": [{"name": "Example Growth Fund", "units": "1000.0000", "price": "1.2345", "value": "1234.50", "allocation_percent": "100"}],
+  "contributions_complete": true,
+  "contributions_total": "1000.00",
+  "contributions": [{"date": "2026-01-05", "type": "Regular", "payer": "employer", "gross": "1000.00"}],
+  "value_history": [{"date": "2026-01-05", "contributions_to_date": "1000.00", "value": "1100.00"}]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | The number `1`. Another version is rejected |
+| `captured_at` | When the page was read, as RFC 3339 with its offset or `Z`. Captures are ordered by this, then by the order they were imported |
+| `as_of` | The day the figures are for, `YYYY-MM-DD` |
+| `plan_ref` | The plan's reference. It becomes the child account's `source_key`, and it must hold at least four letters or digits, because the last four end the slug (`<platform>-pension-<last four>`) |
+| `total_value` | The plan's printed total value, in pounds |
+| `funds` | One entry for each fund held: `name`, `units`, `price` (in pounds), `value` (in pounds) and `allocation_percent`. May be empty. Two names that differ only in spacing are the same fund, so the file is rejected |
+| `contributions_complete` | `true` when `contributions` is the plan's whole contribution history (the Full history view), `false` for a partial view |
+| `contributions_total` | The total printed with the contribution list, in pounds |
+| `contributions` | One entry for each payment in: `date`, `type` (as printed, for example `Regular`), `payer` (`employer` or `member`) and `gross` (in pounds, above zero). May be empty |
+| `value_history` | The provider's past-value table: `date`, `contributions_to_date` and `value` for each row. May be empty |
+
+Every key is required and appears once, at the top level and in each entry. An unknown, missing or
+repeated key rejects the file, and so does a key in another letter case. Money has exactly two
+decimals and no sign, space or thousands separator. Units, prices and percentages are plain unsigned
+decimals with at most ten decimals. A number where a string belongs is rejected.
+
+A file is rejected with exit 2, and nothing is stored from it, when it is not exactly this shape or
+fails one of three checks:
+
+- **Value.** For each fund, units times price equals the printed value, within what rounding of the
+  printed units and price allows, plus half a penny. A price printed to fewer decimals allows a wider
+  gap.
+- **Total.** The funds' values add up to `total_value`, to within one penny for each fund.
+- **Contributions.** The contributions add up to `contributions_total`, exactly. This holds whether
+  or not the list is declared complete: for a partial view, `contributions_total` is the total of that
+  view.
+
+The reason is `check_failed`, and the reader never repeats anything from the file in an error. The
+bytes stay in `raw`.
+
+An accepted capture creates the plan's child account the first time it is seen, then stores:
+
+- one holding for each fund, as of `as_of`, with units and price kept exactly as printed;
+- one valuation of the plan, the printed total, with no cash (a plan holds none);
+- one `contribution` event for each contribution. It has no effect on cash, and its flow is its gross
+  amount.
+
+`value_history` stays in `raw` and produces no `core` rows. The file is still checked for its shape.
+The run's row count is the funds, contributions and value history rows together.
+
+An Aviva contribution has no reference, so its key is the SHA-256 of its date, type, payer and
+amount, followed by `#` and its position among identical rows. A key holds no plaintext amount or
+payer, but the hash is unkeyed, so anyone holding a key can test a guessed date, type, payer and
+amount against it. The same payment in two captures has the same key, wherever it sits in the list,
+so captures overlap safely.
+
+Captures are ordered by `captured_at`, then by when they were imported. The latest capture for a date
+supplies that date's holdings and valuation. A capture with `contributions_complete` set to `true`
+marks a stored contribution as disappeared when the contribution is dated on or before the capture's
+`as_of` and the capture does not list it. A later capture that lists it again clears the mark. A
+capture with `contributions_complete` set to `false` never marks anything. An older capture imported
+late never overrides a newer one: the newest complete capture decides, whatever the order the files
+arrive in. A mistaken capture is corrected by a new capture for the same date, and its contributions
+replace the mistaken ones only when it is complete.
+
+A capture checks nothing against the plan's annual statements by itself. Contributions are compared
+with each statement's paid-in figure when the statement is imported.
+
+#### Fidelity CSV files
+
+Two Fidelity exports are read, both imported against a Fidelity platform account:
+
+```sh
+docker exec -i finstore finstore import --account <platform> --format fidelity-transactions-csv < transactions.csv
+docker exec -i finstore finstore import --account <platform> --format fidelity-summary-csv < summary.csv
+```
+
+One file spans every Fidelity account you hold (SIPP, Investment ISA and Cash Management Account), so
+each is imported once, never once per account. The first file that names an account creates its child
+account.
+
+| Format | Export | Stores |
+|---|---|---|
+| `fidelity-transactions-csv` | Transaction history, exported as a CSV | One event for each row: buys, sells, transfers, fees, interest, tax, withdrawals, adjustments and the cash legs of each |
+| `fidelity-summary-csv` | Account summary, exported as a CSV | Each account's total value and cash, and each holding's units, price, value and book cost |
+
+Both files are UTF-8, normally with a byte order mark, and both are read strictly. A file is
+rejected whole, with exit 2 and no rows stored, when it breaks any rule below. The reader reports one
+fixed reason in the command's own words (a header, a type, a product, a sign, a reference) and never
+repeats anything from the file: no amount, holding name, account number or reference. A reader that
+refuses a file Fidelity has changed is corrected and shipped, after which `finstore renormalise`
+reads the stored file again.
+
+**Transaction history.** The file is five preamble lines (labelled `Account`, `Timeframe`,
+`Transaction type`, `Investment name` and `Valuations`), a blank line, and then this header, which
+must match exactly, trailing comma included:
+
+```text
+Order date,Completion date,Transaction type,Investments,Product Wrapper,Account Number,Source investment,Amount,Quantity,Price per unit,Reference Number,Status,
+```
+
+- Dates are written `02 Jan 2006`. A row with no completion date has no settle date, and its
+  effective date is then its order date. Amount is signed decimal pounds with two decimals, from the
+  account's point of view: positive for a purchase, a transfer in or money received, negative for a
+  sale or money leaving. Quantity is unsigned. Status must be `Completed`.
+- The three products are `SIPP - Pension Savings Account`, `Cash Management Account` and
+  `Investment ISA`. Any other product rejects the file.
+- A row whose Investments column is exactly `Cash` is a cash row. Any other row is a security row, and
+  its ticker is the final parenthesised token of the name, as in `EXAMPLE FUND ETF (EXMP)`. A security
+  row without one rejects the file. Security rows never count in cash, so a buy of 10 units for 100.00
+  with a 7.50 fee is a security row, a `Cash Out For Buy` of 100.00 and a `Dealing Fee` of 7.50, and
+  it takes 107.50 out of cash.
+- Each row's Reference Number is its key. A blank reference, or one that appears twice in the file,
+  rejects the file. Importing two exports whose dates overlap is safe: a row printed by both has the
+  same reference and the same content, so it is stored once and gains no new version.
+- The list of provider types is closed. An unknown type, or a type on the wrong kind of row, rejects
+  the file, and so does an amount whose sign contradicts its type (for example a `Buy` of a negative
+  amount or a `Dealing Fee` of a positive one). No contribution, dividend or transfer out row has been
+  seen in a Fidelity export, so the first such row rejects its file until its mapping is written from
+  that example.
+
+How each type is stored. `cash` is the row's effect on cash, and `flow` its value as an external flow
+for return; Amount is as printed.
+
+| Provider type | Row | Event type | Units | `cash` | `flow` |
+|---|---|---|---|---|---|
+| Buy | Security | `buy` | plus | 0 | 0 |
+| Sell, Auto-sell For Fees | Security | `sell` | minus | 0 | 0 |
+| Transfer In | Security | `transfer_in` | plus | 0 | Amount |
+| Cash In For Transfer | Cash | `transfer_in` | none | Amount | Amount |
+| Dealing Fee, Service Fee, Stamp Duty Or Financial Transaction Tax | Cash | `fee` | none | Amount | 0 |
+| Cash Interest | Cash | `interest` | none | Amount | 0 |
+| Tax On Interest | Cash | `tax` | none | 0, because the interest is already net | 0 |
+| Withdrawal | Cash | `withdrawal` | none | Amount | Amount |
+| Adjustment | Cash | `adjustment` | none | Amount | Amount |
+| Transfer To Cash Management Account For Fees, Cash In Ring-fenced For Fees | Cash | `sibling_transfer` | none | Amount | Amount |
+| Buy, Sell, Auto-sell For Fees, Cash Out For Buy, Cash Out For Buy From Transfer, Cash In From Sell, Cash In Fees From Auto-sell | Cash | `internal` | none | Amount | 0 |
+
+Only `cash` sums to an account's cash and only `flow` sums to its external flows. A security row's price
+is in pounds, as printed.
+
+**Account summary.** The file has preamble lines `Client name`, `Export date` (written `02/01/2006`)
+and `Export time` (written `15:04`), and then the line `View all account details`, and then a block
+whose header must match exactly:
+
+```text
+Type,Holdings,Account number,Product,Account holder,Designation,Provider,Latest price (pence/cents/yen),Export date,Quantity,Value (£),Currency,Cash available,Book cost (£),Gain/loss (£),Gain/loss (%),Annualised return (%),Total return (all time),Total return (%)
+```
+
+- Only that block is read, apart from the export date and time, which give the capture instant in
+  `FINSTORE_TIMEZONE`. A time that happens twice (the clocks going back) takes the later instant, and
+  a time that never happens is rejected. The export date is the date of the valuation and of each
+  holding. The client name and the account holder are never stored outside `raw`.
+- A row of Type `Account` gives an account's total value and cash available. A row of Type `Asset`
+  gives one of its holdings, and its Holdings column carries the ticker in the same form as the
+  transaction history. The latest price is in pence for a sterling holding, and is stored as such. A
+  holding quoted in another currency rejects the file until it has a mapping. Value, book cost and
+  gain are in pounds. Any other Type rejects the file.
+- The summary drops trailing zeros from amounts, so `12`, `12.5` and `12.50` are all read, and more
+  than two decimal places is not. An `Asset` row may end with one extra empty field. An account with
+  nothing in it prints a zero value and a blank cash field, and blank cash on any other account rejects
+  the file.
+- **Value check.** For every sterling holding, units times price must equal the printed value to within
+  what the rounding of the printed units and price allows, plus half a penny. A holding printed to few
+  decimal places is allowed a correspondingly wider difference.
+- **Total check.** For each account, its holdings plus its cash must equal its printed total, to within
+  one penny for each holding. An account with no holdings must match exactly.
+- A file that fails either check is rejected whole.
+
+**Checking the history against the summary.** After every import the ledger recomputes the units of each
+holding and the cash of each account from every stored event, and compares them with the newest
+summary that can be checked. A summary on date `D` is checked when a transaction history was imported
+after the summary's printed export time, no row is dated or settled on `D`, and no trade is still
+unsettled on `D`. Otherwise it is `not_checked`. A transaction export states no date of its own, so a
+stale export imported late can omit newer rows and raise a `mismatch`; importing a fresh export
+clears it. Import a history that was exported after the summary was, in either order, and the account reaches
+`reconciled` with the replayed units and cash equal to the summary's.
 
 ### Accepting a gap
 

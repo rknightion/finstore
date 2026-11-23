@@ -71,7 +71,11 @@ const (
 // investmentFormats is the registry of investment import formats: one line per format, the format
 // name to its normaliser. An importer package adds its formats here and nowhere else; NewLedger
 // registers them and `finstore import` accepts them.
-var investmentFormats = map[string]ledger.InvestmentNormaliser{}
+var investmentFormats = map[string]ledger.InvestmentNormaliser{
+	string(importer.FormatAvivaCapture):            importer.AvivaCaptureNormaliser{},
+	string(importer.FormatFidelitySummaryCSV):      importer.FidelitySummaryNormaliser{},
+	string(importer.FormatFidelityTransactionsCSV): importer.FidelityTransactionsNormaliser{},
+}
 
 // rejectionText says in the operator's terms why the projection refused a file. The categories
 // are the ledger's; none carries anything from the file. investment says the account is a platform
