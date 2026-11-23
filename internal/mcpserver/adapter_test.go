@@ -28,9 +28,14 @@ type fakeStore struct {
 	describe func(string) ([]store.Relation, error)
 	query    func(string, store.Limits) (store.Result, error)
 
-	gotSearch  store.SearchParams
-	gotSummary store.SummaryParams
-	gotLimits  store.Limits
+	portfolio func(store.PortfolioParams) ([]store.PortfolioAccount, bool, error)
+	pension   func(store.PensionSummaryParams) (store.PensionSummary, bool, error)
+
+	gotSearch    store.SearchParams
+	gotSummary   store.SummaryParams
+	gotLimits    store.Limits
+	gotPortfolio store.PortfolioParams
+	gotPension   store.PensionSummaryParams
 }
 
 func (f *fakeStore) Overview(context.Context) (store.Overview, error) { return f.overview() }
@@ -48,6 +53,73 @@ func (f *fakeStore) DescribeSchema(_ context.Context, s string) ([]store.Relatio
 func (f *fakeStore) Query(_ context.Context, sql string, l store.Limits) (store.Result, error) {
 	f.gotLimits = l
 	return f.query(sql, l)
+}
+func (f *fakeStore) Portfolio(_ context.Context, p store.PortfolioParams) ([]store.PortfolioAccount, bool, error) {
+	f.gotPortfolio = p
+	if f.portfolio == nil {
+		return nil, false, nil
+	}
+	return f.portfolio(p)
+}
+func (f *fakeStore) PensionSummary(_ context.Context, p store.PensionSummaryParams) (store.PensionSummary, bool, error) {
+	f.gotPension = p
+	if f.pension == nil {
+		return store.PensionSummary{}, false, nil
+	}
+	return f.pension(p)
+}
+
+// The adapter passes the investment tools' parameters to the store and maps every field of their
+// rows. All values are made up.
+func TestAdapterMapsTheInvestmentTools(t *testing.T) {
+	str := func(s string) *string { return &s }
+	i64 := func(n int64) *int64 { return &n }
+	f := &fakeStore{
+		portfolio: func(store.PortfolioParams) ([]store.PortfolioAccount, bool, error) {
+			return []store.PortfolioAccount{{AccountSlug: "fid-sipp-1234", Provider: "fidelity", AsOf: "2030-03-01",
+				TotalMinor: 12345, CashMinor: 45, Currency: "GBP", ReconciliationState: "reconciled",
+				Holdings: []store.PortfolioHolding{{Instrument: "Example Fund", Ticker: str("EXMP"), ISIN: str("GB00EXAMPLE1"),
+					Units: str("10.5000"), Price: str("1.2500"), PriceUnit: str("GBP"), ValueMinor: i64(12300), Currency: "GBP",
+					BookCostMinor: i64(10000), ExpectedUnits: str("10.5000"), UnitDifference: str("0.0000"), CheckedAsOf: str("2030-02-01")}},
+			}}, true, nil
+		},
+		pension: func(store.PensionSummaryParams) (store.PensionSummary, bool, error) {
+			return store.PensionSummary{
+				TaxYears: []store.TaxYearFlows{{AccountSlug: "avi-pension-1111", TaxYear: "2030-31", Currency: "GBP", PaidInMinor: 100,
+					TransfersInMinor: 2, WithdrawalsMinor: -3, AdjustmentsMinor: 4, SiblingTransfersMinor: -5, FeesMinor: -6, InterestMinor: 7}},
+				Returns: []store.InvestmentReturn{{AccountSlug: "avi-pension-1111", IntervalKind: "statement", OpeningDate: str("2030-04-05"),
+					ClosingDate: str("2031-04-05"), OpeningMinor: i64(10), ClosingMinor: i64(30), ValueChangeMinor: i64(20),
+					NetFlowMinor: i64(5), ReturnMinor: i64(15), TaxYear: str("2030-31"), Currency: "GBP"}},
+				StatementCharges: []store.StatementCharge{{AccountSlug: "avi-pension-1111", PeriodStart: "2030-04-06", PeriodEnd: "2031-04-05", Currency: "GBP"}},
+				Missing:          []store.MissingData{{AccountSlug: "avi-pension-1111", Reason: "flows_unverified"}},
+			}, false, nil
+		},
+	}
+	r := adapterRig(t, f)
+
+	var p PortfolioOutput
+	decode(t, r.call(semconv.MCPToolPortfolio, map[string]any{"accounts": []string{"fid"}, "limit": 7}), &p)
+	if len(f.gotPortfolio.Accounts) != 1 || f.gotPortfolio.Accounts[0] != "fid" || f.gotPortfolio.Limit != 7 {
+		t.Errorf("portfolio params = %+v", f.gotPortfolio)
+	}
+	if !p.Truncated || len(p.Accounts) != 1 || p.Accounts[0].TotalMinor != 12345 || len(p.Accounts[0].Holdings) != 1 {
+		t.Fatalf("portfolio = %+v", p)
+	}
+	if h := p.Accounts[0].Holdings[0]; h.Instrument != "Example Fund" || *h.Units != "10.5000" || *h.ValueMinor != 12300 ||
+		*h.UnitDifference != "0.0000" || *h.CheckedAsOf != "2030-02-01" {
+		t.Errorf("holding = %+v", h)
+	}
+
+	var s PensionSummaryOutput
+	decode(t, r.call(semconv.MCPToolPensionSummary, map[string]any{"from_tax_year": "2030-31", "to_tax_year": "2031-32", "limit": 3}), &s)
+	if f.gotPension.FromTaxYear != "2030-31" || f.gotPension.ToTaxYear != "2031-32" || f.gotPension.Limit != 3 {
+		t.Errorf("pension params = %+v", f.gotPension)
+	}
+	if s.Truncated || len(s.TaxYears) != 1 || s.TaxYears[0].PaidInMinor != 100 || s.TaxYears[0].TransfersOutMinor != nil ||
+		len(s.Returns) != 1 || *s.Returns[0].ReturnMinor != 15 || len(s.StatementCharges) != 1 ||
+		s.StatementCharges[0].ChargesMinor != nil || len(s.Missing) != 1 || s.Missing[0].Reason != "flows_unverified" {
+		t.Errorf("pension summary = %+v", s)
+	}
 }
 
 func adapterRig(t *testing.T, f *fakeStore) *rig {

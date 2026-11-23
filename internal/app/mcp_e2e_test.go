@@ -254,13 +254,13 @@ func TestMCPEndToEnd(t *testing.T) {
 		t.Errorf("the status page for a capability-only caller: %v %v", resp, err)
 	}
 
-	// With it, the five tools are there and the synced data is readable.
+	// With it, the seven tools are there and the synced data is readable.
 	cs, err := mcpSession(t, s.addr, map[string]string{"Tailscale-App-Capabilities": mcpGrant, "X-Forwarded-For": "100.64.0.9"})
 	if err != nil {
 		t.Fatalf("connect with the capability: %v\n%s", err, s.stderr.String())
 	}
 	tools, err := cs.ListTools(context.Background(), nil)
-	if err != nil || len(tools.Tools) != 5 {
+	if err != nil || len(tools.Tools) != 7 {
 		t.Fatalf("tools/list: %v %v", tools, err)
 	}
 	call := func(tool string, args map[string]any) *mcp.CallToolResult {

@@ -858,6 +858,458 @@ func (r *Reader) SpendingSummary(ctx context.Context, p SummaryParams) ([]Summar
 	return rows, truncated, nil
 }
 
+// PortfolioParams are the inputs of Portfolio. Accounts holds slugs of investment child accounts or
+// of platforms, and a platform stands for its children; empty is every investment account. Limit
+// caps each array of the result: 0 for CuratedDefaultLimit, else 1 to CuratedMaxLimit.
+type PortfolioParams struct {
+	Accounts []string `json:"accounts,omitempty"`
+	Limit    int      `json:"limit,omitempty"`
+}
+
+// PortfolioHolding is one row of agent.holdings. Units and prices are exact decimal text. The
+// reported fields are null for a position only the last check knows, and the three check fields
+// are null when no check covers the instrument.
+type PortfolioHolding struct {
+	Instrument     string  `json:"instrument"`
+	Ticker         *string `json:"ticker"`
+	ISIN           *string `json:"isin"`
+	Units          *string `json:"units"`
+	Price          *string `json:"price"`
+	PriceUnit      *string `json:"price_unit"`
+	ValueMinor     *int64  `json:"value_minor"`
+	Currency       string  `json:"currency"`
+	BookCostMinor  *int64  `json:"book_cost_minor"`
+	ExpectedUnits  *string `json:"expected_units"`
+	UnitDifference *string `json:"unit_difference"`
+	CheckedAsOf    *string `json:"checked_as_of"`
+}
+
+// PortfolioAccount is one investment child account at its newest valuation, with its holdings. A
+// value of 0 with no holdings is a real account.
+type PortfolioAccount struct {
+	AccountSlug         string             `json:"account_slug"`
+	Provider            string             `json:"provider"`
+	AsOf                string             `json:"as_of"`
+	TotalMinor          int64              `json:"total_minor"`
+	CashMinor           int64              `json:"cash_minor"`
+	Currency            string             `json:"currency"`
+	ReconciliationState string             `json:"reconciliation_state"`
+	Holdings            []PortfolioHolding `json:"holdings"`
+}
+
+// PensionSummaryParams are the inputs of PensionSummary. Accounts is as for PortfolioParams.
+// FromTaxYear and ToTaxYear are optional tax years such as 2025-26, both included. Limit caps each
+// array of the result, as for PortfolioParams.
+type PensionSummaryParams struct {
+	Accounts    []string `json:"accounts,omitempty"`
+	FromTaxYear string   `json:"from_tax_year,omitempty"`
+	ToTaxYear   string   `json:"to_tax_year,omitempty"`
+	Limit       int      `json:"limit,omitempty"`
+}
+
+// TaxYearFlows is one account's cash flows and ledger fees in one tax year and currency.
+// TransfersOutMinor is null for a statement-only account's year that winning statements do not
+// fully cover, because a transfer out is known only from a statement.
+type TaxYearFlows struct {
+	AccountSlug           string `json:"account_slug"`
+	TaxYear               string `json:"tax_year"`
+	Currency              string `json:"currency"`
+	PaidInMinor           int64  `json:"paid_in_minor"`
+	TransfersInMinor      int64  `json:"transfers_in_minor"`
+	TransfersOutMinor     *int64 `json:"transfers_out_minor"`
+	WithdrawalsMinor      int64  `json:"withdrawals_minor"`
+	AdjustmentsMinor      int64  `json:"adjustments_minor"`
+	SiblingTransfersMinor int64  `json:"sibling_transfers_minor"`
+	FeesMinor             int64  `json:"fees_minor"`
+	InterestMinor         int64  `json:"interest_minor"`
+}
+
+// InvestmentReturn is one row of agent.investment_returns.
+type InvestmentReturn struct {
+	AccountSlug      string  `json:"account_slug"`
+	IntervalKind     string  `json:"interval_kind"`
+	OpeningDate      *string `json:"opening_date"`
+	ClosingDate      *string `json:"closing_date"`
+	OpeningMinor     *int64  `json:"opening_minor"`
+	ClosingMinor     *int64  `json:"closing_minor"`
+	ValueChangeMinor *int64  `json:"value_change_minor"`
+	NetFlowMinor     *int64  `json:"net_flow_minor"`
+	ReturnMinor      *int64  `json:"return_minor"`
+	NullReason       *string `json:"null_reason"`
+	TaxYear          *string `json:"tax_year"`
+	Currency         string  `json:"currency"`
+}
+
+// StatementCharge is the charge one winning statement prints for its period. ChargesMinor null
+// means unknown, never zero. It is never split across tax years.
+type StatementCharge struct {
+	AccountSlug  string `json:"account_slug"`
+	PeriodStart  string `json:"period_start"`
+	PeriodEnd    string `json:"period_end"`
+	ChargesMinor *int64 `json:"charges_minor"`
+	Currency     string `json:"currency"`
+}
+
+// MissingData says what could not be stated for an account, and for which tax year when the gap is
+// one year's.
+type MissingData struct {
+	AccountSlug string  `json:"account_slug"`
+	TaxYear     *string `json:"tax_year"`
+	Reason      string  `json:"reason"`
+}
+
+// PensionSummary is what the pension_summary tool returns.
+type PensionSummary struct {
+	TaxYears         []TaxYearFlows     `json:"tax_years"`
+	Returns          []InvestmentReturn `json:"returns"`
+	StatementCharges []StatementCharge  `json:"statement_charges"`
+	Missing          []MissingData      `json:"missing"`
+}
+
+// parseTaxYear reads a tax year such as 2025-26 and returns its first calendar year; empty is nil.
+func parseTaxYear(name, v string) (*int, error) {
+	if v == "" {
+		return nil, nil
+	}
+	bad := fmt.Errorf("%w: %s must be a tax year such as 2025-26", ErrInvalid, name)
+	if len(v) != 7 || v[4] != '-' {
+		return nil, bad
+	}
+	for i, c := range v {
+		if i != 4 && (c < '0' || c > '9') {
+			return nil, bad
+		}
+	}
+	start, err := strconv.Atoi(v[:4])
+	if err != nil {
+		return nil, bad
+	}
+	end, err := strconv.Atoi(v[5:])
+	if err != nil || start < 1900 || (start+1)%100 != end {
+		return nil, bad
+	}
+	return &start, nil
+}
+
+// CheckTaxYears validates an optional from and to tax year and refuses from after to. Its error
+// wraps ErrInvalid.
+func CheckTaxYears(from, to string) error {
+	_, _, err := taxYearRange(from, to)
+	return err
+}
+
+func taxYearRange(from, to string) (f, t *int, err error) {
+	if f, err = parseTaxYear("from_tax_year", from); err != nil {
+		return nil, nil, err
+	}
+	if t, err = parseTaxYear("to_tax_year", to); err != nil {
+		return nil, nil, err
+	}
+	if f != nil && t != nil && *f > *t {
+		return nil, nil, fmt.Errorf("%w: from_tax_year is after to_tax_year", ErrInvalid)
+	}
+	return f, t, nil
+}
+
+// investmentRow is one row of a curated investment statement: which array it belongs to, whether
+// that array had more rows than the limit, and the element as JSON. Its encoded size is what counts
+// against the shared byte budget.
+type investmentRow struct {
+	Kind    string          `json:"k"`
+	More    bool            `json:"m"`
+	Payload json.RawMessage `json:"p"`
+}
+
+func decodeInvestmentRow(rows pgx.Rows, _ *pgtype.Map) (investmentRow, error) {
+	var row investmentRow
+	var payload []byte
+	if err := rows.Scan(&row.Kind, &row.More, &payload); err != nil {
+		return row, err
+	}
+	row.Payload = append(json.RawMessage(nil), payload...)
+	return row, nil
+}
+
+// investmentTargetsSQL selects the investment child accounts the slugs in $1 name, a platform's slug
+// naming all of its children. A null $1 selects every child.
+const investmentTargetsSQL = `
+	SELECT a.slug, substr(a.source, length('investment:') + 1) AS provider, r.method
+	FROM core.account a
+	JOIN core.account platform ON platform.id = a.parent_id
+	JOIN core.reconciliation r ON r.account_id = a.id
+	WHERE a.source LIKE 'investment:%'
+	  AND ($1::text[] IS NULL OR a.slug = ANY($1) OR platform.slug = ANY($1))`
+
+// portfolioSQL is one statement: a row per account, each followed by its holdings, largest value
+// first. $2 caps the accounts and each account's holdings; a row's more says its array was cut.
+const portfolioSQL = `
+	WITH target AS (` + investmentTargetsSQL + `
+	),
+	acc AS (
+	  SELECT t.slug, t.provider, v.as_of, v.total_minor, v.cash_minor, v.currency,
+	         coalesce(c.reconciliation_state, 'not_checked') AS reconciliation_state,
+	         row_number() OVER (ORDER BY t.slug) AS rn, count(*) OVER () AS n
+	  FROM target t
+	  JOIN LATERAL (SELECT w.as_of, w.total_minor, w.cash_minor, w.currency
+	                FROM agent.valuations w WHERE w.account_slug = t.slug
+	                ORDER BY w.as_of DESC LIMIT 1) v ON true
+	  LEFT JOIN agent.coverage c ON c.account_slug = t.slug
+	),
+	held AS (
+	  SELECT h.*, a.rn AS account_rn,
+	         row_number() OVER (PARTITION BY h.account_slug
+	                            ORDER BY coalesce(h.value_minor, -1) DESC, h.instrument_name, h.ticker) AS rn,
+	         count(*) OVER (PARTITION BY h.account_slug) AS n
+	  FROM agent.holdings h
+	  JOIN acc a ON a.slug = h.account_slug AND a.rn <= $2::int
+	)
+	SELECT u.kind, u.more, u.payload FROM (
+	  SELECT 'account'::text AS kind, a.rn AS account_ord, 0::bigint AS item_ord, a.n > $2::int AS more,
+	         jsonb_build_object('account_slug', a.slug, 'provider', a.provider, 'as_of', a.as_of,
+	           'total_minor', a.total_minor, 'cash_minor', a.cash_minor, 'currency', a.currency,
+	           'reconciliation_state', a.reconciliation_state) AS payload
+	  FROM acc a WHERE a.rn <= $2::int
+	  UNION ALL
+	  SELECT 'holding', h.account_rn, h.rn, h.n > $2::int,
+	         jsonb_build_object('account_slug', h.account_slug, 'instrument', h.instrument_name,
+	           'ticker', h.ticker, 'isin', h.isin, 'units', h.units::text, 'price', h.price::text,
+	           'price_unit', h.price_unit, 'value_minor', h.value_minor, 'currency', h.currency,
+	           'book_cost_minor', h.book_cost_minor, 'expected_units', h.expected_units::text,
+	           'unit_difference', h.unit_difference::text, 'checked_as_of', h.checked_as_of)
+	  FROM held h WHERE h.rn <= $2::int
+	) u
+	ORDER BY u.account_ord, u.item_ord`
+
+// Portfolio reads every selected investment account's newest valuation and holdings in one
+// statement. An account with no valuation has no data and is not listed. Limit caps the accounts
+// and each account's holdings, the rows share CuratedMaxBytes, and the bool is true when anything
+// was cut.
+func (r *Reader) Portfolio(ctx context.Context, p PortfolioParams) ([]PortfolioAccount, bool, error) {
+	accounts, err := slugFilter(p.Accounts)
+	if err != nil {
+		return nil, false, err
+	}
+	limits, err := curatedLimit(p.Limit)
+	if err != nil {
+		return nil, false, err
+	}
+	rows, truncated, err := read(ctx, r, portfolioSQL, []any{accounts, limits.MaxRows},
+		Limits{MaxRows: limits.MaxRows * (limits.MaxRows + 1), MaxBytes: limits.MaxBytes}, nil, nil, decodeInvestmentRow)
+	if err != nil {
+		return nil, false, fmt.Errorf("store: portfolio: %w", err)
+	}
+	out := []PortfolioAccount{}
+	index := map[string]int{}
+	for _, row := range rows {
+		truncated = truncated || row.More
+		switch row.Kind {
+		case "account":
+			var a PortfolioAccount
+			if err := json.Unmarshal(row.Payload, &a); err != nil {
+				return nil, false, fmt.Errorf("store: portfolio: decode account: %w", err)
+			}
+			a.Holdings = []PortfolioHolding{}
+			index[a.AccountSlug] = len(out)
+			out = append(out, a)
+		case "holding":
+			var h struct {
+				AccountSlug string `json:"account_slug"`
+				PortfolioHolding
+			}
+			if err := json.Unmarshal(row.Payload, &h); err != nil {
+				return nil, false, fmt.Errorf("store: portfolio: decode holding: %w", err)
+			}
+			if i, ok := index[h.AccountSlug]; ok {
+				out[i].Holdings = append(out[i].Holdings, h.PortfolioHolding)
+			}
+		}
+	}
+	return out, truncated, nil
+}
+
+// taxYearOf is the SQL for the first calendar year of the tax year holding the date expression d.
+// d is always a column name written in this file.
+func taxYearOf(d string) string {
+	return `(extract(year FROM ` + d + `)::int - CASE WHEN ` + d + ` < make_date(extract(year FROM ` + d + `)::int, 4, 6) THEN 1 ELSE 0 END)`
+}
+
+// taxYearLabel is the SQL for the label (2025-26) of the tax year starting in the int expression y.
+func taxYearLabel(y string) string {
+	return `(` + y + `::text || '-' || lpad(((` + y + ` + 1) % 100)::text, 2, '0'))`
+}
+
+// pensionSummarySQL is one statement over agent.investment_events, agent.pension_statements and
+// agent.investment_returns. $2 and $3 bound the tax years by their first calendar year, $4 and $5
+// are the first and last day of that range, and $6 caps each array. Rows are ordered by position
+// within their array, so a byte budget that runs out cuts all four arrays evenly.
+var pensionSummarySQL = `
+	WITH target AS (` + investmentTargetsSQL + `
+	),
+	ev AS (
+	  SELECT e.account_slug, e.event_type, e.flow_minor, e.cash_minor, e.currency,
+	         ` + taxYearOf("e.effective_date") + ` AS ty
+	  FROM agent.investment_events e
+	  JOIN target t ON t.slug = e.account_slug
+	),
+	stmt AS (
+	  SELECT s.account_slug, s.period_start, s.period_end, s.charges_minor, s.currency,
+	         ` + taxYearOf("s.period_start") + ` AS first_ty,
+	         ` + taxYearOf("s.period_end") + ` AS last_ty
+	  FROM agent.pension_statements s
+	  JOIN target t ON t.slug = s.account_slug
+	),
+	covered AS (
+	  SELECT s.account_slug, range_agg(daterange(s.period_start, s.period_end, '[]')) AS days
+	  FROM stmt s
+	  GROUP BY s.account_slug
+	),
+	years AS (
+	  SELECT e.account_slug, e.ty, e.currency FROM ev e
+	  UNION
+	  SELECT s.account_slug, g.ty, s.currency
+	  FROM stmt s
+	  CROSS JOIN LATERAL generate_series(s.first_ty, s.last_ty) AS g(ty)
+	),
+	by_year AS (
+	  SELECT y.account_slug, y.ty, y.currency, t.method,
+	         coalesce(sum(e.flow_minor) FILTER (WHERE e.event_type = 'contribution'), 0)::bigint AS paid_in,
+	         coalesce(sum(e.flow_minor) FILTER (WHERE e.event_type = 'transfer_in'), 0)::bigint AS transfers_in,
+	         coalesce(sum(e.flow_minor) FILTER (WHERE e.event_type = 'transfer_out'), 0)::bigint AS transfers_out,
+	         coalesce(sum(e.flow_minor) FILTER (WHERE e.event_type = 'withdrawal'), 0)::bigint AS withdrawals,
+	         coalesce(sum(e.flow_minor) FILTER (WHERE e.event_type = 'adjustment'), 0)::bigint AS adjustments,
+	         coalesce(sum(e.flow_minor) FILTER (WHERE e.event_type = 'sibling_transfer'), 0)::bigint AS sibling_transfers,
+	         coalesce(sum(e.cash_minor) FILTER (WHERE e.event_type = 'fee'), 0)::bigint AS fees,
+	         coalesce(sum(e.cash_minor) FILTER (WHERE e.event_type = 'interest'), 0)::bigint AS interest
+	  FROM years y
+	  JOIN target t ON t.slug = y.account_slug
+	  LEFT JOIN ev e ON e.account_slug = y.account_slug AND e.ty = y.ty AND e.currency = y.currency
+	  WHERE ($2::int IS NULL OR y.ty >= $2) AND ($3::int IS NULL OR y.ty <= $3)
+	  GROUP BY y.account_slug, y.ty, y.currency, t.method
+	),
+	tax_rows AS (
+	  SELECT b.*,
+	         coalesce(c.days @> daterange(make_date(b.ty, 4, 6), make_date(b.ty + 1, 4, 5), '[]'), false) AS fully_covered,
+	         row_number() OVER (ORDER BY b.account_slug, b.ty, b.currency) AS rn,
+	         count(*) OVER () AS n
+	  FROM by_year b
+	  LEFT JOIN covered c ON c.account_slug = b.account_slug
+	),
+	ret AS (
+	  SELECT r.*,
+	         row_number() OVER (ORDER BY r.account_slug, r.closing_date NULLS LAST, r.opening_date NULLS FIRST, r.interval_kind) AS rn,
+	         count(*) OVER () AS n
+	  FROM agent.investment_returns r
+	  JOIN target t ON t.slug = r.account_slug
+	  WHERE ($4::date IS NULL OR r.closing_date IS NULL OR r.closing_date >= $4)
+	    AND ($5::date IS NULL OR r.opening_date IS NULL OR r.opening_date < $5)
+	),
+	charges AS (
+	  SELECT s.account_slug, s.period_start, s.period_end, s.charges_minor, s.currency,
+	         row_number() OVER (ORDER BY s.account_slug, s.period_start) AS rn,
+	         count(*) OVER () AS n
+	  FROM stmt s
+	  WHERE ($4::date IS NULL OR s.period_end >= $4) AND ($5::date IS NULL OR s.period_start <= $5)
+	),
+	miss AS (
+	  SELECT d.account_slug, d.tax_year, d.reason,
+	         row_number() OVER (ORDER BY d.account_slug, d.tax_year NULLS FIRST, d.reason) AS rn,
+	         count(*) OVER () AS n
+	  FROM (
+	    SELECT r.account_slug, r.tax_year, r.null_reason AS reason FROM ret r WHERE r.null_reason IS NOT NULL
+	    UNION
+	    SELECT b.account_slug, ` + taxYearLabel("b.ty") + `, 'flows_unverified'
+	    FROM tax_rows b
+	    WHERE b.method = 'statement_flows' AND NOT b.fully_covered
+	  ) d
+	)
+	SELECT u.kind, u.more, u.payload FROM (
+	  SELECT 'tax_year'::text AS kind, b.rn, b.n > $6::int AS more,
+	         jsonb_build_object('account_slug', b.account_slug, 'tax_year', ` + taxYearLabel("b.ty") + `,
+	           'currency', b.currency, 'paid_in_minor', b.paid_in, 'transfers_in_minor', b.transfers_in,
+	           'transfers_out_minor', CASE WHEN b.method = 'statement_flows' AND NOT b.fully_covered THEN NULL ELSE b.transfers_out END,
+	           'withdrawals_minor', b.withdrawals, 'adjustments_minor', b.adjustments,
+	           'sibling_transfers_minor', b.sibling_transfers, 'fees_minor', b.fees, 'interest_minor', b.interest) AS payload
+	  FROM tax_rows b WHERE b.rn <= $6::int
+	  UNION ALL
+	  SELECT 'return', r.rn, r.n > $6::int,
+	         jsonb_build_object('account_slug', r.account_slug, 'interval_kind', r.interval_kind,
+	           'opening_date', r.opening_date, 'closing_date', r.closing_date, 'opening_minor', r.opening_minor,
+	           'closing_minor', r.closing_minor, 'value_change_minor', r.value_change_minor,
+	           'net_flow_minor', r.net_flow_minor, 'return_minor', r.return_minor, 'null_reason', r.null_reason,
+	           'tax_year', r.tax_year, 'currency', r.currency)
+	  FROM ret r WHERE r.rn <= $6::int
+	  UNION ALL
+	  SELECT 'statement_charge', c.rn, c.n > $6::int,
+	         jsonb_build_object('account_slug', c.account_slug, 'period_start', c.period_start,
+	           'period_end', c.period_end, 'charges_minor', c.charges_minor, 'currency', c.currency)
+	  FROM charges c WHERE c.rn <= $6::int
+	  UNION ALL
+	  SELECT 'missing', m.rn, m.n > $6::int,
+	         jsonb_build_object('account_slug', m.account_slug, 'tax_year', m.tax_year, 'reason', m.reason)
+	  FROM miss m WHERE m.rn <= $6::int
+	) u
+	ORDER BY u.rn, u.kind`
+
+// PensionSummary reads cash flows by tax year, returns, statement charges and what is missing for
+// the selected investment accounts, in one statement. Limit caps each of the four arrays, the rows
+// share CuratedMaxBytes, and the bool is true when anything was cut.
+func (r *Reader) PensionSummary(ctx context.Context, p PensionSummaryParams) (PensionSummary, bool, error) {
+	out := PensionSummary{TaxYears: []TaxYearFlows{}, Returns: []InvestmentReturn{},
+		StatementCharges: []StatementCharge{}, Missing: []MissingData{}}
+	accounts, err := slugFilter(p.Accounts)
+	if err != nil {
+		return out, false, err
+	}
+	fromYear, toYear, err := taxYearRange(p.FromTaxYear, p.ToTaxYear)
+	if err != nil {
+		return out, false, err
+	}
+	limits, err := curatedLimit(p.Limit)
+	if err != nil {
+		return out, false, err
+	}
+	var firstDay, lastDay *time.Time
+	if fromYear != nil {
+		d := time.Date(*fromYear, time.April, 6, 0, 0, 0, 0, time.UTC)
+		firstDay = &d
+	}
+	if toYear != nil {
+		d := time.Date(*toYear+1, time.April, 5, 0, 0, 0, 0, time.UTC)
+		lastDay = &d
+	}
+	rows, truncated, err := read(ctx, r, pensionSummarySQL, []any{accounts, fromYear, toYear, firstDay, lastDay, limits.MaxRows},
+		Limits{MaxRows: 4 * limits.MaxRows, MaxBytes: limits.MaxBytes}, nil, nil, decodeInvestmentRow)
+	if err != nil {
+		return out, false, fmt.Errorf("store: pension summary: %w", err)
+	}
+	for _, row := range rows {
+		truncated = truncated || row.More
+		var derr error
+		switch row.Kind {
+		case "tax_year":
+			var v TaxYearFlows
+			derr = json.Unmarshal(row.Payload, &v)
+			out.TaxYears = append(out.TaxYears, v)
+		case "return":
+			var v InvestmentReturn
+			derr = json.Unmarshal(row.Payload, &v)
+			out.Returns = append(out.Returns, v)
+		case "statement_charge":
+			var v StatementCharge
+			derr = json.Unmarshal(row.Payload, &v)
+			out.StatementCharges = append(out.StatementCharges, v)
+		case "missing":
+			var v MissingData
+			derr = json.Unmarshal(row.Payload, &v)
+			out.Missing = append(out.Missing, v)
+		}
+		if derr != nil {
+			return PensionSummary{}, false, fmt.Errorf("store: pension summary: decode row: %w", derr)
+		}
+	}
+	return out, truncated, nil
+}
+
 // Kinds of Relation.
 const (
 	KindTable            = "table"

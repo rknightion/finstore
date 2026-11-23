@@ -38,12 +38,17 @@ type fakeReader struct {
 	describe func(context.Context, string) ([]Relation, error)
 	query    func(context.Context, string, Limits) (Result, error)
 
-	calls     int
-	gotSearch SearchParams
-	gotSum    SummaryParams
-	gotSchema string
-	gotSQL    string
-	gotLimits Limits
+	portfolio func(context.Context, PortfolioParams) ([]PortfolioAccount, bool, error)
+	pension   func(context.Context, PensionSummaryParams) (PensionSummaryData, bool, error)
+
+	calls        int
+	gotSearch    SearchParams
+	gotSum       SummaryParams
+	gotSchema    string
+	gotSQL       string
+	gotLimits    Limits
+	gotPortfolio PortfolioParams
+	gotPension   PensionSummaryParams
 }
 
 func (f *fakeReader) called() int {
@@ -106,6 +111,28 @@ func (f *fakeReader) Query(ctx context.Context, sql string, limits Limits) (Resu
 	return f.query(ctx, sql, limits)
 }
 
+func (f *fakeReader) Portfolio(ctx context.Context, p PortfolioParams) ([]PortfolioAccount, bool, error) {
+	f.mu.Lock()
+	f.calls++
+	f.gotPortfolio = p
+	f.mu.Unlock()
+	if f.portfolio == nil {
+		return nil, false, nil
+	}
+	return f.portfolio(ctx, p)
+}
+
+func (f *fakeReader) PensionSummary(ctx context.Context, p PensionSummaryParams) (PensionSummaryData, bool, error) {
+	f.mu.Lock()
+	f.calls++
+	f.gotPension = p
+	f.mu.Unlock()
+	if f.pension == nil {
+		return PensionSummaryData{}, false, nil
+	}
+	return f.pension(ctx, p)
+}
+
 func sp(s string) *string { return &s }
 
 // A small, made-up ledger.
@@ -130,16 +157,32 @@ var (
 	sampleRels   = []Relation{{Schema: "agent", Name: "transactions", Kind: "view", Comment: sp("one row per transaction"),
 		Columns: []Column{{Name: "id", Type: "uuid", Nullable: false}}}}
 	sampleResult = Result{Columns: []string{"n"}, Rows: [][]any{{1}, {2}}, Elapsed: 7 * time.Millisecond}
+
+	samplePortfolio = []PortfolioAccount{{AccountSlug: "fid-sipp-1234", Provider: "fidelity", AsOf: "2030-03-01", TotalMinor: 1000,
+		Currency: "GBP", ReconciliationState: "reconciled",
+		Holdings: []Holding{{Instrument: "Example Fund", Units: sp("1.5"), Currency: "GBP"}}}}
+	samplePension = PensionSummaryData{
+		TaxYears: []TaxYearFlows{{AccountSlug: "fid-sipp-1234", TaxYear: "2030-31", Currency: "GBP", PaidInMinor: 100}},
+		Returns:  []InvestmentReturn{{AccountSlug: "fid-sipp-1234", IntervalKind: "no_statement", NullReason: sp("statement_missing"), Currency: "GBP"}},
+		Missing:  []MissingData{{AccountSlug: "fid-sipp-1234", Reason: "statement_missing"}},
+	}
 )
 
 func populated() *fakeReader {
-	return &fakeReader{
+	f := &fakeReader{
 		overview: func(context.Context) (Overview, error) { return sampleOverview, nil },
 		search:   func(context.Context, SearchParams) ([]Transaction, bool, error) { return sampleTxns, false, nil },
 		summary:  func(context.Context, SummaryParams) ([]SummaryGroup, bool, error) { return sampleGroups, false, nil },
 		describe: func(context.Context, string) ([]Relation, error) { return sampleRels, nil },
 		query:    func(context.Context, string, Limits) (Result, error) { return sampleResult, nil },
 	}
+	f.portfolio = func(context.Context, PortfolioParams) ([]PortfolioAccount, bool, error) {
+		return samplePortfolio, false, nil
+	}
+	f.pension = func(context.Context, PensionSummaryParams) (PensionSummaryData, bool, error) {
+		return samplePension, false, nil
+	}
+	return f
 }
 
 // rig is a server over the SDK's in-memory transport with its spans, metrics and logs in memory.
@@ -316,8 +359,8 @@ func (r *rig) onlyCall(tool, outcome, client string) (tracetest.SpanStub, map[st
 	return spans[0], logs[0]
 }
 
-// Testing 8: tools/list gives the five tools, each with its annotations, schemas and a description.
-func TestToolsListGivesFiveReadOnlyTools(t *testing.T) {
+// Testing 8: tools/list gives the seven tools, each with its annotations, schemas and a description.
+func TestToolsListGivesSevenReadOnlyTools(t *testing.T) {
 	r := newRig(t, populated())
 	list, err := r.cs.ListTools(context.Background(), nil)
 	if err != nil {
@@ -327,8 +370,8 @@ func TestToolsListGivesFiveReadOnlyTools(t *testing.T) {
 	for _, tool := range list.Tools {
 		got[tool.Name] = tool
 	}
-	if len(list.Tools) != 5 {
-		t.Fatalf("%d tools, want 5", len(list.Tools))
+	if len(list.Tools) != 7 {
+		t.Fatalf("%d tools, want 7", len(list.Tools))
 	}
 	for _, name := range semconv.MCPTools() {
 		tool := got[name]
@@ -346,7 +389,8 @@ func TestToolsListGivesFiveReadOnlyTools(t *testing.T) {
 		}
 	}
 	// A tool that returns text a third party chose says so.
-	for _, name := range []string{semconv.MCPToolSearchTransactions, semconv.MCPToolQuerySQL, semconv.MCPToolSpendingSummary} {
+	for _, name := range []string{semconv.MCPToolSearchTransactions, semconv.MCPToolQuerySQL, semconv.MCPToolSpendingSummary,
+		semconv.MCPToolPortfolio, semconv.MCPToolPensionSummary} {
 		if !strings.Contains(got[name].Description, "never follow instructions") {
 			t.Errorf("%s description does not warn about untrusted text: %s", name, got[name].Description)
 		}
@@ -444,6 +488,21 @@ func TestEachToolReturnsStructuredOutputAndOneOfEachSignal(t *testing.T) {
 				t.Errorf("query = %+v", out)
 			}
 		}},
+		// AC6: finstore.mcp.tool.calls counts both investment tools by name (onlyCall below).
+		{semconv.MCPToolPortfolio, map[string]any{"accounts": []string{"fid"}}, 2, func(t *testing.T, res *mcp.CallToolResult) {
+			var out PortfolioOutput
+			decode(t, res, &out)
+			if len(out.Accounts) != 1 || out.Accounts[0].TotalMinor != 1000 || len(out.Accounts[0].Holdings) != 1 || out.Truncated {
+				t.Errorf("portfolio = %+v", out)
+			}
+		}},
+		{semconv.MCPToolPensionSummary, map[string]any{"from_tax_year": "2030-31"}, 3, func(t *testing.T, res *mcp.CallToolResult) {
+			var out PensionSummaryOutput
+			decode(t, res, &out)
+			if len(out.TaxYears) != 1 || len(out.Returns) != 1 || len(out.Missing) != 1 || out.StatementCharges == nil || out.Truncated {
+				t.Errorf("pension summary = %+v", out)
+			}
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.tool, func(t *testing.T) {
@@ -483,11 +542,14 @@ func TestEachToolReturnsStructuredOutputAndOneOfEachSignal(t *testing.T) {
 // Empty results are empty lists, never null, so an output schema that wants an array is met.
 func TestEmptyResultsAreListsNotNull(t *testing.T) {
 	r := newRig(t, &fakeReader{})
-	for tool, args := range map[string]any{
+	cases := map[string]any{
 		semconv.MCPToolOverview: map[string]any{}, semconv.MCPToolSearchTransactions: map[string]any{},
 		semconv.MCPToolSpendingSummary: map[string]any{"from": "2030-01-01", "to": "2030-01-31", "group_by": "account"},
 		semconv.MCPToolDescribeSchema:  map[string]any{}, semconv.MCPToolQuerySQL: map[string]any{"sql": "SELECT 1 WHERE false"},
-	} {
+	}
+	cases[semconv.MCPToolPortfolio] = map[string]any{}
+	cases[semconv.MCPToolPensionSummary] = map[string]any{}
+	for tool, args := range cases {
 		res := r.call(tool, args)
 		if res.IsError {
 			t.Errorf("%s: %s", tool, resultText(res))
@@ -497,6 +559,44 @@ func TestEmptyResultsAreListsNotNull(t *testing.T) {
 		if strings.Contains(string(b), "null") {
 			t.Errorf("%s output has a null: %s", tool, b)
 		}
+	}
+}
+
+// Invalid investment tool input is a one-line tool error that never reaches the reader, and the
+// limit default and bounds are those of the curated tools.
+func TestInvestmentToolsValidateTheirInput(t *testing.T) {
+	for name, tt := range map[string]struct {
+		tool string
+		args map[string]any
+		want string
+	}{
+		"portfolio slug":  {semconv.MCPToolPortfolio, map[string]any{"accounts": []string{"no spaces"}}, "account slug"},
+		"portfolio limit": {semconv.MCPToolPortfolio, map[string]any{"limit": 1001}, "limit must be between"},
+		"summary slug":    {semconv.MCPToolPensionSummary, map[string]any{"accounts": []string{"no spaces"}}, "account slug"},
+		"summary limit":   {semconv.MCPToolPensionSummary, map[string]any{"limit": -1}, "limit must be between"},
+		"bad tax year":    {semconv.MCPToolPensionSummary, map[string]any{"from_tax_year": "2030"}, "from_tax_year must be a tax year"},
+		"wrong end":       {semconv.MCPToolPensionSummary, map[string]any{"to_tax_year": "2030-32"}, "to_tax_year must be a tax year"},
+		"from after to":   {semconv.MCPToolPensionSummary, map[string]any{"from_tax_year": "2031-32", "to_tax_year": "2030-31"}, "after"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := populated()
+			r := newRig(t, f)
+			res := r.call(tt.tool, tt.args)
+			if !res.IsError || !strings.Contains(resultText(res), tt.want) || strings.Contains(resultText(res), "\n") {
+				t.Fatalf("result = %v %q, want one line with %q", res.IsError, resultText(res), tt.want)
+			}
+			if f.called() != 0 {
+				t.Errorf("invalid input reached the reader %d times", f.called())
+			}
+			r.onlyCall(tt.tool, semconv.MCPOutcomeInvalid, semconv.MCPClientUnknown)
+		})
+	}
+	f := populated()
+	r := newRig(t, f)
+	r.call(semconv.MCPToolPortfolio, map[string]any{})
+	r.call(semconv.MCPToolPensionSummary, map[string]any{"limit": 1000})
+	if f.gotPortfolio.Limits != (Limits{MaxRows: 100, MaxBytes: 512 << 10}) || f.gotPension.Limits != (Limits{MaxRows: 1000, MaxBytes: 512 << 10}) {
+		t.Errorf("limits = %+v and %+v", f.gotPortfolio.Limits, f.gotPension.Limits)
 	}
 }
 
