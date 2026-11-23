@@ -15,6 +15,8 @@ type storeReader interface {
 	SpendingSummary(ctx context.Context, p store.SummaryParams) ([]store.SummaryGroup, bool, error)
 	DescribeSchema(ctx context.Context, schema string) ([]store.Relation, error)
 	Query(ctx context.Context, sql string, limits store.Limits) (store.Result, error)
+	Portfolio(ctx context.Context, p store.PortfolioParams) ([]store.PortfolioAccount, bool, error)
+	PensionSummary(ctx context.Context, p store.PensionSummaryParams) (store.PensionSummary, bool, error)
 }
 
 // FromStore returns the Reader the tools read through, backed by the store's MCP reader. It maps the
@@ -133,6 +135,51 @@ func (a adapter) Query(ctx context.Context, sql string, limits Limits) (Result, 
 		return Result{}, err
 	}
 	return Result{Columns: res.Columns, Rows: res.Rows, Truncated: res.Truncated, Elapsed: res.Elapsed}, nil
+}
+
+func (a adapter) Portfolio(ctx context.Context, p PortfolioParams) ([]PortfolioAccount, bool, error) {
+	rows, truncated, err := a.r.Portfolio(ctx, store.PortfolioParams{Accounts: p.Accounts, Limit: p.Limits.MaxRows})
+	if err != nil {
+		return nil, false, err
+	}
+	out := make([]PortfolioAccount, len(rows))
+	for i, acc := range rows {
+		holdings := make([]Holding, len(acc.Holdings))
+		for j, h := range acc.Holdings {
+			holdings[j] = Holding(h)
+		}
+		out[i] = PortfolioAccount{
+			AccountSlug: acc.AccountSlug, Provider: acc.Provider, AsOf: acc.AsOf, TotalMinor: acc.TotalMinor,
+			CashMinor: acc.CashMinor, Currency: acc.Currency, ReconciliationState: acc.ReconciliationState,
+			Holdings: holdings,
+		}
+	}
+	return out, truncated, nil
+}
+
+func (a adapter) PensionSummary(ctx context.Context, p PensionSummaryParams) (PensionSummaryData, bool, error) {
+	s, truncated, err := a.r.PensionSummary(ctx, store.PensionSummaryParams{Accounts: p.Accounts,
+		FromTaxYear: p.FromTaxYear, ToTaxYear: p.ToTaxYear, Limit: p.Limits.MaxRows})
+	if err != nil {
+		return PensionSummaryData{}, false, err
+	}
+	out := PensionSummaryData{
+		TaxYears: make([]TaxYearFlows, len(s.TaxYears)), Returns: make([]InvestmentReturn, len(s.Returns)),
+		StatementCharges: make([]StatementCharge, len(s.StatementCharges)), Missing: make([]MissingData, len(s.Missing)),
+	}
+	for i, v := range s.TaxYears {
+		out.TaxYears[i] = TaxYearFlows(v)
+	}
+	for i, v := range s.Returns {
+		out.Returns[i] = InvestmentReturn(v)
+	}
+	for i, v := range s.StatementCharges {
+		out.StatementCharges[i] = StatementCharge(v)
+	}
+	for i, v := range s.Missing {
+		out.Missing[i] = MissingData(v)
+	}
+	return out, truncated, nil
 }
 
 // day formats an optional date the way the store takes it: YYYY-MM-DD, empty for none.

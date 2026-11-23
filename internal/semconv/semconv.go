@@ -419,14 +419,17 @@ const (
 	MCPToolSpendingSummary    = "spending_summary"
 	MCPToolDescribeSchema     = "describe_schema"
 	MCPToolQuerySQL           = "query_sql"
+	MCPToolPortfolio          = "portfolio"
+	MCPToolPensionSummary     = "pension_summary"
 	MCPToolUnknown            = "unknown"
 )
 
 var mcpTools = []string{
 	MCPToolOverview, MCPToolSearchTransactions, MCPToolSpendingSummary, MCPToolDescribeSchema, MCPToolQuerySQL,
+	MCPToolPortfolio, MCPToolPensionSummary,
 }
 
-// MCPTools returns the names of the five tools, in the order the server lists them.
+// MCPTools returns the names of the seven tools, in the order the server lists them.
 func MCPTools() []string { return slices.Clone(mcpTools) }
 
 // IsMCPTool reports whether name is one of the server's tools.

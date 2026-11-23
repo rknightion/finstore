@@ -29,6 +29,12 @@ type realCluster struct {
 
 func newRealCluster(t *testing.T) realCluster {
 	t.Helper()
+	return newRealClusterAt(t, 1)
+}
+
+// newRealClusterAt is newRealCluster migrated to the given normaliser revision.
+func newRealClusterAt(t *testing.T, rev int) realCluster {
+	t.Helper()
 	ctx := context.Background()
 	super := testpg.Start(t)
 	if err := store.Bootstrap(ctx, super, "owner-secret", "app-secret"); err != nil {
@@ -37,7 +43,7 @@ func newRealCluster(t *testing.T) realCluster {
 	if err := store.EnableMCPLogin(ctx, super, "mcp-secret"); err != nil {
 		t.Fatalf("EnableMCPLogin: %v", err)
 	}
-	if err := store.Migrate(ctx, testpg.UserURL(t, super, store.RoleOwner), 1); err != nil {
+	if err := store.Migrate(ctx, testpg.UserURL(t, super, store.RoleOwner), rev); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
 	app, err := store.Open(ctx, testpg.UserURL(t, super, store.RoleApp))
