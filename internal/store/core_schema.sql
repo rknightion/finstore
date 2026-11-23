@@ -205,12 +205,17 @@ CREATE TABLE {{schema}}.pension_statement (
   growth_minor bigint NOT NULL, charges_minor bigint, closing_minor bigint NOT NULL,
   charges jsonb NOT NULL, projections jsonb NOT NULL, is_winner boolean NOT NULL,
   PRIMARY KEY (account_id, raw_seq));
+-- A trade note prints an account number and no product, so it cannot create a child account and
+-- is keyed by its platform and that number. A reader joins it with child.parent_id = platform_id
+-- AND child.source_key = account_key, then the child's event by reference; a note whose number
+-- matches no child stays stored and joins nothing.
 CREATE TABLE {{schema}}.trade_note (
-  account_id uuid NOT NULL REFERENCES {{schema}}.account(id), reference text NOT NULL,
+  platform_id uuid NOT NULL REFERENCES {{schema}}.account(id), account_key text NOT NULL,
+  reference text NOT NULL,
   raw_seq bigint NOT NULL, isin text NOT NULL, executed_at timestamptz NOT NULL, venue text,
   units numeric NOT NULL, exact_price numeric NOT NULL, gross_minor bigint NOT NULL,
   fee_minor bigint NOT NULL, tax_minor bigint NOT NULL, net_minor bigint NOT NULL,
-  settle_date date NOT NULL, PRIMARY KEY (account_id, reference));
+  settle_date date NOT NULL, PRIMARY KEY (platform_id, account_key, reference));
 CREATE TABLE {{schema}}.holding_check (
   account_id uuid NOT NULL REFERENCES {{schema}}.account(id),
   instrument_id uuid NOT NULL REFERENCES {{schema}}.instrument(id), checked_as_of date NOT NULL,

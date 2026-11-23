@@ -209,6 +209,7 @@ func sanitiseInvestmentResult(provider string, r InvestmentResult) (out Investme
 		((len(r.Holdings) > 0 || len(r.Valuations) > 0) && !allowed(InvestmentKindHoldings, InvestmentKindCapture)) ||
 		(len(r.Statements) > 0 && !allowed(InvestmentKindStatement)) ||
 		(len(r.TradeNotes) > 0 && !allowed(InvestmentKindTradeNote)) ||
+		(len(r.Accounts) > 0 && allowed(InvestmentKindTradeNote)) ||
 		(len(r.CompleteContributionsFor) > 0 && !allowed(InvestmentKindCapture)) {
 		return out, false
 	}
@@ -323,7 +324,10 @@ func sanitiseInvestmentResult(provider string, r InvestmentResult) (out Investme
 		for _, f := range []*string{&n.AccountKey, &n.Reference, &n.ISIN, &n.Venue, &n.Units, &n.ExactPrice} {
 			*f = cleanText(*f)
 		}
-		if !accounts[n.AccountKey] || n.Reference == "" || !first(n.AccountKey, n.Reference) || n.ISIN == "" ||
+		if _, ok := lastFour(n.AccountKey); !ok {
+			return out, false
+		}
+		if n.Reference == "" || !first(n.AccountKey, n.Reference) || n.ISIN == "" ||
 			n.ExecutedAt.IsZero() || !validDecimal(n.Units) || !validDecimal(n.ExactPrice) || !isDay(n.SettleDate) {
 			return out, false
 		}

@@ -196,7 +196,7 @@ func (a *applier) applyInvestmentRows(ctx context.Context, platform store.Accoun
 		}
 	}
 	for _, n := range res.TradeNotes {
-		if err := a.core.PutTradeNote(ctx, store.TradeNote{AccountID: children[n.AccountKey].ID, Reference: n.Reference,
+		if err := a.core.PutTradeNote(ctx, store.TradeNote{PlatformID: platform.ID, AccountKey: n.AccountKey, Reference: n.Reference,
 			RawSeq: f.Seq, ISIN: n.ISIN, ExecutedAt: n.ExecutedAt, Venue: optional(n.Venue), Units: n.Units,
 			ExactPrice: n.ExactPrice, GrossMinor: n.GrossMinor, FeeMinor: n.FeeMinor, TaxMinor: n.TaxMinor,
 			NetMinor: n.NetMinor, SettleDate: n.SettleDate}); err != nil {

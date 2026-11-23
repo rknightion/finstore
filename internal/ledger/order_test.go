@@ -38,7 +38,10 @@ func businessState(t *testing.T, e *env) string {
 			FROM core.valuation v JOIN core.account a ON a.id = v.account_id ORDER BY 1, 2, 3`},
 		{"statement", `SELECT a.slug, s.period_start::text, s.period_end::text, s.issued_on::text, s.closing_minor::text, s.is_winner::text
 			FROM core.pension_statement s JOIN core.account a ON a.id = s.account_id ORDER BY 1, 2, 4`},
-		{"note", `SELECT a.slug, n.reference, n.isin, n.net_minor::text FROM core.trade_note n JOIN core.account a ON a.id = n.account_id ORDER BY 1, 2`},
+		{"note", `SELECT p.slug, n.account_key, n.reference, n.isin, n.net_minor::text, coalesce(c.slug, ''), coalesce(v.event_type, '')
+			FROM core.trade_note n JOIN core.account p ON p.id = n.platform_id
+			LEFT JOIN core.account c ON c.parent_id = n.platform_id AND c.source_key = n.account_key
+			LEFT JOIN core.investment_event v ON v.account_id = c.id AND v.source_key = n.reference ORDER BY 1, 2, 3`},
 		{"check", `SELECT a.slug, i.provider_key, c.checked_as_of::text, c.expected_units::text, c.reported_units::text, c.difference::text
 			FROM core.holding_check c JOIN core.account a ON a.id = c.account_id JOIN core.instrument i ON i.id = c.instrument_id ORDER BY 1, 2`},
 		{"reconciliation", `SELECT a.slug, r.method, coalesce(r.last_check_ok::text, 'null'), coalesce(r.last_diff_minor::text, 'null'),
@@ -84,6 +87,10 @@ func TestOppositeImportOrdersGiveTheSameState(t *testing.T) {
 	keptOut, droppedOut := transferOut(avi, "T-KEPT", "2029-12-01", 100), transferOut(avi, "T-LOST", "2029-11-01", 200)
 
 	files := []orderFile{
+		// First here and so last in the reversed order: a note arrives before and after its child.
+		{"fid", fakeFidelityFormat, ledger.InvestmentResult{Kind: ledger.InvestmentKindTradeNote, RowCount: 1,
+			TradeNotes: []ledger.TradeNoteRec{{AccountKey: fid, Reference: "R1", ISIN: "GB00EXAMPLE1", ExecutedAt: at(1, 8),
+				Units: "10.5", ExactPrice: "1.2345", GrossMinor: 1296, NetMinor: 1296, SettleDate: date("2030-01-07")}}}},
 		{"fid", fakeFidelityFormat, ledgerFile(fid, buy, in, out)},
 		{"fid", fakeFidelityFormat, ledgerFile(fid, buy, in, out, interest)},
 		{"fid", fakeFidelityFormat, summary(fid, "2030-02-01", at(1, 9), 1000, map[string]string{"EXMP": "10.5"})},
@@ -91,9 +98,6 @@ func TestOppositeImportOrdersGiveTheSameState(t *testing.T) {
 		// imported first.
 		{"fid", fakeFidelityFormat, summary(fid, "2030-04-01", at(2, 9), 1, map[string]string{"EXMP": "10.5"})},
 		{"fid", fakeFidelityFormat, summary(fid, "2030-04-01", at(2, 10), 1025, map[string]string{"EXMP": "10.5"})},
-		{"fid", fakeFidelityFormat, ledger.InvestmentResult{Kind: ledger.InvestmentKindTradeNote, Accounts: sipp(fid), RowCount: 1,
-			TradeNotes: []ledger.TradeNoteRec{{AccountKey: fid, Reference: "R1", ISIN: "GB00EXAMPLE1", ExecutedAt: at(1, 8),
-				Units: "10.5", ExactPrice: "1.2345", GrossMinor: 1296, NetMinor: 1296, SettleDate: date("2030-01-07")}}}},
 
 		// The older capture lists K2; the newer complete one does not, so K2 disappears. K3 is dated
 		// after the newer capture's date and is left alone by it.
@@ -127,6 +131,7 @@ func TestOppositeImportOrdersGiveTheSameState(t *testing.T) {
 
 	// The state both orders reached is the one the rules say, not merely the same.
 	for _, want := range []string{
+		"note fid|ACC00001234|R1|GB00EXAMPLE1|1296|fid-sipp-1234|buy",
 		"K1|contribution|Regular||2029-06-01|||0|600|600|true",
 		"K2|contribution|Regular||2029-09-01|||0|400|400|false",
 		"K3|contribution|Regular||2030-05-01|||0|500|500|true",

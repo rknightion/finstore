@@ -229,7 +229,9 @@ func TestNormaliserRegistrationRefusals(t *testing.T) {
 		"holdings no capture": {Kind: ledger.InvestmentKindHoldings, Accounts: sipp("ACC00005555")},
 		"holding no valuation": {Kind: ledger.InvestmentKindHoldings, CapturedAt: ptr(e.clock), Accounts: sipp("ACC00005555"),
 			Holdings: []ledger.HoldingRec{{AccountKey: "ACC00005555", InstrumentKey: "EXMP", InstrumentName: "x", AsOf: date("2030-01-09"), Units: "1", Price: "1", PriceUnit: "GBP"}}},
-		"statement in a ledger": {Kind: ledger.InvestmentKindLedger, Accounts: sipp("ACC00005555"), Statements: []ledger.PensionStatementRec{{AccountKey: "ACC00005555"}}},
+		"trade note listing accounts":                              {Kind: ledger.InvestmentKindTradeNote, Accounts: sipp("ACC00005555"), TradeNotes: []ledger.TradeNoteRec{madeUpNote("ACC00005555", "N1", e.clock)}},
+		"trade note, no accounts in the result but a short number": {Kind: ledger.InvestmentKindTradeNote, TradeNotes: []ledger.TradeNoteRec{madeUpNote("A-1", "N2", e.clock)}},
+		"statement in a ledger":                                    {Kind: ledger.InvestmentKindLedger, Accounts: sipp("ACC00005555"), Statements: []ledger.PensionStatementRec{{AccountKey: "ACC00005555"}}},
 		"complete with no valuation": {Kind: ledger.InvestmentKindCapture, CapturedAt: ptr(e.clock), Accounts: sipp("ACC00005555"),
 			CompleteContributionsFor: []string{"ACC00005555"}},
 		"date not at midnight": ledgerFile("ACC00005555", func() ledger.InvestmentEventRec {
@@ -254,6 +256,11 @@ func TestNormaliserRegistrationRefusals(t *testing.T) {
 	}
 }
 
+func madeUpNote(acct, reference string, at time.Time) ledger.TradeNoteRec {
+	return ledger.TradeNoteRec{AccountKey: acct, Reference: reference, ISIN: "GB00EXAMPLE1", ExecutedAt: at, Venue: "Made-up", Units: "1.5",
+		ExactPrice: "12.3456", GrossMinor: 1800, FeeMinor: 10, NetMinor: 1810, SettleDate: date("2030-02-03")}
+}
+
 // A result creates a child account, instruments, events, snapshots, valuations, statements and
 // notes, and a byte-identical file adds nothing.
 func TestInvestmentResultCreatesItsRows(t *testing.T) {
@@ -262,6 +269,18 @@ func TestInvestmentResultCreatesItsRows(t *testing.T) {
 	e.platform("fid", ledger.ProviderFidelity)
 	e.platform("avi", ledger.ProviderAviva)
 	const acct, avivaAcct = "ACC00001234", "PLAN00005678"
+
+	// A note imported before any file names its account is stored and creates no child.
+	early := ledger.InvestmentResult{Kind: ledger.InvestmentKindTradeNote, RowCount: 1, TradeNotes: []ledger.TradeNoteRec{madeUpNote(acct, "R1", e.clock)}}
+	if st := e.invest("fid", fakeFidelityFormat, early); st.FilesRejected != 0 || st.AccountsCreated != 0 {
+		t.Fatalf("an early note: %+v", st)
+	}
+	if n := e.count(`SELECT count(*) FROM core.account WHERE parent_id = $1`, e.account("fid").ID); n != 0 {
+		t.Fatalf("a note created %d child accounts", n)
+	}
+	if n := e.count(`SELECT count(*) FROM core.trade_note WHERE platform_id = $1 AND account_key = $2 AND reference = 'R1'`, e.account("fid").ID, acct); n != 1 {
+		t.Fatalf("%d early notes stored", n)
+	}
 
 	buy := trade(acct, "R1", ledger.EventBuy, "EXMP", "2030-01-05", "2030-01-07", "10.5")
 	buy.Price, buy.PriceUnit, buy.GrossMinor = "1234.56789", ledger.PriceUnitGBX, 13000
@@ -272,6 +291,13 @@ func TestInvestmentResultCreatesItsRows(t *testing.T) {
 	child := e.account("fid-sipp-1234")
 	if n := e.count(`SELECT count(*) FROM core.investment_event WHERE account_id = $1`, child.ID); n != 2 {
 		t.Fatalf("%d events", n)
+	}
+	// Once the child and event exist, the early note joins them.
+	if n := e.count(`SELECT count(*) FROM core.trade_note t
+		JOIN core.account c ON c.parent_id = t.platform_id AND c.source_key = t.account_key
+		JOIN core.investment_event v ON v.account_id = c.id AND v.source_key = t.reference
+		WHERE c.id = $1 AND t.reference = 'R1'`, child.ID); n != 1 {
+		t.Fatalf("the early note joins %d events", n)
 	}
 	id := ledger.InvestmentEventID(child.ID, "investment:fidelity", "R1")
 	ev, err := e.core().GetInvestmentEvent(ctx, id)
@@ -307,11 +333,11 @@ func TestInvestmentResultCreatesItsRows(t *testing.T) {
 	at := e.clock
 	sf := summary(acct, "2030-02-01", at, 0, map[string]string{"EXMP": "10.5"})
 	e.invest("fid", fakeFidelityFormat, sf)
-	note := ledger.InvestmentResult{Kind: ledger.InvestmentKindTradeNote, Accounts: sipp(acct), RowCount: 1, TradeNotes: []ledger.TradeNoteRec{{
+	note := ledger.InvestmentResult{Kind: ledger.InvestmentKindTradeNote, RowCount: 1, TradeNotes: []ledger.TradeNoteRec{{
 		AccountKey: acct, Reference: "R-NOT-YET", ISIN: "GB00EXAMPLE1", ExecutedAt: at, Venue: "Made-up", Units: "1.5", ExactPrice: "12.3456",
 		GrossMinor: 1800, FeeMinor: 10, TaxMinor: 0, NetMinor: 1810, SettleDate: date("2030-02-03")}}}
 	e.invest("fid", fakeFidelityFormat, note)
-	if n := e.count(`SELECT count(*) FROM core.trade_note WHERE account_id = $1 AND reference = 'R-NOT-YET' AND exact_price = 12.3456`, child.ID); n != 1 {
+	if n := e.count(`SELECT count(*) FROM core.trade_note WHERE platform_id = $1 AND account_key = $2 AND reference = 'R-NOT-YET' AND exact_price = 12.3456`, e.account("fid").ID, acct); n != 1 {
 		t.Fatalf("%d trade notes", n)
 	}
 	if n := e.count(`SELECT count(*) FROM core.holding_snapshot WHERE account_id = $1`, child.ID); n != 1 {
@@ -330,7 +356,7 @@ func TestInvestmentResultCreatesItsRows(t *testing.T) {
 	if n := e.count(`SELECT count(*) FROM core.pension_statement WHERE account_id = $1 AND is_winner`, avChild.ID); n != 1 {
 		t.Fatalf("%d winning statements", n)
 	}
-	if n := e.count(`SELECT count(*) FROM core.investment_import`); n != 6 {
+	if n := e.count(`SELECT count(*) FROM core.investment_import`); n != 7 {
 		t.Fatalf("%d investment imports", n)
 	}
 

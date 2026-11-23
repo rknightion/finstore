@@ -278,7 +278,9 @@ docker exec finstore finstore account add --slug <slug> --type platform --provid
 Files are imported against the platform with `--account <slug>`, because one file can span several
 provider accounts. The first file naming a provider account creates a **child** account under the
 platform. Its `source_key` is the provider's account number and its slug ends in that number's last
-four alphanumeric characters:
+four alphanumeric characters. A trade confirmation names an account number and no product, so it
+never creates a child: it is stored against the platform and that number, and joins the child once one
+exists.
 
 | Product | `type` | Slug |
 |---|---|---|

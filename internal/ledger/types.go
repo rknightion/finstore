@@ -399,8 +399,11 @@ type PensionStatementRec struct {
 	Projections  json.RawMessage
 }
 
-// TradeNoteRec is one trade confirmation. It is stored even when its event is not there yet.
+// TradeNoteRec is one trade confirmation. It is stored against the platform and its printed account
+// number, even when no child or event matches yet, and never creates a child.
 type TradeNoteRec struct {
+	// AccountKey is the printed account number, with at least four alphanumeric characters. It need
+	// not be in InvestmentResult.Accounts.
 	AccountKey string
 	// Reference is the SourceKey of the event the note confirms.
 	Reference  string
@@ -424,12 +427,13 @@ type TradeNoteRec struct {
 //   - InvestmentKindCapture: Holdings, Valuations, Events of type contribution and
 //     CompleteContributionsFor; CapturedAt required.
 //   - InvestmentKindStatement: Statements and Events of type transfer_out.
-//   - InvestmentKindTradeNote: TradeNotes.
+//   - InvestmentKindTradeNote: TradeNotes, and Accounts must be empty: a note prints no product, so
+//     it can never create a child.
 //
-// Every record's AccountKey must be listed in Accounts. Within one result an account has at most one
-// valuation and one statement, an instrument at most one holding per account, and a source key or a
-// trade reference at most one row per account. A file with no rows (an export of a quiet period) is
-// valid and has an empty Accounts.
+// Every record's AccountKey, a trade note's excepted, must be listed in Accounts. Within one result
+// an account has at most one valuation and one statement, an instrument at most one holding per
+// account, and a source key or a trade reference at most one row per account. A file with no rows
+// (an export of a quiet period) is valid and has an empty Accounts.
 type InvestmentResult struct {
 	Kind string
 	// CapturedAt is the printed capture time, converted with the loc given to the normaliser.

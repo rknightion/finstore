@@ -480,7 +480,9 @@ func (c Core) SetStatementWinners(ctx context.Context, accountID uuid.UUID, winn
 
 // TradeNote is a core.trade_note row: one trade confirmation.
 type TradeNote struct {
-	AccountID  uuid.UUID
+	PlatformID uuid.UUID
+	// AccountKey is the account number the note prints. It may match no child account yet.
+	AccountKey string
 	Reference  string
 	RawSeq     int64
 	ISIN       string
@@ -495,18 +497,18 @@ type TradeNote struct {
 	SettleDate time.Time // a date
 }
 
-// PutTradeNote stores n as the note of its account and reference, unless a note from a higher raw
-// seq is already there.
+// PutTradeNote stores n as the note of its platform, account number and reference, unless a note
+// from a higher raw seq is already there.
 func (c Core) PutTradeNote(ctx context.Context, n TradeNote) error {
-	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.trade_note AS t (account_id, reference, raw_seq, isin, executed_at, venue,
-		  units, exact_price, gross_minor, fee_minor, tax_minor, net_minor, settle_date)
-		VALUES ($1, $2, $3, $4, $5, $6, $7::text::numeric, $8::text::numeric, $9, $10, $11, $12, $13)
-		ON CONFLICT (account_id, reference) DO UPDATE SET raw_seq = EXCLUDED.raw_seq, isin = EXCLUDED.isin,
+	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.trade_note AS t (platform_id, account_key, reference, raw_seq, isin, executed_at,
+		  venue, units, exact_price, gross_minor, fee_minor, tax_minor, net_minor, settle_date)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::numeric, $9::text::numeric, $10, $11, $12, $13, $14)
+		ON CONFLICT (platform_id, account_key, reference) DO UPDATE SET raw_seq = EXCLUDED.raw_seq, isin = EXCLUDED.isin,
 		  executed_at = EXCLUDED.executed_at, venue = EXCLUDED.venue, units = EXCLUDED.units,
 		  exact_price = EXCLUDED.exact_price, gross_minor = EXCLUDED.gross_minor, fee_minor = EXCLUDED.fee_minor,
 		  tax_minor = EXCLUDED.tax_minor, net_minor = EXCLUDED.net_minor, settle_date = EXCLUDED.settle_date
 		WHERE EXCLUDED.raw_seq >= t.raw_seq`),
-		n.AccountID, n.Reference, n.RawSeq, n.ISIN, n.ExecutedAt, n.Venue, n.Units, n.ExactPrice, n.GrossMinor,
+		n.PlatformID, n.AccountKey, n.Reference, n.RawSeq, n.ISIN, n.ExecutedAt, n.Venue, n.Units, n.ExactPrice, n.GrossMinor,
 		n.FeeMinor, n.TaxMinor, n.NetMinor, n.SettleDate)
 	if err != nil {
 		return fmt.Errorf("store: put trade note: %w", err)
