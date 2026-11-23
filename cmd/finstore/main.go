@@ -119,8 +119,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return runAccount(ctx, env, rest, flags, parse)
 	case "import":
 		fs := flags(command)
-		account := fs.String("account", "", "slug of the account the statement belongs to")
-		format := fs.String("format", "", app.FormatHalifaxPDF+" or "+app.FormatManualCSV)
+		account := fs.String("account", "", "slug of the account the statement belongs to, or of the platform for an investment file")
+		format := fs.String("format", "", "the file's format, such as "+app.FormatHalifaxPDF+" or "+app.FormatManualCSV)
 		name := fs.String("name", "", "the file's name, kept for reference")
 		if !parse(fs, rest) {
 			return exitUsage
@@ -168,10 +168,11 @@ func runAccount(ctx context.Context, env app.Env, args []string,
 		fs := flags("account add")
 		var spec app.AccountSpec
 		fs.StringVar(&spec.Slug, "slug", "", "short name used in commands and views, such as bank-joint")
-		fs.StringVar(&spec.Type, "type", "", "current, joint, savings or mortgage")
+		fs.StringVar(&spec.Type, "type", "", "current, joint, savings, mortgage or platform")
+		fs.StringVar(&spec.Provider, "provider", "", "for --type platform only: fidelity or aviva")
 		fs.StringVar(&spec.Currency, "currency", "GBP", "three-letter currency code")
 		fs.StringVar(&spec.Name, "name", "", "display name")
-		fs.BoolVar(&spec.ExpectsImports, "expects-imports", false, "report an import as due when the newest statement is over 35 days old")
+		fs.BoolVar(&spec.ExpectsImports, "expects-imports", false, "report an import as due when the newest statement is over 35 days old (70 days for an investment account's newest valuation)")
 		if !parse(fs, args[1:]) {
 			return exitUsage
 		}

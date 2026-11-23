@@ -503,10 +503,12 @@ const (
 	callbackTimeout = 75 * time.Second
 )
 
-// feedLabel names where an account's data comes from: Monzo's own API, TrueLayer, or statement
-// files. An API source it does not know is shown as stored.
+// feedLabel names where an account's data comes from: Monzo's own API, TrueLayer, investment files
+// or statement files. An API source it does not know is shown as stored.
 func feedLabel(feed, source string) string {
 	switch {
+	case feed == "file" && strings.HasPrefix(source, "investment:"):
+		return "investment file"
 	case feed == "file":
 		return "statement file"
 	case source == "monzo":

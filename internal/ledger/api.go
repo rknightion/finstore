@@ -27,6 +27,10 @@ const (
 	methodBalanceMovement = "balance_movement"
 	methodFileContinuity  = "file_continuity"
 	methodBalancesOnly    = "balances_only"
+	// methodHoldingsReplay checks an investment account with a ledger: see holdingsReplay.
+	methodHoldingsReplay = "holdings_replay"
+	// methodStatementFlows checks an investment account with no ledger: see statementFlows.
+	methodStatementFlows = "statement_flows"
 )
 
 // SourceTrueLayerLloyds is the source of the TrueLayer connection to Lloyds. Its accounts are
@@ -58,6 +62,8 @@ const (
 const (
 	typePot        = "pot"
 	typeCreditCard = "credit_card"
+	// typePlatform groups the accounts held at one investment provider.
+	typePlatform = "platform"
 )
 
 // cardKeyPrefix begins the source key of a card account: card:<last four digits>.

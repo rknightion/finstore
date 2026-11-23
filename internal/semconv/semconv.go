@@ -28,9 +28,11 @@ const (
 	MetricConsentExpiryTime      = "finstore.consent.expiry.time"
 	MetricReconciliationMismatch = "finstore.reconciliation.mismatch"
 	MetricImportLastTime         = "finstore.import.last.time"
-	MetricDumpLastSuccessTime    = "finstore.dump.last_success.time"
-	MetricUp                     = "finstore.up"
-	MetricMandatesUnresolved     = "finstore.mandates.unresolved"
+	// MetricImportDue is 1 while an investment child account has an "import due" gap, else 0.
+	MetricImportDue           = "finstore.import.due"
+	MetricDumpLastSuccessTime = "finstore.dump.last_success.time"
+	MetricUp                  = "finstore.up"
+	MetricMandatesUnresolved  = "finstore.mandates.unresolved"
 	// MetricTrueLayerOptionalReads counts TrueLayer reads whose answer never reaches the ledger, by
 	// endpoint and result (AttrResult).
 	MetricTrueLayerOptionalReads = "finstore.truelayer.optional_reads"
@@ -400,7 +402,7 @@ var statusCategories = []string{
 	"history_failed", "consent_lost", "superseded", "interrupted", "card_key_shared", "cards_refused", "scopes_unknown",
 	"window_closed", "timestamp_group_over_page", "backfill_started", "unexpected_body", "cancelled", "internal",
 	// Import and ledger rejections.
-	"check_failed", "account_mismatch", "unknown_format", "rejected_before",
+	"check_failed", "account_mismatch", "unknown_format", "rejected_before", "child_key_shared",
 	// Connect and callback failures.
 	"attempt_read", "exchange",
 	// MCP tool call outcomes that fail a span (timeout and error are listed above).

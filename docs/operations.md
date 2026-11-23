@@ -216,8 +216,9 @@ docker exec finstore finstore account add --slug bank-joint --type joint --curre
   --name "Joint account" --expects-imports
 ```
 
-`--type` is `current`, `joint`, `savings` or `mortgage`. `--expects-imports` makes the account show
-"import due" in the coverage view when its newest statement is more than 35 days old.
+`--type` is `current`, `joint`, `savings`, `mortgage` or `platform` (see
+[Investment accounts](#investment-accounts)). `--expects-imports` makes the account show "import
+due" in the coverage view when its newest statement is more than 35 days old.
 
 Then each statement is imported from standard input:
 
@@ -263,6 +264,48 @@ If two statements do not join up, both are still imported, and the gap between t
 shown in the coverage view until the missing statement arrives. For PDF statements a gap is a break
 in the printed periods or in the balance. For `manual-csv` only the balance can show it, so a
 skipped stretch in which money in equalled money out goes unnoticed.
+
+### Investment accounts
+
+A pension or investment provider is one **platform** account, created once. `--provider` is
+required for this type, is `fidelity` or `aviva`, and is refused for every other type:
+
+```sh
+docker exec finstore finstore account add --slug <slug> --type platform --provider <fidelity|aviva> \
+  --currency GBP --name "<name>" --expects-imports
+```
+
+Files are imported against the platform with `--account <slug>`, because one file can span several
+provider accounts. The first file naming a provider account creates a **child** account under the
+platform. Its `source_key` is the provider's account number and its slug ends in that number's last
+four alphanumeric characters:
+
+| Product | `type` | Slug |
+|---|---|---|
+| Fidelity SIPP | `pension` | `<platform>-sipp-<last four>` |
+| Fidelity Investment ISA | `isa` | `<platform>-isa-<last four>` |
+| Fidelity Cash Management Account | `investment_cash` | `<platform>-cash-<last four>` |
+| Aviva pension plan | `pension` | `<platform>-pension-<last four>` |
+
+This version holds the ledger for these accounts and registers no real provider format yet, so
+`--format` accepts only the bank formats until an importer is added.
+
+A rejected investment file exits 2 with one of these reasons, and its bytes stay in `raw`:
+
+| Category | Meaning |
+|---|---|
+| `account_mismatch` | The file's provider is not the platform's, the account is not a platform, a bank format was given for an investment account, or a provider account in the file is held under another platform |
+| `child_key_shared` | A child's slug is already taken by another account |
+| `check_failed` | The file could not be read as this format, or failed one of its own checks |
+| `bad_result` | The reader produced a result that breaks the ledger's contract |
+
+A byte-identical file reports "already imported" and stores nothing. A platform has no reconciliation
+state, is left out of `agent.coverage`, and cannot be ended: end each child on its own with `account
+end`, which stops it being import due and judges it on data up to that date. `account accept-difference`
+and `account accept-gap` refuse these accounts, so a permanent difference stays an honest `mismatch`.
+
+A child is **import due** when its newest valuation is more than 70 days old, or it has none, so a
+two-month routine does not raise it. The bank statement threshold stays 35 days.
 
 ### Accepting a gap
 
@@ -459,6 +502,16 @@ state recorded at that time, or in the one recorded next (a capture loaded late)
 `version_count` counts the states it has been in, in turn. Going back to an earlier state after a change is a change and adds
 one. A transaction that the bank stops returning is marked as disappeared,
 not deleted.
+
+Investment data has its own `core` tables and never enters `core.transaction`, so spending totals
+do not change. `instrument` holds each holdable item at a provider and `investment_import` each
+accepted file. `investment_event` holds one provider ledger row, versioned in
+`investment_event_version`. `holding_snapshot` and `valuation` hold one capture's holdings and value,
+`pension_statement` one annual statement (`is_winner` marks the one that counts when periods
+overlap), `trade_note` one trade confirmation, and `holding_check` the per-instrument result of the
+last check. Units and prices are `numeric`, because providers report them to several decimal places.
+These tables reach a live database through the normaliser revision, so upgrading to this version
+needs `finstore renormalise`.
 
 ### Reading the data
 
@@ -662,6 +715,17 @@ Two views follow the money into and out of pots:
   it. Pending card
   transactions are not counted: the check assumes the bank's balance holds settled transactions
   only. A difference that will never clear can be accepted with `account accept-difference`.
+- **Investment accounts with a ledger** (`holdings_replay`): after every import the stored events are
+  replayed and compared with the newest checkable capture. A capture on date `D` is checkable when a
+  transactions file was imported at or after its printed export time, no event is ordered or takes
+  effect on `D`, and no event is unsettled across `D`. Units are compared for every instrument held on
+  either side, and cash with the events effective on or before `D`. Any difference is an immediate
+  `mismatch`, and `core.holding_check` holds the per-instrument result. A transactions export taken
+  before the capture can raise a false mismatch, and a fresh export clears it.
+- **Investment accounts with no ledger** (`statement_flows`): each winning annual statement's paid-in
+  figure must equal the stored contributions dated in its period, and its opening must equal the
+  previous statement's closing when the two periods abut. The account is `not_checked` until it has a
+  statement. When statements overlap, the newest issued wins and the rest are kept but not counted.
 - **Bank references**: two accounts from different sources with the same bank reference, neither
   ended, are both a mismatch.
 - **Pots** have balances only; Monzo's API does not list a pot's own transactions. The transfers
@@ -865,6 +929,7 @@ metric value, a label or a log field; the log handler drops any field that is no
 | `finstore.consent.expiry.time` | `source` | Unix time the consent is expected to end |
 | `finstore.reconciliation.mismatch` | `account` | 1 while the account's last check failed or it has a statement gap |
 | `finstore.import.last.time` | `account` | Unix time of the newest statement date imported |
+| `finstore.import.due` | `account` | For investment child accounts only: 1 while the account has an `import due` gap (no valuation in 70 days), 0 otherwise |
 | `finstore.dump.last_success.time` | none | Unix time from the dump status file |
 | `finstore.up` | none | 1, sent every minute |
 | `finstore.process.start.time` | none | Unix time `serve` started. The value changes at each start, so `changes()` over it counts restarts |
@@ -1005,7 +1070,8 @@ so if that job is failing they all go stale.
 
 Alerts worth having: no successful sync for 3 hours (13 hours for a `truelayer:` source, which syncs
 twice a day); consent ending within 14 days; consent `lost`
-or `expired`; a reconciliation mismatch lasting 90 minutes; newest import older than 35 days; dump
+or `expired`; a reconciliation mismatch lasting 90 minutes; newest import older than 35 days;
+`finstore.import.due` at 1 for an investment account; dump
 older than 14 hours; `finstore.up` absent for an hour; `finstore.store.writer_lock.held` above an
 hour for any holder (every scheduled sync waits behind it; a `serve` holder past its run deadline
 means the release stuck, and a command holder is just a long command).

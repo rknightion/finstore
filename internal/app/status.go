@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/rknightion/finstore/internal/semconv"
@@ -164,6 +166,12 @@ func (p *statusPublisher) run(ctx context.Context) error {
 		expects[a.Slug] = a.Feed != feedAPI && a.ExpectsImports && a.EndedOn == nil
 	}
 	for _, c := range coverage {
+		// Investment child accounts only (coverage leaves platforms out), from the same gap the page
+		// shows, so the alert and the display share one rule. Recorded as 0 as well as 1, so the alert
+		// clears.
+		if strings.HasPrefix(c.Source, "investment:") {
+			p.m.ImportDue(ctx, c.AccountSlug, slices.ContainsFunc(c.Gaps, func(g store.Gap) bool { return g.Reason == store.GapImportDue }))
+		}
 		if c.ReconciliationState == store.StateBalancesOnly {
 			continue
 		}

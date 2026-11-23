@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"regexp"
@@ -67,14 +68,28 @@ const (
 	rejectionRepeated = "rejected_before"
 )
 
+// investmentFormats is the registry of investment import formats: one line per format, the format
+// name to its normaliser. An importer package adds its formats here and nowhere else; NewLedger
+// registers them and `finstore import` accepts them.
+var investmentFormats = map[string]ledger.InvestmentNormaliser{}
+
 // rejectionText says in the operator's terms why the projection refused a file. The categories
-// are the ledger's; none carries anything from the file.
-func rejectionText(category string) string {
+// are the ledger's; none carries anything from the file. investment says the account is a platform
+// or one of its children, whose files name no sort code.
+func rejectionText(category string, investment bool) string {
 	switch category {
 	case "check_failed":
+		if investment {
+			return "the file could not be read as this format, or failed one of its checks."
+		}
 		return "the file could not be read as this format, or failed one of its checks (the rows, the totals and the balances must agree)."
 	case "account_mismatch":
+		if investment {
+			return "this format or the accounts in the file do not belong to this account: an investment file imports only into a platform of its provider, and a provider account stays under its first platform."
+		}
 		return "the sort code and account number in the file are not the ones in the statements already imported into this account."
+	case "child_key_shared":
+		return "an account in the file would take a slug another account already has."
 	case "unknown_format":
 		return "this version does not know the format."
 	default:
@@ -174,7 +189,7 @@ func NewLedger(loc *time.Location, log *slog.Logger, tr trace.Tracer) *ledger.Le
 			FormatHalifaxPDF: importer.Normaliser{},
 			FormatManualCSV:  importer.Normaliser{},
 		},
-		loc, log, tr)
+		loc, log, tr, ledger.WithInvestmentNormalisers(investmentFormats))
 }
 
 // storeTelemetry makes a store opened by a command trace its queries into the command's span.
@@ -302,12 +317,19 @@ type AccountSpec struct {
 	Currency       string `json:"currency"`
 	Name           string `json:"name"`
 	ExpectsImports bool   `json:"expects_imports"`
+	// Provider is required for type platform, and refused for any other type.
+	Provider string `json:"provider,omitempty"`
 }
+
+// typePlatform is the account type that groups the accounts held at one investment provider.
+const typePlatform = "platform"
 
 var (
 	slugRE       = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 	currencyRE   = regexp.MustCompile(`^[A-Z]{3}$`)
-	accountTypes = []string{"current", "joint", "savings", "mortgage"}
+	accountTypes = []string{"current", "joint", "savings", "mortgage", typePlatform}
+	// platformProviders are the values of --provider.
+	platformProviders = []string{ledger.ProviderFidelity, ledger.ProviderAviva}
 )
 
 func (s AccountSpec) validate() error {
@@ -320,6 +342,10 @@ func (s AccountSpec) validate() error {
 		return errors.New("--currency must be a three-letter code such as GBP")
 	case strings.TrimSpace(s.Name) == "":
 		return errors.New("--name is required")
+	case s.Type == typePlatform && !slices.Contains(platformProviders, s.Provider):
+		return fmt.Errorf("--type platform needs --provider, one of %s", strings.Join(platformProviders, ", "))
+	case s.Type != typePlatform && s.Provider != "":
+		return errors.New("--provider applies only to --type platform")
 	}
 	return nil
 }
@@ -366,6 +392,14 @@ func accountAdd(ctx context.Context, e Env, t cliTelemetry, spec AccountSpec) in
 			return fmt.Errorf("an account with the slug %q already exists", spec.Slug)
 		} else if !errors.Is(err, store.ErrNotFound) {
 			return err
+		}
+		if spec.Type == typePlatform {
+			// A platform's id comes from its provider and slug, which a child's account number could equal.
+			if _, err := core.GetAccountBySource(ctx, ledger.InvestmentSource(spec.Provider), spec.Slug); err == nil {
+				return fmt.Errorf("the slug %q is the account number of an account of this provider", spec.Slug)
+			} else if !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
 		}
 		if _, err := store.InsertOperatorEntry(ctx, tx, store.OperatorEntry{
 			Kind: entryAccountAdd, Payload: payload, EnteredAt: e.now(),
@@ -556,10 +590,14 @@ func accountEnd(ctx context.Context, e Env, t cliTelemetry, slug string, lastDat
 		if err != nil {
 			return err
 		}
-		if _, err := core.GetAccountBySlug(ctx, slug); errors.Is(err, store.ErrNotFound) {
+		account, err := core.GetAccountBySlug(ctx, slug)
+		if errors.Is(err, store.ErrNotFound) {
 			return fmt.Errorf("no account has the slug %q", slug)
 		} else if err != nil {
 			return err
+		}
+		if account.Type == typePlatform {
+			return fmt.Errorf("account %s is a platform: end each of its accounts on its own", slug)
 		}
 		if _, err := store.InsertOperatorEntry(ctx, tx, store.OperatorEntry{
 			Kind: entryAccountEnd, Payload: payload, EnteredAt: e.now(),
@@ -588,8 +626,8 @@ func Import(ctx context.Context, e Env, slug, format, name string) int {
 }
 
 func importStatement(ctx context.Context, e Env, t cliTelemetry, slug, format, name string) int {
-	if format != FormatHalifaxPDF && format != FormatManualCSV {
-		return e.fail(fmt.Errorf("--format must be %s or %s", FormatHalifaxPDF, FormatManualCSV))
+	if _, investment := investmentFormats[format]; !investment && format != FormatHalifaxPDF && format != FormatManualCSV {
+		return e.fail(fmt.Errorf("--format must be one of %s", strings.Join(importFormats(), ", ")))
 	}
 	body, err := io.ReadAll(io.LimitReader(e.Stdin, maxImportLen+1))
 	if err != nil {
@@ -619,6 +657,9 @@ func importStatement(ctx context.Context, e Env, t cliTelemetry, slug, format, n
 			code, message = ExitNoAccount, fmt.Sprintf("account %s is fed by an API and takes no imports", slug)
 			return nil
 		}
+		// An investment format on a bank account is refused in the same provider-neutral words.
+		_, investmentFormat := investmentFormats[format]
+		investment := investmentFormat || strings.HasPrefix(account.Source, "investment:")
 		// Normalise anything already waiting first, so the counts below belong to this file alone.
 		if _, err := l.CatchUp(ctx, tx, store.SchemaCore); err != nil {
 			return err
@@ -636,12 +677,12 @@ func importStatement(ctx context.Context, e Env, t cliTelemetry, slug, format, n
 		if existed {
 			// The same bytes were stored before. Whether they were imported is another matter:
 			// a file that was rejected then is still rejected now.
-			statements, err := core.ListStatements(ctx, account.ID)
+			imported, err := fileWasImported(ctx, core, account, seq)
 			if err != nil {
 				return err
 			}
 			result := store.RunResult{FinishedAt: e.now(), Outcome: "ok"}
-			if slices.ContainsFunc(statements, func(s store.Statement) bool { return s.RawSeq == seq }) {
+			if imported {
 				message = "already imported: this exact file was imported before"
 			} else {
 				category := rejectionRepeated
@@ -664,7 +705,14 @@ func importStatement(ctx context.Context, e Env, t cliTelemetry, slug, format, n
 			}
 			result.Outcome, result.ErrorCategory = "failed", &category
 			code = ExitRejected
-			message = "rejected: " + rejectionText(category) + " Nothing was imported. The file itself is kept."
+			message = "rejected: " + rejectionText(category, investment) + " Nothing was imported. The file itself is kept."
+		} else if investment {
+			imp, err := core.GetInvestmentImport(ctx, seq)
+			if err != nil {
+				return err
+			}
+			result.RowsSeen = imp.RowCount
+			message = fmt.Sprintf("imported: %d rows", imp.RowCount)
 		} else {
 			message = fmt.Sprintf("imported: %d new transactions, %d changed", stats.TransactionsCreated, stats.TransactionsChanged)
 		}
@@ -679,6 +727,29 @@ func importStatement(ctx context.Context, e Env, t cliTelemetry, slug, format, n
 	}
 	_, _ = fmt.Fprintln(out, message)
 	return code
+}
+
+// importFormats lists every format `finstore import` takes, in order.
+func importFormats() []string {
+	formats := append([]string{FormatHalifaxPDF, FormatManualCSV}, slices.Collect(maps.Keys(investmentFormats))...)
+	slices.Sort(formats)
+	return formats
+}
+
+// fileWasImported says whether the stored file with this seq was accepted, as opposed to rejected.
+func fileWasImported(ctx context.Context, core store.Core, account store.Account, seq int64) (bool, error) {
+	if strings.HasPrefix(account.Source, "investment:") {
+		_, err := core.GetInvestmentImport(ctx, seq)
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+		return err == nil, err
+	}
+	statements, err := core.ListStatements(ctx, account.ID)
+	if err != nil {
+		return false, err
+	}
+	return slices.ContainsFunc(statements, func(s store.Statement) bool { return s.RawSeq == seq }), nil
 }
 
 // LoadCapture loads capture directories written before the service existed.

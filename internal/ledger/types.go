@@ -263,10 +263,204 @@ type FileNormaliser interface {
 	NormaliseFile(f File) (FileResult, error)
 }
 
+// Investment providers: the value of `account add --provider` and of InvestmentNormaliser.Provider.
+const (
+	ProviderFidelity = "fidelity"
+	ProviderAviva    = "aviva"
+)
+
+// Products an InvestmentAccountRec names. A parser maps the provider's printed product to one of
+// these. Each fixes the child account's type and the middle word of its slug.
+const (
+	ProductSIPP           = "sipp"    // Fidelity SIPP: type pension, slug <platform>-sipp-<last four>
+	ProductISA            = "isa"     // Fidelity Investment ISA: type isa, slug <platform>-isa-<last four>
+	ProductCashManagement = "cash"    // Fidelity Cash Management Account: type investment_cash, slug <platform>-cash-<last four>
+	ProductPensionPlan    = "pension" // Aviva pension plan: type pension, slug <platform>-pension-<last four>
+)
+
+// Kinds of investment file: InvestmentResult.Kind and core.investment_import.kind. The kind fixes
+// which parts of a result may be set; see InvestmentResult.
+const (
+	InvestmentKindLedger    = "ledger"
+	InvestmentKindHoldings  = "holdings"
+	InvestmentKindCapture   = "capture"
+	InvestmentKindStatement = "statement"
+	InvestmentKindTradeNote = "trade_note"
+)
+
+// Investment event types: core.investment_event.event_type.
+const (
+	EventContribution    = "contribution"
+	EventBuy             = "buy"
+	EventSell            = "sell"
+	EventTransferIn      = "transfer_in"
+	EventTransferOut     = "transfer_out"
+	EventFee             = "fee"
+	EventTax             = "tax"
+	EventInterest        = "interest"
+	EventWithdrawal      = "withdrawal"
+	EventAdjustment      = "adjustment"
+	EventSiblingTransfer = "sibling_transfer"
+	EventInternal        = "internal"
+)
+
+// Price units: GBP is pounds, GBX is pence.
+const (
+	PriceUnitGBP = "GBP"
+	PriceUnitGBX = "GBX"
+)
+
+// InvestmentAccountRec is one provider account a file names. The ledger creates a child account of
+// the platform for it the first time it is seen.
+type InvestmentAccountRec struct {
+	// AccountKey is the provider's account number, exactly as every other record of the result
+	// names it. It becomes the child's source_key; its last four alphanumeric characters,
+	// lower-cased, end the child's slug, and a number with fewer than four rejects the file.
+	AccountKey string
+	// Product is one of the Product constants, and must belong to the normaliser's provider.
+	Product string
+}
+
+// InvestmentEventRec is one provider ledger row. Dates are calendar days at midnight UTC.
+type InvestmentEventRec struct {
+	// AccountKey names the account by its InvestmentAccountRec.AccountKey.
+	AccountKey string
+	// SourceKey is the provider's reference, or for a row with none the SHA-256 key described in
+	// the design. It is unique within an account.
+	SourceKey    string
+	EventType    string // an Event constant
+	ProviderType string // the provider's own word for the row
+	// InstrumentKey is the instrument's provider key, set exactly when Units is. Fidelity's is the
+	// ticker; Aviva's is NormaliseFundName of the fund name.
+	InstrumentKey  string
+	InstrumentName string
+	OrderDate      time.Time
+	// SettleDate is the zero time when the row has none; the effective date is then OrderDate.
+	SettleDate time.Time
+	// Units is an unsigned decimal string, and event_type gives direction. Required on buy and sell,
+	// allowed on transfer_in and transfer_out, refused on every other type. Empty on a cash row.
+	Units string
+	// Price and PriceUnit are set together or not at all, and only with Units.
+	Price     string
+	PriceUnit string
+	// GrossMinor is the row's amount as printed; CashMinor its effect on cash; FlowMinor its value
+	// as an external flow for return.
+	GrossMinor int64
+	CashMinor  int64
+	FlowMinor  int64
+	// Currency is empty for the platform's currency.
+	Currency string
+	// Content is the whole row as JSON, stored with each version. HashInput is the canonical
+	// encoding the version hash is computed over: two records of one event with equal HashInput are
+	// the same version, so it must not hold anything that varies between exports of the same row.
+	Content   json.RawMessage
+	HashInput []byte
+}
+
+// HoldingRec is one holding at this file's capture. The file's result must carry a ValuationRec for
+// the same account and AsOf.
+type HoldingRec struct {
+	AccountKey     string
+	InstrumentKey  string // as InvestmentEventRec.InstrumentKey
+	InstrumentName string
+	AsOf           time.Time // a calendar day at midnight UTC
+	Units          string    // unsigned decimal string
+	Price          string    // unsigned decimal string
+	PriceUnit      string    // PriceUnitGBP or PriceUnitGBX
+	ValueMinor     int64
+	BookCostMinor  *int64
+	Currency       string // empty for the platform's currency
+}
+
+// ValuationRec is one account's value at this file's capture.
+type ValuationRec struct {
+	AccountKey        string
+	AsOf              time.Time // a calendar day at midnight UTC
+	TotalMinor        int64
+	CashMinor         int64
+	ReportedGainMinor *int64
+	Currency          string // empty for the platform's currency
+}
+
+// PensionStatementRec is one annual statement. Dates are calendar days at midnight UTC, and
+// PeriodEnd is not before PeriodStart. Charges and Projections are JSON, stored as printed.
+type PensionStatementRec struct {
+	AccountKey   string
+	PeriodStart  time.Time
+	PeriodEnd    time.Time
+	IssuedOn     time.Time
+	OpeningMinor int64
+	PaidInMinor  int64
+	PaidOutMinor int64
+	GrowthMinor  int64
+	ChargesMinor *int64
+	ClosingMinor int64
+	Charges      json.RawMessage
+	Projections  json.RawMessage
+}
+
+// TradeNoteRec is one trade confirmation. It is stored even when its event is not there yet.
+type TradeNoteRec struct {
+	AccountKey string
+	// Reference is the SourceKey of the event the note confirms.
+	Reference  string
+	ISIN       string
+	ExecutedAt time.Time
+	Venue      string // empty when not printed
+	Units      string // unsigned decimal string
+	ExactPrice string // unsigned decimal string
+	GrossMinor int64
+	FeeMinor   int64
+	TaxMinor   int64
+	NetMinor   int64
+	SettleDate time.Time // a calendar day at midnight UTC
+}
+
+// InvestmentResult is everything one investment file yields. A result breaking any rule below is
+// rejected as bad_result before anything is written.
+//
+//   - InvestmentKindLedger: Events.
+//   - InvestmentKindHoldings: Holdings and Valuations; CapturedAt required.
+//   - InvestmentKindCapture: Holdings, Valuations, Events of type contribution and
+//     CompleteContributionsFor; CapturedAt required.
+//   - InvestmentKindStatement: Statements and Events of type transfer_out.
+//   - InvestmentKindTradeNote: TradeNotes.
+//
+// Every record's AccountKey must be listed in Accounts. Within one result an account has at most one
+// valuation and one statement, an instrument at most one holding per account, and a source key or a
+// trade reference at most one row per account. A file with no rows (an export of a quiet period) is
+// valid and has an empty Accounts.
+type InvestmentResult struct {
+	Kind string
+	// CapturedAt is the printed capture time, converted with the loc given to the normaliser.
+	CapturedAt *time.Time
+	Accounts   []InvestmentAccountRec
+	Events     []InvestmentEventRec
+	Holdings   []HoldingRec
+	Valuations []ValuationRec
+	Statements []PensionStatementRec
+	TradeNotes []TradeNoteRec
+	// CompleteContributionsFor names the accounts whose contribution list this file states in full.
+	// Each must have a ValuationRec in this result, whose AsOf is the capture's date.
+	CompleteContributionsFor []string
+	// RowCount is the file's row count, reported to the operator and stored on investment_import.
+	RowCount int
+}
+
+// InvestmentNormaliser turns one stored investment file into records. It is a pure function of the
+// file's bytes and loc, and uses no clock: replay calls it again, and may call it for an earlier
+// file while applying a later one. It returns an error, with no file content in it, when the file
+// fails its own checks; the ledger then rejects the file as check_failed and stores no rows.
+type InvestmentNormaliser interface {
+	// Provider is ProviderFidelity or ProviderAviva. A file imports only against a platform of it.
+	Provider() string
+	NormaliseInvestmentFile(f File, loc *time.Location) (InvestmentResult, error)
+}
+
 // NormaliserRev is the revision of the normalising code. Bump it whenever a change to a
 // normaliser or to the core schema would give different core rows for the same raw rows; a
 // deployment must then run `finstore renormalise`.
-const NormaliserRev = 5
+const NormaliserRev = 6
 
 // Stats counts what one CatchUp did.
 type Stats struct {
@@ -288,7 +482,8 @@ type Stats struct {
 	FilesRejected       int
 	// Rejections holds the fixed category of each rejected file, in raw seq order: one of
 	// unknown_account, api_account, unknown_format, check_failed, bad_result, account_mismatch,
-	// or bad_transaction (a row the schema would refuse). They are the words the skip log uses.
+	// child_key_shared, or bad_transaction (a row the schema would refuse). They are the words the
+	// skip log uses.
 	Rejections []string
 	// PendingSnapshots counts the pending snapshots applied and PendingSkipped the rows their
 	// normaliser left out.

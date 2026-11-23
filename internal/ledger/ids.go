@@ -34,3 +34,21 @@ func TransactionID(accountID uuid.UUID, source, sourceKey string) uuid.UUID {
 func MandateID(source, bankRef, kind, mandateKey string) uuid.UUID {
 	return uuid.NewSHA1(namespace, []byte(source+sep+bankRef+sep+kind+sep+mandateKey))
 }
+
+// InstrumentID is the core id of an instrument: UUID version 5 of "instrument" + U+001F + provider +
+// U+001F + provider key.
+func InstrumentID(provider, providerKey string) uuid.UUID {
+	return uuid.NewSHA1(namespace, []byte("instrument"+sep+provider+sep+providerKey))
+}
+
+// InvestmentEventID is the core id of an investment event: UUID version 5 of "investment_event" +
+// U+001F + the account id's text + U+001F + source + U+001F + sourceKey.
+func InvestmentEventID(accountID uuid.UUID, source, sourceKey string) uuid.UUID {
+	return uuid.NewSHA1(namespace, []byte("investment_event"+sep+accountID.String()+sep+source+sep+sourceKey))
+}
+
+// investmentSourcePrefix begins the source of a platform, its children and their events.
+const investmentSourcePrefix = "investment:"
+
+// InvestmentSource is the source of a provider's platforms, child accounts and events.
+func InvestmentSource(provider string) string { return investmentSourcePrefix + provider }
