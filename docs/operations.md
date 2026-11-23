@@ -484,7 +484,7 @@ Type,Holdings,Account number,Product,Account holder,Designation,Provider,Latest 
 - A row of Type `Account` gives an account's total value and cash available. A row of Type `Asset`
   gives one of its holdings, and its Holdings column carries the ticker in the same form as the
   transaction history. The latest price is in pence for a sterling holding, and is stored as such. A
-  holding in another currency is stored as printed and is not value checked. Value, book cost and
+  holding quoted in another currency rejects the file until it has a mapping. Value, book cost and
   gain are in pounds. Any other Type rejects the file.
 - The summary drops trailing zeros from amounts, so `12`, `12.5` and `12.50` are all read, and more
   than two decimal places is not. An `Asset` row may end with one extra empty field. An account with

@@ -402,19 +402,13 @@ func TestFidelitySummaryGivesHoldingsAndValuations(t *testing.T) {
 	}
 }
 
-// A thousands comma and a pound sign in a value are read, and a holding in another currency is
-// stored as printed without the Value check.
-func TestFidelitySummaryValueFormatsAndOtherCurrencies(t *testing.T) {
+// A thousands comma and a pound sign in a value are read.
+func TestFidelitySummaryValueFormats(t *testing.T) {
 	res := fidSumResult(t, fidSummary(
-		fidSumRow("Account", "", fidAcct, fidSIPP, "", "", `"£1,234.51"`, "", "134.50", "", ""),
-		fidSumRow("Asset", fidFund, fidAcct, fidSIPP, "110.00", "1000.00", `"£1,100.00"`, "GBP", "", "", ""),
-		// 3 units at 25.00 cents is nowhere near 0.01, and is not checked.
-		fidSumRow("Asset", fidOther, fidAcct, fidSIPP, "25.00", "3", "0.01", "USD", "", "", "")), time.UTC)
-	if res.Holdings[0].ValueMinor != 110000 || res.Valuations[0].TotalMinor != 123451 {
+		fidSumRow("Account", "", fidAcct, fidSIPP, "", "", `"£1,234.50"`, "", "134.50", "", ""),
+		fidSumRow("Asset", fidFund, fidAcct, fidSIPP, "110.00", "1000.00", `"£1,100.00"`, "GBP", "", "", "")), time.UTC)
+	if res.Holdings[0].ValueMinor != 110000 || res.Valuations[0].TotalMinor != 123450 {
 		t.Fatalf("%+v %+v", res.Holdings[0], res.Valuations[0])
-	}
-	if h := res.Holdings[1]; h.Currency != "USD" || h.PriceUnit != ledger.PriceUnitGBX || h.ValueMinor != 1 {
-		t.Fatalf("%+v", h)
 	}
 	if res.Holdings[0].Currency != "" {
 		t.Fatalf("a sterling holding has currency %q", res.Holdings[0].Currency)
@@ -541,6 +535,7 @@ func TestFidelitySummaryRejects(t *testing.T) {
 		{"bad book cost", fidSummary(account, fidSumRow("Asset", fidFund, fidAcct, fidSIPP, "100", "1", "1.00", "GBP", "", "n/a", "")), "amount"},
 		{"blank cash", fidSummary(fidSumRow("Account", "", fidAcct, fidSIPP, "", "", "100.00", "", "", "", "")), "amount"},
 		{"bad currency", fidSummary(account, fidSumRow("Asset", fidFund, fidAcct, fidSIPP, "100", "1", "1.00", "pounds", "", "", "")), "currency"},
+		{"a holding quoted in another currency", fidSummary(account, fidSumRow("Asset", fidFund, fidAcct, fidSIPP, "25.00", "3", "0.75", "USD", "", "", "")), "currency"},
 		{"short account number", fidSummary(fidSumRow("Account", "", "A-1", fidSIPP, "", "", "100.00", "", "100.00", "", "")), "account number"},
 		{"short row", fidSummary(account, "Asset,EXAMPLE"), "row shape"},
 		{"a filled column after the last", fidSummary(account, fidSumRow("Asset", fidFund, fidAcct, fidSIPP, "100", "1", "1.00", "GBP", "", "", "")+",extra"), "row shape"},

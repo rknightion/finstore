@@ -102,7 +102,6 @@ var fidelityProducts = map[string]string{
 var (
 	fidDecimalRE = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?$`)
 	fidTickerRE  = regexp.MustCompile(`\(([^()]*)\)$`)
-	fidCurrency  = regexp.MustCompile(`^[A-Z]{3}$`)
 )
 
 // fidNextLine returns the first line of data without its line end, and the rest.
@@ -596,16 +595,13 @@ func fidelityHolding(rec []string, account string, day time.Time) (ledger.Holdin
 		}
 		h.BookCostMinor = &cost
 	}
-	switch {
-	case rec[fidSumCurrency] == "GBP":
-		if !fidelityValueWithinRounding(h.Units, h.Price, value) {
-			return ledger.HoldingRec{}, fidReasonValueCheck
-		}
-	case fidCurrency.MatchString(rec[fidSumCurrency]):
-		// A holding in another currency is stored as printed and not checked.
-		h.Currency = rec[fidSumCurrency]
-	default:
+	// The value columns are sterling whatever the quote currency, and a holding record has one
+	// currency, so a holding quoted in another currency is refused until it has a mapping.
+	if rec[fidSumCurrency] != "GBP" {
 		return ledger.HoldingRec{}, fidReasonCurrency
+	}
+	if !fidelityValueWithinRounding(h.Units, h.Price, value) {
+		return ledger.HoldingRec{}, fidReasonValueCheck
 	}
 	return h, ""
 }
