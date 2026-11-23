@@ -327,6 +327,8 @@ func (d *ppdfFidelityDoc) pdf() []byte {
 	if d.extraLabel != "" {
 		statement = append(statement, t(132, 510, 8, d.extraLabel), t(425, 510, 8, ppdfGBP(100)))
 	}
+	// Body text below the table can start with an amount, and is not a row of the table.
+	statement = append(statement, t(50, 480, 10, ppdfGBP(d.closing)+" plus any outstanding tax relief is the amount"))
 	statement = append(statement, footer(1)...)
 
 	holdings := append([]string{t(54, 770, 14, "Summary of investments for the year"), t(54, 740, 8, "EXAMPLE FUND ETF"),

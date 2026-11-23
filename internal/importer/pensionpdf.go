@@ -669,7 +669,8 @@ func ppdfFidelityIssued(ts []pdftext.Text) (time.Time, error) {
 func ppdfFidelityBlock(ts []pdftext.Text, h int, end time.Time) (ppdfFidelityFigures, error) {
 	var f ppdfFidelityFigures
 	var haveIn, havePerf, haveClosing bool
-	for j := h + 1; j < len(ts) && ts[j].Page == ts[h].Page && ts[j].Size < 12; {
+	// The table is set in small type, so the body text below it ends the block.
+	for j := h + 1; j < len(ts) && ts[j].Page == ts[h].Page && ts[j].Size < 9; {
 		row, next := ppdfRow(ts, j)
 		j = next
 		if !ppdfMoneyTokenRE.MatchString(row) {
