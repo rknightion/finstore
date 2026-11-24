@@ -4,9 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
-    # `edited` re-runs CI when the pull request body changes, so the acceptance evidence check reads
-    # the new table.
-    types: [opened, edited, reopened, synchronize, ready_for_review]
+    # The acceptance-evidence check reads the pull request body, so it runs in pr-metadata.yml;
+    # a body edit does not re-run this workflow.
+    types: [opened, reopened, synchronize, ready_for_review]
 
 permissions:
   contents: read
@@ -65,17 +65,6 @@ jobs:
             COMMIT=${{ github.sha }}
             BUILD_DATE=${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}
 
-  # A pull request that closes an issue shows evidence for each of its acceptance criteria. Checks
-  # only pull requests with a closing keyword. The reusable fails on any event but pull_request.
-  # Check run: `ac-evidence / Acceptance evidence`.
-  ac-evidence:
-    if: github.event_name == 'pull_request'
-    permissions:
-      contents: read
-      issues: read
-      pull-requests: read
-    uses: rknightion/.github/.github/workflows/ac-evidence.yml@7ed87713176ccae972b0143071b0196ff370d804 # v1.32.3
-
   # The lines a pull request adds carry no identifier, email address, public address or credential
   # shape. The reusable fails on any event but pull_request. Check run: `privacy-sweep / Privacy sweep`.
   privacy-sweep:
@@ -89,7 +78,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [build-test, docker-build, ac-evidence, privacy-sweep]
+    needs: [build-test, docker-build, privacy-sweep]
     steps:
       - if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: exit 1
@@ -98,10 +87,9 @@ jobs:
       - name: Fail if a pull request check did not run
         if: ${{ github.event_name == 'pull_request' }}
         env:
-          AC_EVIDENCE: ${{ needs.ac-evidence.result }}
           PRIVACY_SWEEP: ${{ needs.privacy-sweep.result }}
         run: |
-          if [[ "$AC_EVIDENCE" != "success" || "$PRIVACY_SWEEP" != "success" ]]; then
-            echo "ac-evidence: ${AC_EVIDENCE}, privacy-sweep: ${PRIVACY_SWEEP}; both must pass on a pull request"
+          if [[ "$PRIVACY_SWEEP" != "success" ]]; then
+            echo "privacy-sweep: ${PRIVACY_SWEEP}; must pass on a pull request"
             exit 1
           fi
