@@ -161,6 +161,9 @@ func TestPayeeCategoryAndScopeCommandsTakeFlagsOnly(t *testing.T) {
 	for _, args := range [][]string{
 		{"payee"},
 		{"payee", "nonsense"},
+		{"payee", "show"},
+		{"payee", "show", "--key", "n:a", "stray"},
+		{"payee", "list", "stray"},
 		{"payee", "merge", "--key", "n:made-up"},
 		{"payee", "merge", "--into", "n:made-up"},
 		{"payee", "merge", "--key", "n:a", "--into", "n:b", "stray"},
@@ -187,6 +190,9 @@ func TestPayeeCategoryAndScopeCommandsTakeFlagsOnly(t *testing.T) {
 	// Well-formed commands go on to need the database.
 	for _, args := range [][]string{
 		{"payee", "merge", "--key", "n:a", "--into", "mg:b"},
+		{"payee", "list"},
+		{"payee", "list", "--query", "made-up", "--limit", "5"},
+		{"payee", "show", "--key", "n:a"},
 		{"payee", "recurring", "--series", "sub:n:a", "--decision", "not-recurring"},
 		{"payee", "clear", "--key", "n:a", "--what", "class"},
 		{"payee", "clear", "--series", "sub:n:a"},

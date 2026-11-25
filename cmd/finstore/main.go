@@ -45,6 +45,7 @@ commands:
   account accept-gap          record a gap between two statements as accepted
   account end                 end an account at a date, or clear its end
   account scope               set an account's scope, or clear it
+  payee list|show             list payees, or show one payee with its keys, rules and series
   payee merge|separate|rename|class|category|recurring|clear
                               record an operator rule about a payee or a recurring series
   category name|clear         name a category, or clear its name
@@ -289,13 +290,25 @@ func runPayee(ctx context.Context, env app.Env, args []string,
 	flags func(string) *flag.FlagSet, parse func(*flag.FlagSet, []string) bool,
 ) int {
 	if len(args) == 0 {
-		_, _ = fmt.Fprintln(env.Stderr, "finstore payee: expected merge, separate, rename, class, category, recurring or clear")
+		_, _ = fmt.Fprintln(env.Stderr, "finstore payee: expected list, show, merge, separate, rename, class, category, recurring or clear")
 		return exitUsage
 	}
 	command := "payee " + args[0]
 	fs := flags(command)
 	key := fs.String("key", "", "the payee key, such as mg:<group id> or n:<name>")
 	switch args[0] {
+	case "list":
+		query := fs.String("query", "", "only payees whose name contains this text (case-insensitive)")
+		limit := fs.Int("limit", app.DefaultPayeeListLimit, "the most payees to print")
+		if !parse(fs, args[1:]) {
+			return exitUsage
+		}
+		return app.PayeeList(ctx, env, *query, *limit)
+	case "show":
+		if !parse(fs, args[1:]) || !requireFlags(env, command, map[string]string{"key": *key}) {
+			return exitUsage
+		}
+		return app.PayeeShow(ctx, env, *key)
 	case "merge":
 		into := fs.String("into", "", "the payee key to merge into")
 		if !parse(fs, args[1:]) || !requireFlags(env, command, map[string]string{"key": *key, "into": *into}) {
