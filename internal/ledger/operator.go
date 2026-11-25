@@ -71,6 +71,12 @@ func (a *applier) operatorEntry(ctx context.Context, e *store.OperatorEntry) err
 		return a.accountEnd(ctx, e.Payload, e.EnteredAt)
 	case EntryAcceptGap:
 		return a.acceptGap(ctx, e.Payload, e.EnteredAt)
+	case EntryPayeeRule:
+		return a.payeeRule(ctx, e.Payload, e.Seq, e.EnteredAt)
+	case EntryCategoryName:
+		return a.categoryName(ctx, e.Payload, e.Seq, e.EnteredAt)
+	case EntryAccountScope:
+		return a.accountScope(ctx, e.Payload)
 	}
 	return unparseable("unknown_entry")
 }

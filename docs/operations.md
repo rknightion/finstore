@@ -826,6 +826,9 @@ current balances.
 | `finstore account end --slug S --last-date YYYY-MM-DD`, `finstore account end --slug S --clear` | app | Ends an account at a date, or removes its end. See [Ending an account](#ending-an-account) |
 | `finstore account accept-difference --slug S --reason TEXT` | app | For an account an API feeds: records that its current balance difference is known and accepted, so it stops counting as a mismatch. A different difference later counts again. A statement-fed account is refused: see `account accept-gap` |
 | `finstore account accept-gap --slug S --from YYYY-MM-DD --to YYYY-MM-DD --reason TEXT` | app | For an account fed by statements: records that the gap from `--from` to `--to`, as `coverage` shows it, is known and accepted, because the bank issued no statement for it. See [Accepting a gap](#accepting-a-gap) |
+| `finstore account scope --slug S --scope personal\|joint\|business`, `finstore account scope --slug S --clear` | app | Sets an account's scope, or removes the setting. A pot is refused: it takes its parent's scope |
+| `finstore payee merge --key K --into K`, `separate --key K`, `rename --key K --name N`, `class --key K --class C [--employer]`, `category --key K --category C`, `recurring --series S --decision confirm\|ignore\|not-recurring`, `clear --key K --what merge\|separate\|name\|class\|category`, `clear --series S` | app | Records an operator rule about a payee key or a recurring series, as a `payee_rule` entry. The entry is checked before anything is written: a refusal names the reason and writes nothing. Keys are taken as given |
+| `finstore category name --category C --name N`, `finstore category clear --category C` | app | Names a category, or removes its name, as a `category_name` entry |
 | `finstore import` | app | Imports one statement from standard input |
 | `finstore load-capture --dir PATH [--dir PATH]...` | app | Loads API responses captured before the service existed. Loading twice loads once, and a capture older than what is already held never replaces newer data. A capture loaded while it was still running, then loaded again once it has finished, gets the completion of a finished fetch whose pages it already holds, without storing them again |
 | `finstore renormalise [--verify]` | owner | Rebuilds `core` from `raw`. With `--verify` it swaps nothing: exit 0 when the rebuilt copy equals the live one, 4 when it differs, listing table, key, column and kind of difference. Either way it first normalises any stored rows the live record has not caught up with, unless the live record was built by another normaliser revision: that one is left as it is, and the rows still waiting show as differences |
@@ -1406,7 +1409,7 @@ such as `main-659f3b6`, or `dev` for an unlabelled build), `deployment.environme
 | Process | `service.instance.id` | `finstore.command` |
 |---|---|---|
 | `serve` | the fixed word `serve`, so its series keep their labels across restarts | absent |
-| A command (`migrate`, `renormalise`, `account add`, `account list`, `account accept-difference`, `account accept-gap`, `account end`, `import`, `load-capture`, `coverage`) | a new UUID for each run, so a command never writes `serve`'s series | the command's name |
+| A command (`migrate`, `renormalise`, `account add`, `account list`, `account accept-difference`, `account accept-gap`, `account end`, `account scope`, `payee <subcommand>`, `category <subcommand>`, `import`, `load-capture`, `coverage`) | a new UUID for each run, so a command never writes `serve`'s series | the command's name |
 
 `bootstrap`, `healthcheck`, `version` and `help` export nothing. `bootstrap` executes `CREATE ROLE`
 with a password, and the health check runs every 30 seconds.
@@ -1472,7 +1475,7 @@ body. finstore sends no trace header to a bank, and a bank sees the same request
 or off.
 
 **Postgres.** `serve` and the commands that read or write through the app role (`account add`,
-`account list`, `account accept-difference`, `account accept-gap`, `account end`, `import`, `coverage`) and `migrate` open
+`account list`, `account accept-difference`, `account accept-gap`, `account end`, `account scope`, `payee`, `category`, `import`, `coverage`) and `migrate` open
 their database connection with tracing. A query, a prepare, a connect or a pool acquire made while a
 span is recording becomes a client span beneath it, named for the statement's first word (`SELECT`)
 and carrying `db.query.text` with placeholders only (`$1`), `db.operation.name`, `db.namespace`,

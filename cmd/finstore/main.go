@@ -8,11 +8,14 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"slices"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/rknightion/finstore/internal/app"
 	"github.com/rknightion/finstore/internal/config"
+	"github.com/rknightion/finstore/internal/ledger"
 )
 
 // Set at build time with -ldflags.
@@ -41,6 +44,10 @@ commands:
   account accept-difference   record a known balance difference as accepted
   account accept-gap          record a gap between two statements as accepted
   account end                 end an account at a date, or clear its end
+  account scope               set an account's scope, or clear it
+  payee merge|separate|rename|class|category|recurring|clear
+                              record an operator rule about a payee or a recurring series
+  category name|clear         name a category, or clear its name
   import                      import one statement from standard input
   load-capture                load API responses captured before the service existed
   coverage [--json]           print what is held for each account, and the gaps
@@ -117,6 +124,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return app.Renormalise(ctx, env, *verify)
 	case "account":
 		return runAccount(ctx, env, rest, flags, parse)
+	case "payee":
+		return runPayee(ctx, env, rest, flags, parse)
+	case "category":
+		return runCategory(ctx, env, rest, flags, parse)
 	case "import":
 		fs := flags(command)
 		account := fs.String("account", "", "slug of the account the statement belongs to, or of the platform for an investment file")
@@ -160,7 +171,7 @@ func runAccount(ctx context.Context, env app.Env, args []string,
 	flags func(string) *flag.FlagSet, parse func(*flag.FlagSet, []string) bool,
 ) int {
 	if len(args) == 0 {
-		_, _ = fmt.Fprintln(env.Stderr, "finstore account: expected add, list, accept-difference, accept-gap or end")
+		_, _ = fmt.Fprintln(env.Stderr, "finstore account: expected add, list, accept-difference, accept-gap, end or scope")
 		return exitUsage
 	}
 	switch args[0] {
@@ -235,8 +246,134 @@ func runAccount(ctx context.Context, env app.Env, args []string,
 			return exitUsage
 		}
 		return app.AccountEnd(ctx, env, *slug, &d)
+	case "scope":
+		fs := flags("account scope")
+		slug := fs.String("slug", "", "slug of the account")
+		scope := fs.String("scope", "", "personal, joint or business")
+		clear := fs.Bool("clear", false, "remove the account's scope setting instead")
+		if !parse(fs, args[1:]) {
+			return exitUsage
+		}
+		if *slug == "" || (*scope == "") == !*clear {
+			_, _ = fmt.Fprintln(env.Stderr, "finstore account scope: --slug and exactly one of --scope and --clear are required")
+			return exitUsage
+		}
+		if *clear {
+			return app.AccountScope(ctx, env, *slug, nil)
+		}
+		return app.AccountScope(ctx, env, *slug, scope)
 	default:
 		_, _ = fmt.Fprintf(env.Stderr, "finstore account: unknown subcommand %q\n", args[0])
+		return exitUsage
+	}
+}
+
+// requireFlags reports whether every named string flag has a value; it prints what is missing
+// otherwise.
+func requireFlags(env app.Env, command string, required map[string]string) bool {
+	var missing []string
+	for name, value := range required {
+		if value == "" {
+			missing = append(missing, "--"+name)
+		}
+	}
+	if len(missing) == 0 {
+		return true
+	}
+	slices.Sort(missing)
+	_, _ = fmt.Fprintf(env.Stderr, "finstore %s: %s required\n", command, strings.Join(missing, ", "))
+	return false
+}
+
+func runPayee(ctx context.Context, env app.Env, args []string,
+	flags func(string) *flag.FlagSet, parse func(*flag.FlagSet, []string) bool,
+) int {
+	if len(args) == 0 {
+		_, _ = fmt.Fprintln(env.Stderr, "finstore payee: expected merge, separate, rename, class, category, recurring or clear")
+		return exitUsage
+	}
+	command := "payee " + args[0]
+	fs := flags(command)
+	key := fs.String("key", "", "the payee key, such as mg:<group id> or n:<name>")
+	switch args[0] {
+	case "merge":
+		into := fs.String("into", "", "the payee key to merge into")
+		if !parse(fs, args[1:]) || !requireFlags(env, command, map[string]string{"key": *key, "into": *into}) {
+			return exitUsage
+		}
+		return app.PayeeMerge(ctx, env, *key, *into)
+	case "separate":
+		if !parse(fs, args[1:]) || !requireFlags(env, command, map[string]string{"key": *key}) {
+			return exitUsage
+		}
+		return app.PayeeSeparate(ctx, env, *key)
+	case "rename":
+		name := fs.String("name", "", "the display name")
+		if !parse(fs, args[1:]) || !requireFlags(env, command, map[string]string{"key": *key, "name": *name}) {
+			return exitUsage
+		}
+		return app.PayeeRename(ctx, env, *key, *name)
+	case "class":
+		class := fs.String("class", "", "the flow class: "+strings.Join(ledger.FlowClasses, ", "))
+		employer := fs.Bool("employer", false, "the payee is an employer (only with --class income)")
+		if !parse(fs, args[1:]) || !requireFlags(env, command, map[string]string{"key": *key, "class": *class}) {
+			return exitUsage
+		}
+		return app.PayeeClass(ctx, env, *key, *class, *employer)
+	case "category":
+		category := fs.String("category", "", "the category")
+		if !parse(fs, args[1:]) || !requireFlags(env, command, map[string]string{"key": *key, "category": *category}) {
+			return exitUsage
+		}
+		return app.PayeeCategory(ctx, env, *key, *category)
+	case "recurring":
+		series := fs.String("series", "", "the series key, such as sub:<payee key>")
+		decision := fs.String("decision", "", "confirm, ignore or not-recurring")
+		if !parse(fs, args[1:]) || !requireFlags(env, command, map[string]string{"series": *series, "decision": *decision}) {
+			return exitUsage
+		}
+		return app.PayeeRecurring(ctx, env, *series, *decision)
+	case "clear":
+		series := fs.String("series", "", "the series key whose decision to remove")
+		what := fs.String("what", "", "what to remove from --key: merge, separate, name, class or category")
+		if !parse(fs, args[1:]) {
+			return exitUsage
+		}
+		if (*series == "") == (*key == "") || (*series != "" && *what != "") || (*key != "" && *what == "") {
+			_, _ = fmt.Fprintln(env.Stderr, "finstore payee clear: either --key with --what, or --series alone, is required")
+			return exitUsage
+		}
+		return app.PayeeClear(ctx, env, *key, *what, *series)
+	default:
+		_, _ = fmt.Fprintf(env.Stderr, "finstore payee: unknown subcommand %q\n", args[0])
+		return exitUsage
+	}
+}
+
+func runCategory(ctx context.Context, env app.Env, args []string,
+	flags func(string) *flag.FlagSet, parse func(*flag.FlagSet, []string) bool,
+) int {
+	if len(args) == 0 {
+		_, _ = fmt.Fprintln(env.Stderr, "finstore category: expected name or clear")
+		return exitUsage
+	}
+	command := "category " + args[0]
+	fs := flags(command)
+	category := fs.String("category", "", "the category, as agent.transactions shows it")
+	switch args[0] {
+	case "name":
+		name := fs.String("name", "", "the display name")
+		if !parse(fs, args[1:]) || !requireFlags(env, command, map[string]string{"category": *category, "name": *name}) {
+			return exitUsage
+		}
+		return app.CategoryName(ctx, env, *category, *name)
+	case "clear":
+		if !parse(fs, args[1:]) || !requireFlags(env, command, map[string]string{"category": *category}) {
+			return exitUsage
+		}
+		return app.CategoryClear(ctx, env, *category)
+	default:
+		_, _ = fmt.Fprintf(env.Stderr, "finstore category: unknown subcommand %q\n", args[0])
 		return exitUsage
 	}
 }
