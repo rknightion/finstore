@@ -75,6 +75,9 @@ type Account struct {
 	// EndedOn is the last day the account has transactions on (a date), set by an account_end
 	// operator entry; nil while the account has no end.
 	EndedOn *time.Time
+	// Scope is the operator's setting for the account (personal, joint or business), set by an
+	// account_scope operator entry; nil while it has none.
+	Scope *string
 	// Detail is the source's whole account object as JSON, or nil when the source gave none.
 	Detail json.RawMessage
 }
@@ -214,13 +217,13 @@ type ProjectionState struct {
 }
 
 const accountColumns = `id, source, source_key, slug, type, feed, currency, name, parent_id, expects_imports, opened_on, closed,
-	bank_ref, ended_on, detail`
+	bank_ref, ended_on, scope, detail`
 
 func scanAccount(r pgx.CollectableRow) (Account, error) {
 	var a Account
 	var detail []byte
 	err := r.Scan(&a.ID, &a.Source, &a.SourceKey, &a.Slug, &a.Type, &a.Feed, &a.Currency, &a.Name,
-		&a.ParentID, &a.ExpectsImports, &a.OpenedOn, &a.Closed, &a.BankRef, &a.EndedOn, &detail)
+		&a.ParentID, &a.ExpectsImports, &a.OpenedOn, &a.Closed, &a.BankRef, &a.EndedOn, &a.Scope, &detail)
 	a.Detail = detail
 	return a, err
 }
@@ -234,14 +237,15 @@ func (c Core) UpsertAccount(ctx context.Context, a Account) error {
 		detail = string(a.Detail)
 	}
 	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.account (`+accountColumns+`)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		ON CONFLICT (id) DO UPDATE SET source = EXCLUDED.source, source_key = EXCLUDED.source_key,
 		  slug = EXCLUDED.slug, type = EXCLUDED.type, feed = EXCLUDED.feed, currency = EXCLUDED.currency,
 		  name = EXCLUDED.name, parent_id = EXCLUDED.parent_id, expects_imports = EXCLUDED.expects_imports,
 		  opened_on = EXCLUDED.opened_on, closed = EXCLUDED.closed, bank_ref = EXCLUDED.bank_ref,
-		  ended_on = EXCLUDED.ended_on, detail = COALESCE(EXCLUDED.detail, account.detail)`),
+		  ended_on = EXCLUDED.ended_on, scope = EXCLUDED.scope,
+		  detail = COALESCE(EXCLUDED.detail, account.detail)`),
 		a.ID, a.Source, a.SourceKey, a.Slug, a.Type, a.Feed, a.Currency, a.Name, a.ParentID,
-		a.ExpectsImports, a.OpenedOn, a.Closed, a.BankRef, a.EndedOn, detail)
+		a.ExpectsImports, a.OpenedOn, a.Closed, a.BankRef, a.EndedOn, a.Scope, detail)
 	if err != nil {
 		return fmt.Errorf("store: upsert account: %w", err)
 	}

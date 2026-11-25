@@ -117,10 +117,10 @@ func TestUpgradeFromRevisionFiveAndBack(t *testing.T) {
 
 // Revision 5 of the normaliser adds no version for a sighting of a state already recorded beside
 // it (a late-loaded sighting of an older state), and records accepted statement gaps. Revision 6
-// adds the investment tables.
-func TestNormaliserRevisionIsSix(t *testing.T) {
-	if ledger.NormaliserRev != 6 {
-		t.Fatalf("NormaliserRev = %d, want 6", ledger.NormaliserRev)
+// adds the investment tables. Revision 7 adds the payee rule tables and core.account.scope.
+func TestNormaliserRevisionIsSeven(t *testing.T) {
+	if ledger.NormaliserRev != 7 {
+		t.Fatalf("NormaliserRev = %d, want 7", ledger.NormaliserRev)
 	}
 }
 
