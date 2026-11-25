@@ -152,16 +152,45 @@ func ShowPayee(ctx context.Context, q DBTX, key string) (PayeeDetail, error) {
 	return d, nil
 }
 
-// PayeeOf returns the canonical key and the display name of the payee key belongs to, read from
-// agent.payee_keys and agent.cash_flows. ok is false when no transaction gives the key a payee; a
+// resolvePayeeID returns the canonical key of the payee that key names in agent.payee_keys, whether
+// it is given as a member key or as a payee_id, whatever transactions the key has of its own. A
+// member key wins over a payee_id that happens to match. ok is false when the view names the key
+// nowhere.
+func resolvePayeeID(ctx context.Context, q DBTX, key string) (id string, ok bool, err error) {
+	err = q.QueryRow(ctx, `SELECT payee_id FROM agent.payee_keys WHERE payee_key = $1 OR payee_id = $1
+		ORDER BY (payee_key = $1) DESC, payee_id LIMIT 1`, key).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return id, true, nil
+}
+
+// PayeeOf returns the canonical key and the display name of the payee key belongs to. The key may
+// be a member key or a payee_id, and need have no transaction of its own: the payee is known when
+// any of its keys has a transaction. ok is false when no transaction gives the key a payee; a
 // caller then uses the key as it was given.
 func PayeeOf(ctx context.Context, q DBTX, key string) (id, name string, ok bool, err error) {
-	err = q.QueryRow(ctx, `SELECT k.payee_id,
-			coalesce(k.setting_name, (SELECT c.payee_name FROM agent.cash_flows c WHERE c.payee_id = k.payee_id LIMIT 1), k.payee_id)
-		FROM agent.payee_keys k WHERE k.payee_key = $1 AND k.txn_count > 0`, key).Scan(&id, &name)
-	if errors.Is(err, pgx.ErrNoRows) {
+	id, found, err := resolvePayeeID(ctx, q, key)
+	if err != nil {
+		return "", "", false, fmt.Errorf("store: payee of key: %w", err)
+	}
+	if !found {
 		return "", "", false, nil
 	}
+	var known bool
+	err = q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM agent.payee_keys WHERE payee_id = $1 AND txn_count > 0)
+		OR EXISTS (SELECT 1 FROM agent.cash_flows WHERE payee_id = $1)`, id).Scan(&known)
+	if err != nil {
+		return "", "", false, fmt.Errorf("store: payee of key: %w", err)
+	}
+	if !known {
+		return "", "", false, nil
+	}
+	err = q.QueryRow(ctx, `SELECT coalesce((SELECT max(k.setting_name) FROM agent.payee_keys k WHERE k.payee_id = $1),
+			(SELECT c.payee_name FROM agent.cash_flows c WHERE c.payee_id = $1 LIMIT 1), $1)`, id).Scan(&name)
 	if err != nil {
 		return "", "", false, fmt.Errorf("store: payee of key: %w", err)
 	}
@@ -181,13 +210,12 @@ type PayeeState struct {
 // rule knows is its own payee.
 func EffectivePayeeState(ctx context.Context, q DBTX, key string) (PayeeState, error) {
 	st := PayeeState{PayeeID: key, Name: key, Keys: 1}
-	var id string
-	err := q.QueryRow(ctx, `SELECT payee_id FROM agent.payee_keys WHERE payee_key = $1`, key).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return st, nil
-	}
+	id, found, err := resolvePayeeID(ctx, q, key)
 	if err != nil {
 		return st, fmt.Errorf("store: payee state: %w", err)
+	}
+	if !found {
+		return st, nil
 	}
 	err = q.QueryRow(ctx, `SELECT $1::text,
 		coalesce(max(k.setting_name), (SELECT c.payee_name FROM agent.cash_flows c WHERE c.payee_id = $1 LIMIT 1), $1),

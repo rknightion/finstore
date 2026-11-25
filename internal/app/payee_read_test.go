@@ -226,9 +226,9 @@ func TestPayeeMergeRefusals(t *testing.T) {
 		{"same payee", alpha, beta, "same payee"},
 		{"same payee in the other direction", beta, alpha, "same payee"},
 		// alpha into ghost one: the target has no transactions, but its merge chain (ghost two,
-		// then alpha) returns to the key.
-		{"chain returns to the key", alpha, ghost1, "merge chain"},
-		{"chain of one step returns to the key", alpha, ghost2, "merge chain"},
+		// then alpha) makes it a key of the same payee as alpha.
+		{"chain returns to the key", alpha, ghost1, "same payee"},
+		{"chain of one step returns to the key", alpha, ghost2, "same payee"},
 	}
 	for _, c := range refused {
 		code, out, stderr := r.run(func(ctx context.Context, e Env) int { return PayeeMerge(ctx, e, c.key, c.into) })
@@ -246,4 +246,58 @@ func TestPayeeMergeRefusals(t *testing.T) {
 	}
 	// A merge that is neither is accepted.
 	r.mustRun(func(ctx context.Context, e Env) int { return PayeeMerge(ctx, e, "n:other", gamma) })
+}
+
+// A payee_id can be a key no transaction has (the target of a merge), and a member key can have no
+// transaction of its own; both resolve to their payee when the payee has transactions.
+func TestPayeeResolvesKeysWithoutTransactionsOfTheirOwn(t *testing.T) {
+	r := newPayeeRig(t)
+	ctx := context.Background()
+	alpha, beta, gamma := r.keyOf("ALPHA SHOP"), r.keyOf("BETA CAFE"), r.keyOf("GAMMA UTILITIES")
+	core, err := store.NewCore(r.st.DB(), store.SchemaCore)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// show works from the payee_id of a merge target that has no transactions of its own.
+	const target = "n:merge target"
+	r.mustRun(func(ctx context.Context, e Env) int { return PayeeMerge(ctx, e, alpha, target) })
+	code, out, stderr := r.run(func(ctx context.Context, e Env) int { return PayeeShow(ctx, e, target) })
+	if code != ExitOK || !strings.Contains(out, "payee: "+target+"\n") || !strings.Contains(out, alpha) {
+		t.Errorf("show of a transactionless merge target: exit %d, stderr %q:\n%s", code, stderr, out)
+	}
+
+	// A second merge into the same target is refused: the key already resolves to it.
+	r.mustRun(func(ctx context.Context, e Env) int { return PayeeMerge(ctx, e, beta, target) })
+	before := r.entries()
+	var stdout string
+	code, stdout, stderr = r.run(func(ctx context.Context, e Env) int { return PayeeMerge(ctx, e, beta, target) })
+	if code == ExitOK || stdout != "" || !strings.Contains(stderr, "same payee") || strings.Contains(stderr, target) {
+		t.Errorf("duplicate merge: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if n := r.entries(); n != before {
+		t.Errorf("the refused merge wrote %d entries", n-before)
+	}
+
+	// A setting named on a member key with no transactions lands on the canonical key.
+	const ghost = "n:ghost member"
+	r.mustRun(func(ctx context.Context, e Env) int { return PayeeMerge(ctx, e, ghost, gamma) })
+	r.mustRun(func(ctx context.Context, e Env) int { return PayeeRename(ctx, e, ghost, "Power Co") })
+	if _, err := core.GetPayeeSetting(ctx, ghost); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("a setting was written against the transactionless member key: %v", err)
+	}
+	if s, err := core.GetPayeeSetting(ctx, gamma); err != nil || s.Name == nil || *s.Name != "Power Co" {
+		t.Errorf("setting on the canonical key %+v, %v", s, err)
+	}
+
+	// Clearing the last setting on the transactionless merge target prints the real state.
+	r.mustRun(func(ctx context.Context, e Env) int { return PayeeRename(ctx, e, target, "Target Name") })
+	out = r.mustRun(func(ctx context.Context, e Env) int { return PayeeClear(ctx, e, target, "name", "") })
+	m := stateLine.FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("state line %q", out)
+	}
+	if m[1] != target || m[2] == target || m[3] != "spending" || m[5] != "2" {
+		t.Errorf("state line after clearing the last setting %q", out)
+	}
 }

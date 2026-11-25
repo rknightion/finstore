@@ -132,3 +132,31 @@ func sorted(keys ...string) []string {
 	slices.Sort(keys)
 	return keys
 }
+
+func TestPayeeOfKeysWithoutTransactionsOfTheirOwn(t *testing.T) {
+	ctx := context.Background()
+	f := payeeReadFixture(t)
+	var alpha string
+	if err := f.q.QueryRow(ctx, `SELECT payee_key FROM agent.cash_flows WHERE id = $1`, f.ids["a1"]).Scan(&alpha); err != nil {
+		t.Fatal(err)
+	}
+	// alpha merges into a target no transaction has; a ghost member merges into alpha.
+	f.alias(alpha, false, "n:merge target", "", 1)
+	f.alias("n:ghost member", false, alpha, "", 2)
+	for _, key := range []string{"n:merge target", "n:ghost member", alpha} {
+		if id, _, ok, err := store.PayeeOf(ctx, f.q, key); err != nil || !ok || id != "n:merge target" {
+			t.Errorf("PayeeOf(%q) = %q, %v, %v", key, id, ok, err)
+		}
+	}
+	if _, err := store.ShowPayee(ctx, f.q, "n:merge target"); err != nil {
+		t.Errorf("ShowPayee(merge target) = %v", err)
+	}
+	if st, err := store.EffectivePayeeState(ctx, f.q, "n:merge target"); err != nil || st.PayeeID != "n:merge target" || st.Keys != 2 || st.FlowClass != "spending" {
+		t.Errorf("EffectivePayeeState(merge target) = %+v, %v", st, err)
+	}
+	// A key the view names, whose payee has no transactions, is still unknown.
+	f.setting("n:lonely", "Lonely", "", "", "", nil, 3)
+	if _, _, ok, err := store.PayeeOf(ctx, f.q, "n:lonely"); err != nil || ok {
+		t.Errorf("PayeeOf(lonely) ok = %v, %v", ok, err)
+	}
+}
