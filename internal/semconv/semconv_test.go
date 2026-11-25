@@ -119,9 +119,10 @@ func TestEveryMCPFailureOutcomeMayBeAStatusDescription(t *testing.T) {
 	}
 }
 
-func TestMCPToolsAreTheSevenAndACopy(t *testing.T) {
+func TestMCPToolsAreTheElevenAndACopy(t *testing.T) {
 	got := MCPTools()
-	want := []string{"overview", "search_transactions", "spending_summary", "describe_schema", "query_sql", "portfolio", "pension_summary"}
+	want := []string{"overview", "search_transactions", "spending_summary", "describe_schema", "query_sql", "portfolio", "pension_summary",
+		"recurring_payments", "payees", "cash_flow", "finance_profile"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("MCPTools = %v, want %v", got, want)
 	}

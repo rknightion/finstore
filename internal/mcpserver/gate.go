@@ -1,5 +1,5 @@
 // Package mcpserver serves finstore's MCP endpoint: the gate that admits only callers a tailnet
-// grant names, and the server with its seven read-only tools.
+// grant names, and the server with its eleven read-only tools.
 //
 // Every route here answers 404, never 403, to a caller it refuses, as the status page's allow-list
 // does: the proxy in front may rewrite a 403 into a login redirect.

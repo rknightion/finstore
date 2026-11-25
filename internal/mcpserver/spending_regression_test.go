@@ -36,7 +36,7 @@ func (regressionNormaliser) NormaliseInvestmentFile(f ledger.File, _ *time.Locat
 func spendingSnapshot(t *testing.T, r *rig) map[string]string {
 	t.Helper()
 	out := map[string]string{}
-	for _, group := range []string{"month", "category", "merchant", "counterparty", "account"} {
+	for _, group := range []string{"month", "category", "merchant", "counterparty", "account", "payee"} {
 		for _, direction := range []string{"in", "out"} {
 			var s SummaryOutput
 			decode(t, r.call(semconv.MCPToolSpendingSummary, map[string]any{

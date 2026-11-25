@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -562,6 +563,7 @@ const (
 	GroupMerchant     = "merchant"
 	GroupCounterparty = "counterparty"
 	GroupAccount      = "account"
+	GroupPayee        = "payee"
 )
 
 // NoneKey is the key of a SpendingSummary group whose grouping column is NULL.
@@ -770,8 +772,10 @@ func (r *Reader) SearchTransactions(ctx context.Context, p SearchParams) ([]Tran
 // SummaryParams are the inputs of SpendingSummary. GroupBy is required: one of the Group
 // constants. From and To are optional inclusive YYYY-MM-DD dates on txn_date. Direction is "out"
 // (the default), which sums rows below zero and reports the total as a positive number, or "in",
-// which sums rows above zero. ExcludePotTransfers leaves out rows whose pot_slug is set; nil means
-// true. Limit is as for SearchParams.
+// which sums rows above zero. FlowClasses are the classes of agent.cash_flows to count; empty means
+// spending for "out" and income and refund for "in". ExcludePotTransfers matters only when
+// FlowClasses is empty: false adds the pot transfers (class internal, reason pot); nil means true.
+// IncludePending counts pending rows as well as settled ones. Limit is as for SearchParams.
 type SummaryParams struct {
 	GroupBy             string   `json:"group_by"`
 	From                string   `json:"from,omitempty"`
@@ -779,12 +783,15 @@ type SummaryParams struct {
 	Accounts            []string `json:"accounts,omitempty"`
 	Direction           string   `json:"direction,omitempty"`
 	ExcludePotTransfers *bool    `json:"exclude_pot_transfers,omitempty"`
+	FlowClasses         []string `json:"flow_classes,omitempty"`
+	IncludePending      bool     `json:"include_pending,omitempty"`
 	Limit               int      `json:"limit,omitempty"`
 }
 
 // SummaryGroup is one row of SpendingSummary: a key and a currency, never summed across
 // currencies. Key is YYYY-MM for GroupMonth, otherwise the grouping column's value, NoneKey for
-// NULL.
+// NULL. For GroupPayee it is the payee's display name, and GroupCategory reads the effective
+// category (the operator's setting first).
 type SummaryGroup struct {
 	Key        string `json:"key"`
 	Currency   string `json:"currency"`
@@ -792,15 +799,17 @@ type SummaryGroup struct {
 	Count      int64  `json:"count"`
 }
 
-// SpendingSummary totals agent.transactions by GroupBy and currency. Declined transactions are
-// excluded. Groups of GroupMonth come in key order; the others largest total first. The bool is true
-// when more groups existed than were returned.
+// SpendingSummary totals agent.cash_flows by GroupBy and currency. Declined transactions are not
+// in the view, and pending ones count only with IncludePending. The classes counted are FlowClasses,
+// or by default spending for money out and income and refund for money in. Groups of GroupMonth
+// come in key order; the others largest total first. The bool is true when more groups existed than
+// were returned.
 func (r *Reader) SpendingSummary(ctx context.Context, p SummaryParams) ([]SummaryGroup, bool, error) {
 	switch p.GroupBy {
-	case GroupMonth, GroupCategory, GroupMerchant, GroupCounterparty, GroupAccount:
+	case GroupMonth, GroupCategory, GroupMerchant, GroupCounterparty, GroupAccount, GroupPayee:
 	default:
-		return nil, false, fmt.Errorf("%w: group_by must be one of %s, %s, %s, %s, %s", ErrInvalid,
-			GroupMonth, GroupCategory, GroupMerchant, GroupCounterparty, GroupAccount)
+		return nil, false, fmt.Errorf("%w: group_by must be one of %s, %s, %s, %s, %s, %s", ErrInvalid,
+			GroupMonth, GroupCategory, GroupMerchant, GroupCounterparty, GroupAccount, GroupPayee)
 	}
 	from, to, err := dayRange(p.From, p.To)
 	if err != nil {
@@ -818,7 +827,19 @@ func (r *Reader) SpendingSummary(ctx context.Context, p SummaryParams) ([]Summar
 	default:
 		return nil, false, fmt.Errorf("%w: direction must be %q or %q", ErrInvalid, DirectionIn, DirectionOut)
 	}
-	exclude := p.ExcludePotTransfers == nil || *p.ExcludePotTransfers
+	for _, c := range p.FlowClasses {
+		if !slices.Contains(FlowClasses, c) {
+			return nil, false, fmt.Errorf("%w: flow_classes must be among %s", ErrInvalid, strings.Join(FlowClasses, ", "))
+		}
+	}
+	classes, potTransfers := p.FlowClasses, false
+	if len(classes) == 0 {
+		classes = []string{"spending"}
+		if direction == DirectionIn {
+			classes = []string{"income", "refund"}
+		}
+		potTransfers = p.ExcludePotTransfers != nil && !*p.ExcludePotTransfers
+	}
 	limits, err := curatedLimit(p.Limit)
 	if err != nil {
 		return nil, false, err
@@ -826,25 +847,26 @@ func (r *Reader) SpendingSummary(ctx context.Context, p SummaryParams) ([]Summar
 	rows, truncated, err := read(ctx, r, `
 		SELECT key, currency, sum(abs(amount_minor))::bigint AS total_minor, count(*)::bigint AS n
 		FROM (
-		  SELECT t.currency, t.amount_minor,
+		  SELECT c.currency, c.amount_minor,
 		         CASE $1::text
-		           WHEN 'month' THEN to_char(t.txn_date, 'YYYY-MM')
-		           WHEN 'category' THEN coalesce(t.category, '(none)')
-		           WHEN 'merchant' THEN coalesce(t.merchant_name, '(none)')
-		           WHEN 'counterparty' THEN coalesce(t.counterparty, '(none)')
-		           WHEN 'account' THEN t.account_slug
+		           WHEN 'month' THEN to_char(c.txn_date, 'YYYY-MM')
+		           WHEN 'category' THEN coalesce(c.category, '(none)')
+		           WHEN 'merchant' THEN coalesce(c.merchant_name, '(none)')
+		           WHEN 'counterparty' THEN coalesce(c.counterparty, '(none)')
+		           WHEN 'account' THEN c.account_slug
+		           WHEN 'payee' THEN c.payee_name
 		         END AS key
-		  FROM agent.transactions t
-		  WHERE t.status <> 'declined'
-		    AND (($2::text = 'out' AND t.amount_minor < 0) OR ($2::text = 'in' AND t.amount_minor > 0))
-		    AND ($3::date IS NULL OR t.txn_date >= $3)
-		    AND ($4::date IS NULL OR t.txn_date <= $4)
-		    AND ($5::text[] IS NULL OR t.account_slug = ANY($5))
-		    AND (NOT $6::boolean OR t.pot_slug IS NULL)
+		  FROM agent.cash_flows c
+		  WHERE (c.status = 'settled' OR $7::boolean)
+		    AND (($2::text = 'out' AND c.amount_minor < 0) OR ($2::text = 'in' AND c.amount_minor > 0))
+		    AND ($3::date IS NULL OR c.txn_date >= $3)
+		    AND ($4::date IS NULL OR c.txn_date <= $4)
+		    AND ($5::text[] IS NULL OR c.account_slug = ANY($5))
+		    AND (c.flow_class = ANY($6::text[]) OR ($8::boolean AND c.flow_class = 'internal' AND c.flow_reason = 'pot'))
 		) s
 		GROUP BY key, currency
 		ORDER BY CASE WHEN $1::text = 'month' THEN key END, total_minor DESC, key, currency`,
-		[]any{p.GroupBy, direction, from, to, accounts, exclude}, limits, nil, nil,
+		[]any{p.GroupBy, direction, from, to, accounts, classes, p.IncludePending, potTransfers}, limits, nil, nil,
 		func(rows pgx.Rows, _ *pgtype.Map) (SummaryGroup, error) {
 			var g SummaryGroup
 			return g, rows.Scan(&g.Key, &g.Currency, &g.TotalMinor, &g.Count)
@@ -1391,4 +1413,892 @@ func (r *Reader) DescribeSchema(ctx context.Context, schema string) ([]Relation,
 		rows = []Relation{}
 	}
 	return rows, nil
+}
+
+// --- the insight tools -----------------------------------------------------------------------
+
+// Flow classes of agent.cash_flows, and the account scopes of agent.account_scopes. The views own
+// the rules that give a row its class or an account its scope; the reader only checks the names a
+// caller passes.
+var (
+	FlowClasses   = []string{"internal", "scope_transfer", "own_external", "investment", "debt_repayment", "income", "refund", "spending"}
+	AccountScopes = []string{"personal", "joint", "business"}
+	// SeriesStatuses are the statuses of agent.recurring_payments.
+	SeriesStatuses = []string{"active", "due", "overdue", "lapsed", "ended"}
+)
+
+// Sorts of RecurringPayments and Payees.
+const (
+	SortAnnualCost = "annual_cost"
+	SortNextDate   = "next_date"
+	SortChange12m  = "change_12m"
+	SortOut        = "out"
+	SortIn         = "in"
+	SortLastDate   = "last_date"
+)
+
+// PriceChange is one entry of a series' price_changes.
+type PriceChange struct {
+	Date      string `json:"date"`
+	FromMinor int64  `json:"from_minor"`
+	ToMinor   int64  `json:"to_minor"`
+}
+
+// RecurringSeries is a row of agent.recurring_payments, with its column names. Dates are YYYY-MM-DD.
+type RecurringSeries struct {
+	SeriesKey          string        `json:"series_key"`
+	PayeeID            string        `json:"payee_id"`
+	PayeeName          string        `json:"payee_name"`
+	Evidence           string        `json:"evidence"`
+	Cadence            string        `json:"cadence"`
+	AmountKind         string        `json:"amount_kind"`
+	Occurrences        int64         `json:"occurrences"`
+	FirstDate          string        `json:"first_date"`
+	LastDate           string        `json:"last_date"`
+	LastAmountMinor    int64         `json:"last_amount_minor"`
+	TypicalAmountMinor int64         `json:"typical_amount_minor"`
+	Currency           string        `json:"currency"`
+	AnnualCostMinor    *int64        `json:"annual_cost_minor"`
+	NextExpectedDate   *string       `json:"next_expected_date"`
+	Status             string        `json:"status"`
+	PriceChanges       []PriceChange `json:"price_changes"`
+	Change12mMinor     *int64        `json:"change_12m_minor"`
+	FlowClass          string        `json:"flow_class"`
+	Category           *string       `json:"category"`
+	CategoryName       *string       `json:"category_name"`
+	AccountSlugs       []string      `json:"account_slugs"`
+	OperatorState      *string       `json:"operator_state"`
+	Confidence         string        `json:"confidence"`
+}
+
+// AnnualCostTotal is the annual cost of every series that matched, in one currency.
+type AnnualCostTotal struct {
+	Currency   string `json:"currency"`
+	TotalMinor int64  `json:"total_minor"`
+}
+
+// RecurringParams are the inputs of RecurringPayments. Statuses empty means active, due and
+// overdue. Sort is empty for SortAnnualCost. Limit is as for SearchParams.
+type RecurringParams struct {
+	Statuses       []string
+	IncludeIgnored bool
+	ChangedOnly    bool
+	Query          string
+	Sort           string
+	Limit          int
+}
+
+// Recurring is what RecurringPayments returns: the series rows, cut at the limit, and the annual
+// cost of every matching series per currency, counted before the cut.
+type Recurring struct {
+	Series          []RecurringSeries `json:"series"`
+	AnnualCostTotal []AnnualCostTotal `json:"annual_cost_total"`
+}
+
+// PayeeYear is one calendar year of a payee's totals (agent.payee_years).
+type PayeeYear struct {
+	Year     int64 `json:"year"`
+	OutMinor int64 `json:"out_minor"`
+	InMinor  int64 `json:"in_minor"`
+	TxnCount int64 `json:"txn_count"`
+}
+
+// PayeeRow is one payee and currency of agent.payees, with its totals over the range asked for.
+type PayeeRow struct {
+	PayeeID      string      `json:"payee_id"`
+	PayeeName    string      `json:"payee_name"`
+	Currency     string      `json:"currency"`
+	FlowClass    *string     `json:"flow_class"`
+	Category     *string     `json:"category"`
+	CategoryName *string     `json:"category_name"`
+	Employer     *bool       `json:"employer"`
+	FirstDate    string      `json:"first_date"`
+	LastDate     string      `json:"last_date"`
+	TxnCount     int64       `json:"txn_count"`
+	OutMinor     int64       `json:"out_minor"`
+	InMinor      int64       `json:"in_minor"`
+	Keys         []string    `json:"keys"`
+	NameVariants []string    `json:"name_variants"`
+	Years        []PayeeYear `json:"years"`
+}
+
+// PayeesParams are the inputs of Payees. From and To are YYYY-MM-DD dates, empty for none. Sort is
+// empty for SortOut.
+type PayeesParams struct {
+	Query     string
+	FlowClass string
+	From, To  string
+	Sort      string
+	Limit     int
+}
+
+// MonthFlow is a month, scope and currency of agent.monthly_flows, settled rows (or settled and
+// pending together), without the status column.
+type MonthFlow struct {
+	Month                 string   `json:"month"`
+	Scope                 string   `json:"scope"`
+	Currency              string   `json:"currency"`
+	IncomeMinor           int64    `json:"income_minor"`
+	SalaryMinor           int64    `json:"salary_minor"`
+	RefundMinor           int64    `json:"refund_minor"`
+	SpendingMinor         int64    `json:"spending_minor"`
+	DebtRepaymentMinor    int64    `json:"debt_repayment_minor"`
+	InvestmentOutMinor    int64    `json:"investment_out_minor"`
+	InvestmentInMinor     int64    `json:"investment_in_minor"`
+	OwnExternalOutMinor   int64    `json:"own_external_out_minor"`
+	OwnExternalInMinor    int64    `json:"own_external_in_minor"`
+	ScopeTransferOutMinor int64    `json:"scope_transfer_out_minor"`
+	ScopeTransferInMinor  int64    `json:"scope_transfer_in_minor"`
+	InternalOutMinor      int64    `json:"internal_out_minor"`
+	InternalInMinor       int64    `json:"internal_in_minor"`
+	NetMinor              int64    `json:"net_minor"`
+	SavingsRate           *float64 `json:"savings_rate"`
+}
+
+// CategoryMonth is a row of agent.category_months.
+type CategoryMonth struct {
+	Month         string  `json:"month"`
+	Scope         string  `json:"scope"`
+	Currency      string  `json:"currency"`
+	Category      *string `json:"category"`
+	CategoryName  *string `json:"category_name"`
+	SpendingMinor int64   `json:"spending_minor"`
+	TxnCount      int64   `json:"txn_count"`
+}
+
+// UpcomingPayment is a row of agent.upcoming_payments.
+type UpcomingPayment struct {
+	Date        string  `json:"date"`
+	PayeeID     *string `json:"payee_id"`
+	PayeeName   string  `json:"payee_name"`
+	AmountMinor int64   `json:"amount_minor"`
+	Currency    string  `json:"currency"`
+	Source      string  `json:"source"`
+	SeriesKey   *string `json:"series_key"`
+	AccountSlug *string `json:"account_slug"`
+}
+
+// CashFlowParams are the inputs of CashFlow. FromMonth and ToMonth are YYYY-MM, empty for the
+// defaults (the last 12 complete months in Europe/London). Scopes empty means all. CategoryLimit is
+// 0 for DefaultCategoryLimit. Limit caps each array.
+type CashFlowParams struct {
+	FromMonth, ToMonth string
+	Scopes             []string
+	CategoryLimit      int
+	IncludePending     bool
+	Limit              int
+}
+
+// DefaultCategoryLimit and MaxCategoryLimit bound CashFlowParams.CategoryLimit.
+const (
+	DefaultCategoryLimit = 10
+	MaxCategoryLimit     = 100
+)
+
+// CashFlow is what the cash_flow tool returns.
+type CashFlow struct {
+	Months     []MonthFlow       `json:"months"`
+	Categories []CategoryMonth   `json:"categories"`
+	Upcoming   []UpcomingPayment `json:"upcoming"`
+}
+
+// ProfileSpan is the first and last transaction date, null on an empty ledger.
+type ProfileSpan struct {
+	FirstDate *string `json:"first_date"`
+	LastDate  *string `json:"last_date"`
+}
+
+// ProfileAccount is an account with its resolved scope and where the scope came from.
+type ProfileAccount struct {
+	Slug        string `json:"slug"`
+	Source      string `json:"source"`
+	Scope       string `json:"scope"`
+	ScopeSource string `json:"scope_source"`
+}
+
+// ProfileMedian is the monthly medians of one scope and currency.
+type ProfileMedian struct {
+	Scope         string   `json:"scope"`
+	Currency      string   `json:"currency"`
+	IncomeMinor   int64    `json:"income_minor"`
+	SalaryMinor   int64    `json:"salary_minor"`
+	SpendingMinor int64    `json:"spending_minor"`
+	SavingsRate   *float64 `json:"savings_rate"`
+}
+
+// ProfileRecurring counts the live recurring series of one evidence and currency.
+type ProfileRecurring struct {
+	Evidence        string `json:"evidence"`
+	Currency        string `json:"currency"`
+	Count           int64  `json:"count"`
+	AnnualCostMinor int64  `json:"annual_cost_minor"`
+}
+
+// ProfilePayee is one of the largest payees by spending.
+type ProfilePayee struct {
+	PayeeID       string `json:"payee_id"`
+	PayeeName     string `json:"payee_name"`
+	Currency      string `json:"currency"`
+	SpendingMinor int64  `json:"spending_minor"`
+}
+
+// ProfileSeries is one of the largest recurring series by annual cost.
+type ProfileSeries struct {
+	SeriesKey       string `json:"series_key"`
+	PayeeName       string `json:"payee_name"`
+	Currency        string `json:"currency"`
+	AnnualCostMinor int64  `json:"annual_cost_minor"`
+}
+
+// ProfileAnomalyCount is the anomalies of one kind in the last 90 days.
+type ProfileAnomalyCount struct {
+	Kind  string `json:"kind"`
+	Count int64  `json:"count"`
+}
+
+// ProfileUnclassified is the spending that only the direction classified, in one currency.
+type ProfileUnclassified struct {
+	Currency    string `json:"currency"`
+	Count       int64  `json:"count"`
+	AmountMinor int64  `json:"amount_minor"`
+}
+
+// ProfileToCorrect is what the operator could still correct.
+type ProfileToCorrect struct {
+	UnnamedCategories       []string              `json:"unnamed_categories"`
+	UnclassifiedSpending    []ProfileUnclassified `json:"unclassified_spending"`
+	UnclassifiedOBTransfers int64                 `json:"unclassified_ob_transfers"`
+	UnpairedCardCredits     int64                 `json:"unpaired_card_credits"`
+	RuleProblems            int64                 `json:"rule_problems"`
+}
+
+// FinanceProfile is what the finance_profile tool returns.
+type FinanceProfile struct {
+	Span           ProfileSpan           `json:"span"`
+	Accounts       []ProfileAccount      `json:"accounts"`
+	MonthlyMedians []ProfileMedian       `json:"monthly_medians"`
+	SalaryDay      *int64                `json:"salary_day"`
+	Recurring      []ProfileRecurring    `json:"recurring"`
+	TopPayees      []ProfilePayee        `json:"top_payees"`
+	TopSeries      []ProfileSeries       `json:"top_series"`
+	Anomalies90d   []ProfileAnomalyCount `json:"anomalies_90d"`
+	ToCorrect      ProfileToCorrect      `json:"to_correct"`
+}
+
+// FinanceProfileParams are the inputs of FinanceProfile. Limit caps each array.
+type FinanceProfileParams struct{ Limit int }
+
+// decodePayload reads a row of a statement that returns one JSON payload per row.
+func decodePayload(rows pgx.Rows, _ *pgtype.Map) (json.RawMessage, error) {
+	var payload []byte
+	if err := rows.Scan(&payload); err != nil {
+		return nil, err
+	}
+	return append(json.RawMessage(nil), payload...), nil
+}
+
+// readTagged runs a statement whose rows are (kind, more, payload), as decodeInvestmentRow reads
+// them, and returns them with whether the read was cut or any array reported more rows.
+func readTagged(ctx context.Context, r *Reader, sql string, args []any, maxRows int) ([]investmentRow, bool, error) {
+	rows, truncated, err := read(ctx, r, sql, args, Limits{MaxRows: maxRows, MaxBytes: CuratedMaxBytes}, nil, nil, decodeInvestmentRow)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, row := range rows {
+		truncated = truncated || row.More
+	}
+	return rows, truncated, nil
+}
+
+// likePattern is the ILIKE pattern for a substring, nil for none.
+func likePattern(s string) *string {
+	if s == "" {
+		return nil
+	}
+	p := "%" + likeEscaper.Replace(s) + "%"
+	return &p
+}
+
+// recurringSQL is one statement: first the annual cost of every matching series per currency, then
+// the series, in sort order. $1 statuses, $2 include ignored, $3 changed only, $4 pattern, $5 sort,
+// $6 the limit; a series row's more says its array was cut. Everything is read from the view.
+const recurringSQL = `
+	WITH f AS (
+	  SELECT r.* FROM agent.recurring_payments r
+	  WHERE r.status = ANY($1::text[])
+	    AND ($2::boolean OR r.operator_state IS DISTINCT FROM 'ignored')
+	    AND (NOT $3::boolean OR coalesce(r.change_12m_minor, 0) <> 0)
+	    AND ($4::text IS NULL OR r.payee_name ILIKE $4 ESCAPE '\')
+	),
+	ranked AS (
+	  SELECT f.*, row_number() OVER (
+	           ORDER BY CASE WHEN $5::text = 'annual_cost' THEN f.annual_cost_minor END DESC NULLS LAST,
+	                    CASE WHEN $5::text = 'next_date' THEN f.next_expected_date END ASC NULLS LAST,
+	                    CASE WHEN $5::text = 'change_12m' THEN abs(f.change_12m_minor) END DESC NULLS LAST,
+	                    f.series_key) AS rn,
+	         count(*) OVER () AS n
+	  FROM f
+	),
+	totals AS (
+	  SELECT currency, sum(annual_cost_minor)::bigint AS total_minor, row_number() OVER (ORDER BY currency) AS rn
+	  FROM f GROUP BY currency HAVING count(annual_cost_minor) > 0
+	)
+	SELECT u.kind, u.more, u.payload FROM (
+	  SELECT 'total'::text AS kind, 0 AS part, t.rn, false AS more,
+	         jsonb_build_object('currency', t.currency, 'total_minor', t.total_minor) AS payload
+	  FROM totals t
+	  UNION ALL
+	  SELECT 'series', 1, r.rn, r.n > $6::int,
+	         jsonb_build_object('series_key', r.series_key, 'payee_id', r.payee_id, 'payee_name', r.payee_name,
+	           'evidence', r.evidence, 'cadence', r.cadence, 'amount_kind', r.amount_kind,
+	           'occurrences', r.occurrences, 'first_date', r.first_date, 'last_date', r.last_date,
+	           'last_amount_minor', r.last_amount_minor, 'typical_amount_minor', r.typical_amount_minor,
+	           'currency', r.currency, 'annual_cost_minor', r.annual_cost_minor,
+	           'next_expected_date', r.next_expected_date, 'status', r.status, 'price_changes', r.price_changes,
+	           'change_12m_minor', r.change_12m_minor, 'flow_class', r.flow_class, 'category', r.category,
+	           'category_name', r.category_name, 'account_slugs', r.account_slugs,
+	           'operator_state', r.operator_state, 'confidence', r.confidence)
+	  FROM ranked r WHERE r.rn <= $6::int
+	) u
+	ORDER BY u.part, u.rn`
+
+// totalsMaxRows is how many rows beyond the limit a statement with per-currency totals may read.
+const totalsMaxRows = 100
+
+// RecurringPayments reads agent.recurring_payments in one statement: the series that match the
+// filters, sorted and cut at Limit, and the annual cost per currency of every matching series
+// before the cut (series with no annual cost, the irregular ones, add nothing). Status defaults to
+// active, due and overdue; ignored series are left out unless IncludeIgnored. The bool is true
+// when the series were cut.
+func (r *Reader) RecurringPayments(ctx context.Context, p RecurringParams) (Recurring, bool, error) {
+	out := Recurring{Series: []RecurringSeries{}, AnnualCostTotal: []AnnualCostTotal{}}
+	statuses := p.Statuses
+	if len(statuses) == 0 {
+		statuses = []string{"active", "due", "overdue"}
+	}
+	for _, s := range statuses {
+		if !slices.Contains(SeriesStatuses, s) {
+			return out, false, fmt.Errorf("%w: status must be one of %s", ErrInvalid, strings.Join(SeriesStatuses, ", "))
+		}
+	}
+	sortBy := p.Sort
+	switch sortBy {
+	case "":
+		sortBy = SortAnnualCost
+	case SortAnnualCost, SortNextDate, SortChange12m:
+	default:
+		return out, false, fmt.Errorf("%w: sort must be %s, %s or %s", ErrInvalid, SortAnnualCost, SortNextDate, SortChange12m)
+	}
+	limits, err := curatedLimit(p.Limit)
+	if err != nil {
+		return out, false, err
+	}
+	rows, truncated, err := readTagged(ctx, r, recurringSQL,
+		[]any{statuses, p.IncludeIgnored, p.ChangedOnly, likePattern(p.Query), sortBy, limits.MaxRows},
+		limits.MaxRows+totalsMaxRows)
+	if err != nil {
+		return out, false, fmt.Errorf("store: recurring payments: %w", err)
+	}
+	for _, row := range rows {
+		var derr error
+		switch row.Kind {
+		case "total":
+			var v AnnualCostTotal
+			derr = json.Unmarshal(row.Payload, &v)
+			out.AnnualCostTotal = append(out.AnnualCostTotal, v)
+		case "series":
+			var v RecurringSeries
+			derr = json.Unmarshal(row.Payload, &v)
+			if v.PriceChanges == nil {
+				v.PriceChanges = []PriceChange{}
+			}
+			if v.AccountSlugs == nil {
+				v.AccountSlugs = []string{}
+			}
+			out.Series = append(out.Series, v)
+		}
+		if derr != nil {
+			return Recurring{}, false, fmt.Errorf("store: recurring payments: decode row: %w", derr)
+		}
+	}
+	return out, truncated, nil
+}
+
+// payeesSQL is one statement over agent.payees. With a range ($3 true) the totals are summed from
+// agent.cash_flows over the range (settled rows, every class but internal and scope_transfer) and a
+// payee with nothing in the range is left out; without one they are the view's lifetime totals.
+// $1 pattern, $2 flow class, $4 from, $5 to, $6 sort.
+const payeesSQL = `
+	WITH rng AS (
+	  SELECT c.payee_id, c.currency,
+	         coalesce(sum(-c.amount_minor) FILTER (WHERE c.amount_minor < 0), 0)::bigint AS out_minor,
+	         coalesce(sum(c.amount_minor) FILTER (WHERE c.amount_minor > 0), 0)::bigint AS in_minor,
+	         count(*)::bigint AS txn_count
+	  FROM agent.cash_flows c
+	  WHERE $3::boolean AND c.status = 'settled' AND c.flow_class NOT IN ('internal', 'scope_transfer')
+	    AND ($4::date IS NULL OR c.txn_date >= $4) AND ($5::date IS NULL OR c.txn_date <= $5)
+	  GROUP BY c.payee_id, c.currency
+	),
+	p AS (
+	  SELECT p.payee_id, p.payee_name, p.currency, p.flow_class, p.category, p.category_name, p.employer,
+	         p.first_date, p.last_date, p.keys, p.name_variants,
+	         CASE WHEN $3::boolean THEN r.txn_count ELSE p.txn_count END AS txn_count,
+	         CASE WHEN $3::boolean THEN r.out_minor ELSE p.out_minor END AS out_minor,
+	         CASE WHEN $3::boolean THEN r.in_minor ELSE p.in_minor END AS in_minor
+	  FROM agent.payees p
+	  LEFT JOIN rng r ON r.payee_id = p.payee_id AND r.currency = p.currency
+	  WHERE (NOT $3::boolean OR r.payee_id IS NOT NULL)
+	    AND ($1::text IS NULL OR p.payee_name ILIKE $1 ESCAPE '\'
+	         OR EXISTS (SELECT 1 FROM unnest(p.name_variants) v WHERE v ILIKE $1 ESCAPE '\'))
+	    AND ($2::text IS NULL OR p.flow_class = $2)
+	)
+	SELECT jsonb_build_object('payee_id', p.payee_id, 'payee_name', p.payee_name, 'currency', p.currency,
+	         'flow_class', p.flow_class, 'category', p.category, 'category_name', p.category_name,
+	         'employer', p.employer, 'first_date', p.first_date, 'last_date', p.last_date,
+	         'txn_count', p.txn_count, 'out_minor', p.out_minor, 'in_minor', p.in_minor,
+	         'keys', p.keys, 'name_variants', coalesce(p.name_variants, ARRAY[]::text[]),
+	         'years', coalesce((SELECT jsonb_agg(jsonb_build_object('year', y.year, 'out_minor', y.out_minor,
+	                                                               'in_minor', y.in_minor, 'txn_count', y.txn_count)
+	                                             ORDER BY y.year)
+	                            FROM agent.payee_years y WHERE y.payee_id = p.payee_id AND y.currency = p.currency),
+	                           '[]'::jsonb))
+	FROM p
+	ORDER BY CASE WHEN $6::text = 'out' THEN p.out_minor WHEN $6::text = 'in' THEN p.in_minor END DESC NULLS LAST,
+	         CASE WHEN $6::text = 'last_date' THEN p.last_date END DESC NULLS LAST,
+	         p.payee_id, p.currency`
+
+// Payees reads agent.payees and agent.payee_years in one statement. Without From and To the totals
+// are the view's lifetime ones, every flow class counted; with either, they are summed from
+// agent.cash_flows over the range, settled rows of every class but internal and scope_transfer,
+// and a payee with nothing in the range is left out. Sort is SortOut (the default), SortIn or
+// SortLastDate, ties by payee id. The bool is true when more payees matched than were returned or
+// the byte cap was reached.
+func (r *Reader) Payees(ctx context.Context, p PayeesParams) ([]PayeeRow, bool, error) {
+	if p.FlowClass != "" && !slices.Contains(FlowClasses, p.FlowClass) {
+		return nil, false, fmt.Errorf("%w: flow_class must be one of %s", ErrInvalid, strings.Join(FlowClasses, ", "))
+	}
+	sortBy := p.Sort
+	switch sortBy {
+	case "":
+		sortBy = SortOut
+	case SortOut, SortIn, SortLastDate:
+	default:
+		return nil, false, fmt.Errorf("%w: sort must be %s, %s or %s", ErrInvalid, SortOut, SortIn, SortLastDate)
+	}
+	from, to, err := dayRange(p.From, p.To)
+	if err != nil {
+		return nil, false, err
+	}
+	limits, err := curatedLimit(p.Limit)
+	if err != nil {
+		return nil, false, err
+	}
+	var class *string
+	if p.FlowClass != "" {
+		class = &p.FlowClass
+	}
+	rows, truncated, err := read(ctx, r, payeesSQL,
+		[]any{likePattern(p.Query), class, from != nil || to != nil, from, to, sortBy}, limits, nil, nil, decodePayload)
+	if err != nil {
+		return nil, false, fmt.Errorf("store: payees: %w", err)
+	}
+	out := make([]PayeeRow, 0, len(rows))
+	for _, raw := range rows {
+		var v PayeeRow
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return nil, false, fmt.Errorf("store: payees: decode row: %w", err)
+		}
+		if v.Keys == nil {
+			v.Keys = []string{}
+		}
+		if v.NameVariants == nil {
+			v.NameVariants = []string{}
+		}
+		if v.Years == nil {
+			v.Years = []PayeeYear{}
+		}
+		out = append(out, v)
+	}
+	return out, truncated, nil
+}
+
+// cashFlowSQL is one statement with three arrays, read from one snapshot: months (agent.monthly_flows
+// summed over the statuses wanted), categories (agent.category_months, the top $5 in each month,
+// scope and currency, settled rows only) and upcoming (agent.upcoming_payments). $1 and $2 are the
+// first and last month, null for the defaults (the 12 complete months before today in
+// Europe/London); $3 the scopes, $4 whether pending rows count, $6 the limit of each array.
+const cashFlowSQL = `
+	WITH rng AS (
+	  SELECT x.to_m, coalesce($1::text, to_char((x.to_m || '-01')::date - interval '11 months', 'YYYY-MM')) AS from_m
+	  FROM (SELECT coalesce($2::text, to_char(date_trunc('month', ((now() AT TIME ZONE 'Europe/London')::date)::timestamp)
+	                                         - interval '1 month', 'YYYY-MM')) AS to_m) x
+	),
+	mf AS (
+	  SELECT m.month, m.scope, m.currency,
+	         sum(m.income_minor)::bigint AS income_minor, sum(m.salary_minor)::bigint AS salary_minor,
+	         sum(m.refund_minor)::bigint AS refund_minor, sum(m.spending_minor)::bigint AS spending_minor,
+	         sum(m.debt_repayment_minor)::bigint AS debt_repayment_minor,
+	         sum(m.investment_out_minor)::bigint AS investment_out_minor,
+	         sum(m.investment_in_minor)::bigint AS investment_in_minor,
+	         sum(m.own_external_out_minor)::bigint AS own_external_out_minor,
+	         sum(m.own_external_in_minor)::bigint AS own_external_in_minor,
+	         sum(m.scope_transfer_out_minor)::bigint AS scope_transfer_out_minor,
+	         sum(m.scope_transfer_in_minor)::bigint AS scope_transfer_in_minor,
+	         sum(m.internal_out_minor)::bigint AS internal_out_minor,
+	         sum(m.internal_in_minor)::bigint AS internal_in_minor,
+	         sum(m.net_minor)::bigint AS net_minor,
+	         -- One row: the view's own rate. Settled and pending rows together: the view's formula
+	         -- over the sums.
+	         CASE WHEN count(*) = 1 THEN max(m.savings_rate)
+	              WHEN sum(m.income_minor) > 0
+	              THEN round((sum(m.income_minor) - (sum(m.spending_minor) - sum(m.refund_minor))
+	                          - sum(m.debt_repayment_minor))::numeric / sum(m.income_minor), 4) END AS savings_rate
+	  FROM agent.monthly_flows m, rng
+	  WHERE m.month BETWEEN rng.from_m AND rng.to_m
+	    AND (m.status = 'settled' OR $4::boolean)
+	    AND ($3::text[] IS NULL OR m.scope = ANY($3))
+	  GROUP BY m.month, m.scope, m.currency
+	),
+	mfr AS (
+	  SELECT mf.*, row_number() OVER (ORDER BY mf.month, mf.scope, mf.currency) AS rn, count(*) OVER () AS n FROM mf
+	),
+	cm AS (
+	  SELECT m.*, row_number() OVER (PARTITION BY m.month, m.scope, m.currency
+	                                 ORDER BY m.spending_minor DESC, m.category NULLS LAST) AS cat_rank
+	  FROM agent.category_months m, rng
+	  WHERE m.month BETWEEN rng.from_m AND rng.to_m AND ($3::text[] IS NULL OR m.scope = ANY($3))
+	),
+	cmr AS (
+	  SELECT c.*, row_number() OVER (ORDER BY c.month, c.scope, c.currency, c.cat_rank) AS rn, count(*) OVER () AS n
+	  FROM cm c WHERE c.cat_rank <= $5::int
+	),
+	upr AS (
+	  SELECT u.*, row_number() OVER (ORDER BY u.date, coalesce(u.series_key, ''), u.payee_name, u.amount_minor,
+	                                          coalesce(u.account_slug, '')) AS rn, count(*) OVER () AS n
+	  FROM agent.upcoming_payments u
+	  WHERE $3::text[] IS NULL OR u.account_slug IS NULL
+	     OR EXISTS (SELECT 1 FROM agent.account_scopes s WHERE s.slug = u.account_slug AND s.scope = ANY($3))
+	)
+	SELECT u.kind, u.more, u.payload FROM (
+	  SELECT 'month'::text AS kind, 0 AS part, r.rn, r.n > $6::int AS more,
+	         jsonb_build_object('month', r.month, 'scope', r.scope, 'currency', r.currency,
+	           'income_minor', r.income_minor, 'salary_minor', r.salary_minor, 'refund_minor', r.refund_minor,
+	           'spending_minor', r.spending_minor, 'debt_repayment_minor', r.debt_repayment_minor,
+	           'investment_out_minor', r.investment_out_minor, 'investment_in_minor', r.investment_in_minor,
+	           'own_external_out_minor', r.own_external_out_minor, 'own_external_in_minor', r.own_external_in_minor,
+	           'scope_transfer_out_minor', r.scope_transfer_out_minor, 'scope_transfer_in_minor', r.scope_transfer_in_minor,
+	           'internal_out_minor', r.internal_out_minor, 'internal_in_minor', r.internal_in_minor,
+	           'net_minor', r.net_minor, 'savings_rate', r.savings_rate) AS payload
+	  FROM mfr r WHERE r.rn <= $6::int
+	  UNION ALL
+	  SELECT 'category', 1, r.rn, r.n > $6::int,
+	         jsonb_build_object('month', r.month, 'scope', r.scope, 'currency', r.currency, 'category', r.category,
+	           'category_name', r.category_name, 'spending_minor', r.spending_minor, 'txn_count', r.txn_count)
+	  FROM cmr r WHERE r.rn <= $6::int
+	  UNION ALL
+	  SELECT 'upcoming', 2, r.rn, r.n > $6::int,
+	         jsonb_build_object('date', r.date, 'payee_id', r.payee_id, 'payee_name', r.payee_name,
+	           'amount_minor', r.amount_minor, 'currency', r.currency, 'source', r.source,
+	           'series_key', r.series_key, 'account_slug', r.account_slug)
+	  FROM upr r WHERE r.rn <= $6::int
+	) u
+	ORDER BY u.part, u.rn`
+
+// parseMonth checks an optional YYYY-MM month.
+func parseMonth(name, v string) (*string, error) {
+	if v == "" {
+		return nil, nil
+	}
+	if _, err := time.Parse("2006-01", v); err != nil || len(v) != len("2006-01") {
+		return nil, fmt.Errorf("%w: %s must be a YYYY-MM month", ErrInvalid, name)
+	}
+	return &v, nil
+}
+
+// scopeFilter validates account scopes; an empty list is no filter (nil).
+func scopeFilter(scopes []string) ([]string, error) {
+	if len(scopes) == 0 {
+		return nil, nil
+	}
+	for _, s := range scopes {
+		if !slices.Contains(AccountScopes, s) {
+			return nil, fmt.Errorf("%w: a scope must be one of %s", ErrInvalid, strings.Join(AccountScopes, ", "))
+		}
+	}
+	return scopes, nil
+}
+
+// CashFlow reads agent.monthly_flows, agent.category_months and agent.upcoming_payments in one
+// statement. The months are the range's rows summed over the settled status, or over both statuses
+// with IncludePending; the categories are the settled top CategoryLimit by spending in each month,
+// scope and currency; the upcoming payments are the view's, those of an account in another scope
+// than Scopes left out (a row with no account stays). Limit caps each array, and the bool is true
+// when any was cut.
+func (r *Reader) CashFlow(ctx context.Context, p CashFlowParams) (CashFlow, bool, error) {
+	out := CashFlow{Months: []MonthFlow{}, Categories: []CategoryMonth{}, Upcoming: []UpcomingPayment{}}
+	from, err := parseMonth("from_month", p.FromMonth)
+	if err != nil {
+		return out, false, err
+	}
+	to, err := parseMonth("to_month", p.ToMonth)
+	if err != nil {
+		return out, false, err
+	}
+	if from != nil && to != nil && *from > *to {
+		return out, false, fmt.Errorf("%w: from_month is after to_month", ErrInvalid)
+	}
+	scopes, err := scopeFilter(p.Scopes)
+	if err != nil {
+		return out, false, err
+	}
+	catLimit := p.CategoryLimit
+	switch {
+	case catLimit == 0:
+		catLimit = DefaultCategoryLimit
+	case catLimit < 0 || catLimit > MaxCategoryLimit:
+		return out, false, fmt.Errorf("%w: category_limit must be between 1 and %d", ErrInvalid, MaxCategoryLimit)
+	}
+	limits, err := curatedLimit(p.Limit)
+	if err != nil {
+		return out, false, err
+	}
+	rows, truncated, err := readTagged(ctx, r, cashFlowSQL,
+		[]any{from, to, scopes, p.IncludePending, catLimit, limits.MaxRows}, 3*limits.MaxRows)
+	if err != nil {
+		return out, false, fmt.Errorf("store: cash flow: %w", err)
+	}
+	for _, row := range rows {
+		var derr error
+		switch row.Kind {
+		case "month":
+			var v MonthFlow
+			derr = json.Unmarshal(row.Payload, &v)
+			out.Months = append(out.Months, v)
+		case "category":
+			var v CategoryMonth
+			derr = json.Unmarshal(row.Payload, &v)
+			out.Categories = append(out.Categories, v)
+		case "upcoming":
+			var v UpcomingPayment
+			derr = json.Unmarshal(row.Payload, &v)
+			out.Upcoming = append(out.Upcoming, v)
+		}
+		if derr != nil {
+			return CashFlow{}, false, fmt.Errorf("store: cash flow: decode row: %w", derr)
+		}
+	}
+	return out, truncated, nil
+}
+
+// profileSQL is one statement with every part of the finance profile, read from one snapshot. The
+// transactions come from one pass over agent.cash_flows. $1 caps each array; the two top lists are
+// capped at ten as well.
+const profileSQL = `
+	WITH w AS (
+	  SELECT (now() AT TIME ZONE 'Europe/London')::date AS today,
+	         to_char(date_trunc('month', ((now() AT TIME ZONE 'Europe/London')::date)::timestamp) - interval '12 months', 'YYYY-MM') AS from_m,
+	         to_char(date_trunc('month', ((now() AT TIME ZONE 'Europe/London')::date)::timestamp) - interval '1 month', 'YYYY-MM') AS to_m
+	),
+	cf AS MATERIALIZED (
+	  SELECT c.account_slug, c.txn_date, c.status, c.amount_minor, c.currency, c.txn_category, c.payee_id, c.payee_name,
+	         c.flow_class, c.flow_reason, c.employer, c.category, c.category_name
+	  FROM agent.cash_flows c
+	),
+	span AS (SELECT min(txn_date) AS first_date, max(txn_date) AS last_date FROM cf),
+	acc AS (
+	  SELECT a.slug, a.source, s.scope, s.scope_source,
+	         row_number() OVER (ORDER BY a.slug) AS rn, count(*) OVER () AS n
+	  FROM agent.accounts a JOIN agent.account_scopes s ON s.slug = a.slug
+	),
+	med AS (
+	  SELECT m.scope, m.currency,
+	         round(percentile_cont(0.5) WITHIN GROUP (ORDER BY m.income_minor))::bigint AS income_minor,
+	         round(percentile_cont(0.5) WITHIN GROUP (ORDER BY m.salary_minor))::bigint AS salary_minor,
+	         round(percentile_cont(0.5) WITHIN GROUP (ORDER BY m.spending_minor))::bigint AS spending_minor,
+	         round((percentile_cont(0.5) WITHIN GROUP (ORDER BY m.savings_rate))::numeric, 4) AS savings_rate
+	  FROM agent.monthly_flows m, w
+	  WHERE m.status = 'settled' AND m.month BETWEEN w.from_m AND w.to_m
+	  GROUP BY m.scope, m.currency
+	),
+	medr AS (SELECT med.*, row_number() OVER (ORDER BY scope, currency) AS rn, count(*) OVER () AS n FROM med),
+	sal AS (
+	  SELECT mode() WITHIN GROUP (ORDER BY extract(day FROM txn_date)::int) AS day
+	  FROM cf WHERE status = 'settled' AND flow_class = 'income' AND employer IS TRUE
+	),
+	live AS MATERIALIZED (
+	  SELECT r.* FROM agent.recurring_payments r
+	  WHERE r.status IN ('active', 'due', 'overdue') AND r.operator_state IS DISTINCT FROM 'ignored'
+	),
+	rec AS (
+	  SELECT l.evidence, l.currency, count(*)::bigint AS k, coalesce(sum(l.annual_cost_minor), 0)::bigint AS annual,
+	         row_number() OVER (ORDER BY l.evidence, l.currency) AS rn, count(*) OVER () AS n
+	  FROM live l GROUP BY l.evidence, l.currency
+	),
+	tp AS (
+	  SELECT c.payee_id, max(c.payee_name) AS payee_name, c.currency, sum(-c.amount_minor)::bigint AS spending,
+	         row_number() OVER (ORDER BY sum(-c.amount_minor) DESC, c.payee_id, c.currency) AS rn,
+	         count(*) OVER () AS n
+	  FROM cf c, w
+	  WHERE c.status = 'settled' AND c.flow_class = 'spending' AND c.txn_date >= w.today - 365
+	  GROUP BY c.payee_id, c.currency
+	),
+	ts AS (
+	  SELECT l.series_key, l.payee_name, l.currency, l.annual_cost_minor,
+	         row_number() OVER (ORDER BY l.annual_cost_minor DESC, l.series_key) AS rn, count(*) OVER () AS n
+	  FROM live l WHERE l.annual_cost_minor IS NOT NULL
+	),
+	an AS (
+	  SELECT a.kind, count(*)::bigint AS k, row_number() OVER (ORDER BY a.kind) AS rn, count(*) OVER () AS n
+	  FROM agent.anomalies a, w WHERE a.txn_date >= w.today - 90
+	  GROUP BY a.kind
+	),
+	uc AS (
+	  SELECT d.category, row_number() OVER (ORDER BY d.category) AS rn, count(*) OVER () AS n
+	  FROM (SELECT DISTINCT category FROM cf
+	        WHERE status = 'settled' AND category LIKE 'category\_%' ESCAPE '\' AND category_name IS NULL) d
+	),
+	classed AS MATERIALIZED (
+	  SELECT DISTINCT payee_id FROM agent.payee_keys WHERE setting_flow_class IS NOT NULL
+	),
+	us AS (
+	  SELECT c.currency, count(*)::bigint AS k, sum(-c.amount_minor)::bigint AS amount,
+	         row_number() OVER (ORDER BY c.currency) AS rn, count(*) OVER () AS n
+	  FROM cf c LEFT JOIN classed k ON k.payee_id = c.payee_id
+	  WHERE c.status = 'settled' AND c.flow_class = 'spending' AND c.flow_reason = 'direction' AND k.payee_id IS NULL
+	  GROUP BY c.currency
+	),
+	counts AS (
+	  SELECT (SELECT count(*) FROM cf c WHERE c.status = 'settled' AND c.txn_category = 'TRANSFER'
+	            AND c.flow_reason NOT IN ('pot', 'flex', 'own_account', 'paired', 'rule'))::bigint AS ob_transfers,
+	         (SELECT count(*) FROM cf c JOIN agent.accounts a ON a.slug = c.account_slug
+	          WHERE a.type = 'credit_card' AND c.status = 'settled' AND c.amount_minor > 0
+	            AND c.flow_reason = 'card_credit')::bigint AS card_credits,
+	         (SELECT count(*) FROM agent.payee_rule_status WHERE problem IS NOT NULL)::bigint AS rule_problems
+	)
+	SELECT u.kind, u.more, u.payload FROM (
+	  SELECT 'span'::text AS kind, 1 AS part, 1::bigint AS rn, false AS more,
+	         jsonb_build_object('first_date', s.first_date, 'last_date', s.last_date) AS payload FROM span s
+	  UNION ALL
+	  SELECT 'account', 2, a.rn, a.n > $1::int,
+	         jsonb_build_object('slug', a.slug, 'source', a.source, 'scope', a.scope, 'scope_source', a.scope_source)
+	  FROM acc a WHERE a.rn <= $1::int
+	  UNION ALL
+	  SELECT 'median', 3, m.rn, m.n > $1::int,
+	         jsonb_build_object('scope', m.scope, 'currency', m.currency, 'income_minor', m.income_minor,
+	           'salary_minor', m.salary_minor, 'spending_minor', m.spending_minor, 'savings_rate', m.savings_rate)
+	  FROM medr m WHERE m.rn <= $1::int
+	  UNION ALL
+	  SELECT 'salary_day', 4, 1, false, jsonb_build_object('day', s.day) FROM sal s
+	  UNION ALL
+	  SELECT 'recurring', 5, r.rn, r.n > $1::int,
+	         jsonb_build_object('evidence', r.evidence, 'currency', r.currency, 'count', r.k, 'annual_cost_minor', r.annual)
+	  FROM rec r WHERE r.rn <= $1::int
+	  UNION ALL
+	  SELECT 'top_payee', 6, t.rn, $1::int < 10 AND t.n > $1::int,
+	         jsonb_build_object('payee_id', t.payee_id, 'payee_name', t.payee_name, 'currency', t.currency,
+	           'spending_minor', t.spending)
+	  FROM tp t WHERE t.rn <= least(10, $1::int)
+	  UNION ALL
+	  SELECT 'top_series', 7, t.rn, $1::int < 10 AND t.n > $1::int,
+	         jsonb_build_object('series_key', t.series_key, 'payee_name', t.payee_name, 'currency', t.currency,
+	           'annual_cost_minor', t.annual_cost_minor)
+	  FROM ts t WHERE t.rn <= least(10, $1::int)
+	  UNION ALL
+	  SELECT 'anomaly', 8, a.rn, a.n > $1::int, jsonb_build_object('kind', a.kind, 'count', a.k)
+	  FROM an a WHERE a.rn <= $1::int
+	  UNION ALL
+	  SELECT 'unnamed_category', 9, u.rn, u.n > $1::int, jsonb_build_object('category', u.category)
+	  FROM uc u WHERE u.rn <= $1::int
+	  UNION ALL
+	  SELECT 'unclassified', 10, u.rn, u.n > $1::int,
+	         jsonb_build_object('currency', u.currency, 'count', u.k, 'amount_minor', u.amount)
+	  FROM us u WHERE u.rn <= $1::int
+	  UNION ALL
+	  SELECT 'counts', 11, 1, false,
+	         jsonb_build_object('unclassified_ob_transfers', c.ob_transfers, 'unpaired_card_credits', c.card_credits,
+	                            'rule_problems', c.rule_problems)
+	  FROM counts c
+	) u
+	ORDER BY u.part, u.rn`
+
+// profileArrays is the most arrays of the profile that a limit caps, plus its single rows.
+const profileArrays = 8
+
+// FinanceProfile reads the profile of the data in one statement; see the finance_profile tool for
+// what it holds. Limit caps each array (the two top lists hold ten at most), and the bool is true
+// when any was cut. A part with no data is null (the span, the salary day) or an empty list.
+func (r *Reader) FinanceProfile(ctx context.Context, p FinanceProfileParams) (FinanceProfile, bool, error) {
+	out := FinanceProfile{
+		Accounts: []ProfileAccount{}, MonthlyMedians: []ProfileMedian{}, Recurring: []ProfileRecurring{},
+		TopPayees: []ProfilePayee{}, TopSeries: []ProfileSeries{}, Anomalies90d: []ProfileAnomalyCount{},
+		ToCorrect: ProfileToCorrect{UnnamedCategories: []string{}, UnclassifiedSpending: []ProfileUnclassified{}},
+	}
+	limits, err := curatedLimit(p.Limit)
+	if err != nil {
+		return out, false, err
+	}
+	rows, truncated, err := readTagged(ctx, r, profileSQL, []any{limits.MaxRows}, profileArrays*limits.MaxRows+3)
+	if err != nil {
+		return out, false, fmt.Errorf("store: finance profile: %w", err)
+	}
+	for _, row := range rows {
+		var derr error
+		switch row.Kind {
+		case "span":
+			derr = json.Unmarshal(row.Payload, &out.Span)
+		case "account":
+			var v ProfileAccount
+			derr = json.Unmarshal(row.Payload, &v)
+			out.Accounts = append(out.Accounts, v)
+		case "median":
+			var v ProfileMedian
+			derr = json.Unmarshal(row.Payload, &v)
+			out.MonthlyMedians = append(out.MonthlyMedians, v)
+		case "salary_day":
+			var v struct {
+				Day *int64 `json:"day"`
+			}
+			derr = json.Unmarshal(row.Payload, &v)
+			out.SalaryDay = v.Day
+		case "recurring":
+			var v ProfileRecurring
+			derr = json.Unmarshal(row.Payload, &v)
+			out.Recurring = append(out.Recurring, v)
+		case "top_payee":
+			var v ProfilePayee
+			derr = json.Unmarshal(row.Payload, &v)
+			out.TopPayees = append(out.TopPayees, v)
+		case "top_series":
+			var v ProfileSeries
+			derr = json.Unmarshal(row.Payload, &v)
+			out.TopSeries = append(out.TopSeries, v)
+		case "anomaly":
+			var v ProfileAnomalyCount
+			derr = json.Unmarshal(row.Payload, &v)
+			out.Anomalies90d = append(out.Anomalies90d, v)
+		case "unnamed_category":
+			var v struct {
+				Category string `json:"category"`
+			}
+			derr = json.Unmarshal(row.Payload, &v)
+			out.ToCorrect.UnnamedCategories = append(out.ToCorrect.UnnamedCategories, v.Category)
+		case "unclassified":
+			var v ProfileUnclassified
+			derr = json.Unmarshal(row.Payload, &v)
+			out.ToCorrect.UnclassifiedSpending = append(out.ToCorrect.UnclassifiedSpending, v)
+		case "counts":
+			var v struct {
+				OBTransfers int64 `json:"unclassified_ob_transfers"`
+				CardCredits int64 `json:"unpaired_card_credits"`
+				Problems    int64 `json:"rule_problems"`
+			}
+			derr = json.Unmarshal(row.Payload, &v)
+			out.ToCorrect.UnclassifiedOBTransfers, out.ToCorrect.UnpairedCardCredits, out.ToCorrect.RuleProblems =
+				v.OBTransfers, v.CardCredits, v.Problems
+		}
+		if derr != nil {
+			return FinanceProfile{}, false, fmt.Errorf("store: finance profile: decode row: %w", derr)
+		}
+	}
+	return out, truncated, nil
 }
