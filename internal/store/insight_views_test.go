@@ -29,10 +29,10 @@ type insightFixture struct {
 // itx describes one made-up transaction. Zero fields take defaults: GBP, settled, and a
 // description derived from the key.
 type itx struct {
-	acct, key, date, status, desc, cp, merchant, scheme, category, currency string
-	amt                                                                     int64
-	blank                                                                   bool
-	detail                                                                  map[string]any
+	acct, key, date, status, desc, cp, merchant, scheme, category, currency, local string
+	amt                                                                            int64
+	blank                                                                          bool
+	detail                                                                         map[string]any
 }
 
 const (
@@ -163,6 +163,10 @@ func (f *insightFixture) tx(x itx) {
 	}
 	if x.category != "" {
 		t.Category = ptr(x.category)
+	}
+	if x.local != "" {
+		t.LocalCurrency = ptr(x.local)
+		t.LocalAmountMinor = ptr(x.amt)
 	}
 	content := merge(x.detail, map[string]any{"id": x.key, "amount": x.amt})
 	body, err := json.Marshal(content)
@@ -573,8 +577,15 @@ func TestCanonicalKeys(t *testing.T) {
 	f.setting("mg:empty_target", "Empty Target", "", "", "", nil, 83)
 	mg("et_a", "2026-03-03", "et_a", "Empty Target Feeder", -100)
 	f.alias("mg:et_a", false, "mg:empty_target", "", 84)
+	// An inferred series is keyed by its first transaction: confirm decisions on that key match, and
+	// on the key of a later transaction of the same series (a key that no longer exists) do not.
+	var infKey string
+	if err := f.q.QueryRow(ctx, `SELECT 'inf:' || id FROM agent.cash_flows WHERE payee_id = 'n:target co' ORDER BY txn_date, id LIMIT 1`).Scan(&infKey); err != nil {
+		t.Fatal(err)
+	}
 	f.exec(`INSERT INTO core.series_setting (series_key, recurring, entry_seq, entered_at) VALUES
-		('dd:nothing', 'ignore', 90, now()), ('inf:' || $1, 'confirm', 91, now())`, f.ids["mv_a"].String())
+		('dd:nothing', 'ignore', 90, now()), ($1, 'confirm', 91, now()), ('inf:' || $2, 'confirm', 94, now())`,
+		infKey, f.ids["mv_c_late"].String())
 	f.exec(`INSERT INTO core.category_name (category, name, entry_seq, entered_at) VALUES
 		('category_unused', 'Unused', 92, now()), ('cat_first', 'First Category', 93, now())`)
 	rows, err = f.q.Query(ctx, `SELECT rule_table, key, matches, last_match_date, problem, detail FROM agent.payee_rule_status`)
@@ -596,8 +607,9 @@ func TestCanonicalKeys(t *testing.T) {
 	for k, w := range map[string]string{
 		"payee_alias mg:never_seen": "no_match", "payee_setting n:nobody": "no_match",
 		"payee_setting mg:empty_target": "<nil>", "payee_setting n:target co": "<nil>",
-		"series_setting dd:nothing": "no_match", "series_setting inf:" + f.ids["mv_a"].String(): "<nil>",
-		"category_name category_unused": "no_match", "category_name cat_first": "<nil>",
+		"series_setting dd:nothing": "no_match", "series_setting " + infKey: "<nil>",
+		"series_setting inf:" + f.ids["mv_c_late"].String(): "no_match",
+		"category_name category_unused":                     "no_match", "category_name cat_first": "<nil>",
 	} {
 		if got := prob(k); got != w {
 			t.Errorf("rule status %s problem = %s, want %s", k, got, w)

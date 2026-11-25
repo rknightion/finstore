@@ -483,7 +483,8 @@ func TestTrueLayerEndToEnd(t *testing.T) {
 	}
 	for _, view := range []string{"accounts", "transactions", "transaction_history", "balances", "coverage", "sync_status",
 		"pot_transactions", "pot_reconciliation", "standing_orders", "direct_debits", "pending_transactions",
-		"account_scopes", "payee_keys", "cash_flows", "payees", "payee_years", "payee_rule_status"} {
+		"account_scopes", "payee_keys", "cash_flows", "payees", "payee_years", "payee_rule_status",
+		"recurring_payments", "upcoming_payments", "monthly_flows", "category_months", "anomalies"} {
 		if n := w.queryInt(`SELECT count(*) FROM agent.`+view+` x WHERE x::text LIKE '%' || $1 || '%'`, tlIdentity); n != 0 {
 			t.Errorf("agent.%s shows the account holder's identity in %d rows", view, n)
 		}
