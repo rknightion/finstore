@@ -11,6 +11,9 @@ golangci_lint_version := "v2.15.0"
 # renovate: datasource=go depName=golang.org/x/vuln
 govulncheck_version := "v1.10.0"
 golangci_lint_dir := tools_dir + "/golangci-lint-" + golangci_lint_version
+# renovate: datasource=go depName=github.com/k1LoW/tbls
+tbls_version := "v1.97.0"
+tbls_dir := tools_dir + "/tbls-" + tbls_version
 
 # List available recipes
 default:
@@ -82,9 +85,72 @@ build:
 vuln:
     go run golang.org/x/vuln/cmd/govulncheck@{{ govulncheck_version }} ./...
 
+# Regenerate the database schema docs (tbls) from a freshly migrated, empty throwaway database. Needs the PostgreSQL 18 server binaries (initdb, pg_ctl, postgres) on PATH.
+[group('gen')]
+[no-exit-message]
+schema-docs dest="docs/schema":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for bin in initdb pg_ctl postgres createdb; do
+        command -v "$bin" >/dev/null || { echo "schema-docs: $bin is not on PATH (PostgreSQL 18 server binaries are required)" >&2; exit 1; }
+    done
+    # A developer's PG* variables must not redirect the throwaway cluster or its utilities.
+    for name in $(compgen -e | grep '^PG' || true); do unset "$name"; done
+    mkdir -p {{ tbls_dir }}
+    test -x {{ tbls_dir }}/tbls || GOBIN={{ tbls_dir }} go install github.com/k1LoW/tbls@{{ tbls_version }}
+    work="$(mktemp -d)"
+    cleanup() { pg_ctl -D "$work/data" -m immediate -w stop >/dev/null 2>&1 || true; rm -rf "$work"; }
+    trap cleanup EXIT
+    go build -o "$work/finstore" ./cmd/finstore
+    # The cluster listens on loopback only, on a free port, with no Unix socket and trust
+    # authentication. The passwords are throwaway values for a database that is deleted at the end.
+    port=0
+    for _ in $(seq 1 100); do
+        candidate=$((20000 + RANDOM % 40000))
+        if ! (exec 3<>"/dev/tcp/127.0.0.1/$candidate") 2>/dev/null; then port="$candidate"; break; fi
+    done
+    test "$port" -ne 0 || { echo "schema-docs: no free port found" >&2; exit 1; }
+    initdb -D "$work/data" -A trust -U postgres --no-locale --encoding=UTF8 >/dev/null
+    pg_ctl -D "$work/data" -l "$work/server.log" -w -t 60 -o "-c listen_addresses=127.0.0.1 -c port=$port -c unix_socket_directories= -c fsync=off" start >/dev/null
+    createdb -h 127.0.0.1 -p "$port" -U postgres finstore
+    export FINSTORE_SUPERUSER_DATABASE_URL="postgresql://postgres@127.0.0.1:$port/finstore?sslmode=disable"
+    export FINSTORE_OWNER_DATABASE_URL="postgresql://finstore_owner:schemadocsowner1@127.0.0.1:$port/finstore?sslmode=disable"
+    export FINSTORE_OWNER_PASSWORD=schemadocsowner1 FINSTORE_APP_PASSWORD=schemadocsapp1
+    "$work/finstore" bootstrap </dev/null
+    "$work/finstore" migrate </dev/null
+    # tbls reads only the schemas on search_path, and splits the setting on ", ".
+    export TBLS_DSN="postgres://finstore_owner:schemadocsowner1@127.0.0.1:$port/finstore?sslmode=disable&search_path=raw,%20core,%20agent,%20sync,%20secret"
+    # Two passes: Mermaid diagrams inside the Markdown, and SVG files beside it. The SVG pass is
+    # only mined for its .svg files.
+    {{ tbls_dir }}/tbls doc --er-format svg --force --sort "$TBLS_DSN" "$work/svg" >/dev/null
+    {{ tbls_dir }}/tbls doc --er-format mermaid --force --sort --rm-dist "$TBLS_DSN" {{ quote(dest) }} >/dev/null
+    cp "$work"/svg/*.svg {{ quote(dest) }}/
+    # tbls lists every name it finds in a view definition (CTE names, LATERAL, unqualified tables)
+    # as a referenced table, with a link to a page that does not exist. Drop those rows: they are
+    # the ones with no columns and no type.
+    for page in {{ quote(dest) }}/*.md; do
+        sed -E '/^\| \[[^]]+\]\([^)]+\.md\) \| 0 \|  \|  \|$/d' "$page" > "$work/page.md"
+        mv "$work/page.md" "$page"
+    done
+    # The server version string names the build and platform; keep only the major version.
+    sed -E 's/"database_version": "[^"]*"/"database_version": "PostgreSQL 18"/' {{ quote(dest) }}/schema.json > "$work/schema.json"
+    mv "$work/schema.json" {{ quote(dest) }}/schema.json
+    echo "schema docs written to {{ dest }}"
+
+# Fail if docs/schema differs from what the current migrations and views produce. Needs the PostgreSQL 18 server binaries.
+[group('check')]
+[no-exit-message]
+schema-docs-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fresh="$(mktemp -d)"
+    trap 'rm -rf "$fresh"' EXIT
+    {{ just_executable() }} schema-docs "$fresh/schema" </dev/null
+    diff -r docs/schema "$fresh/schema" || { echo "docs/schema is out of date: run 'just schema-docs' and commit the result" >&2; exit 1; }
+
 # The pre-commit gate: everything that runs with the Go toolchain and PostgreSQL binaries
 [group('check')]
-check: fmt-check lint vet test tidy-check build vuln
+check: fmt-check lint vet test tidy-check schema-docs-check build vuln
 
 # Workstation feedback for Go edits since HEAD. Checks the working tree and its Go dependents.
 # Unclear scope, shared files, and an empty change set use the full gate. Commit gates use `just check`.

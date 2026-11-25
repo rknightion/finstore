@@ -1,0 +1,9 @@
+# tbls configuration for `just schema-docs` (see the justfile). The recipe supplies TBLS_DSN for a
+# throwaway database that `finstore bootstrap` and `finstore migrate` have just built, so the
+# output is structure only. The DSN's search_path lists every finstore schema, because tbls reads
+# only the schemas on it.
+dsn: ${TBLS_DSN}
+docPath: docs/schema
+name: finstore
+format:
+  sort: true
