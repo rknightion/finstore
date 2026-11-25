@@ -73,6 +73,7 @@ erDiagram
   text name
   date opened_on
   uuid parent_id
+  text scope
   text slug
   text source
   text source_key

@@ -1363,6 +1363,11 @@
           "nullable": true
         },
         {
+          "name": "scope",
+          "type": "text",
+          "nullable": true
+        },
+        {
           "name": "slug",
           "type": "text",
           "nullable": false
@@ -1497,6 +1502,16 @@
           "referenced_table": "",
           "columns": [
             "id"
+          ]
+        },
+        {
+          "name": "account_scope_check",
+          "type": "CHECK",
+          "def": "CHECK ((scope = ANY (ARRAY['personal'::text, 'joint'::text, 'business'::text])))",
+          "table": "core.account",
+          "referenced_table": "",
+          "columns": [
+            "scope"
           ]
         },
         {
@@ -1693,6 +1708,94 @@
           "referenced_table": "",
           "columns": [
             "raw_seq"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "core.category_name",
+      "type": "BASE TABLE",
+      "columns": [
+        {
+          "name": "category",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "entered_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "entry_seq",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "nullable": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "category_name_pkey",
+          "def": "CREATE UNIQUE INDEX category_name_pkey ON core.category_name USING btree (category)",
+          "table": "core.category_name",
+          "columns": [
+            "category"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "category_name_category_not_null",
+          "type": "n",
+          "def": "NOT NULL category",
+          "table": "core.category_name",
+          "referenced_table": "",
+          "columns": [
+            "category"
+          ]
+        },
+        {
+          "name": "category_name_entered_at_not_null",
+          "type": "n",
+          "def": "NOT NULL entered_at",
+          "table": "core.category_name",
+          "referenced_table": "",
+          "columns": [
+            "entered_at"
+          ]
+        },
+        {
+          "name": "category_name_entry_seq_not_null",
+          "type": "n",
+          "def": "NOT NULL entry_seq",
+          "table": "core.category_name",
+          "referenced_table": "",
+          "columns": [
+            "entry_seq"
+          ]
+        },
+        {
+          "name": "category_name_name_not_null",
+          "type": "n",
+          "def": "NOT NULL name",
+          "table": "core.category_name",
+          "referenced_table": "",
+          "columns": [
+            "name"
+          ]
+        },
+        {
+          "name": "category_name_pkey",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (category)",
+          "table": "core.category_name",
+          "referenced_table": "",
+          "columns": [
+            "category"
           ]
         }
       ]
@@ -3398,6 +3501,224 @@
       ]
     },
     {
+      "name": "core.payee_alias",
+      "type": "BASE TABLE",
+      "columns": [
+        {
+          "name": "entered_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "entry_seq",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "into_key",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "name_sample",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "payee_key",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "separate",
+          "type": "boolean",
+          "nullable": false,
+          "default": "false"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "payee_alias_pkey",
+          "def": "CREATE UNIQUE INDEX payee_alias_pkey ON core.payee_alias USING btree (payee_key)",
+          "table": "core.payee_alias",
+          "columns": [
+            "payee_key"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "payee_alias_check",
+          "type": "CHECK",
+          "def": "CHECK ((separate OR (into_key IS NOT NULL)))",
+          "table": "core.payee_alias",
+          "referenced_table": "",
+          "columns": [
+            "separate",
+            "into_key"
+          ]
+        },
+        {
+          "name": "payee_alias_entered_at_not_null",
+          "type": "n",
+          "def": "NOT NULL entered_at",
+          "table": "core.payee_alias",
+          "referenced_table": "",
+          "columns": [
+            "entered_at"
+          ]
+        },
+        {
+          "name": "payee_alias_entry_seq_not_null",
+          "type": "n",
+          "def": "NOT NULL entry_seq",
+          "table": "core.payee_alias",
+          "referenced_table": "",
+          "columns": [
+            "entry_seq"
+          ]
+        },
+        {
+          "name": "payee_alias_payee_key_not_null",
+          "type": "n",
+          "def": "NOT NULL payee_key",
+          "table": "core.payee_alias",
+          "referenced_table": "",
+          "columns": [
+            "payee_key"
+          ]
+        },
+        {
+          "name": "payee_alias_pkey",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (payee_key)",
+          "table": "core.payee_alias",
+          "referenced_table": "",
+          "columns": [
+            "payee_key"
+          ]
+        },
+        {
+          "name": "payee_alias_separate_not_null",
+          "type": "n",
+          "def": "NOT NULL separate",
+          "table": "core.payee_alias",
+          "referenced_table": "",
+          "columns": [
+            "separate"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "core.payee_setting",
+      "type": "BASE TABLE",
+      "columns": [
+        {
+          "name": "category",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "employer",
+          "type": "boolean",
+          "nullable": true
+        },
+        {
+          "name": "entered_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "entry_seq",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "flow_class",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "name_sample",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "payee_key",
+          "type": "text",
+          "nullable": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "payee_setting_pkey",
+          "def": "CREATE UNIQUE INDEX payee_setting_pkey ON core.payee_setting USING btree (payee_key)",
+          "table": "core.payee_setting",
+          "columns": [
+            "payee_key"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "payee_setting_entered_at_not_null",
+          "type": "n",
+          "def": "NOT NULL entered_at",
+          "table": "core.payee_setting",
+          "referenced_table": "",
+          "columns": [
+            "entered_at"
+          ]
+        },
+        {
+          "name": "payee_setting_entry_seq_not_null",
+          "type": "n",
+          "def": "NOT NULL entry_seq",
+          "table": "core.payee_setting",
+          "referenced_table": "",
+          "columns": [
+            "entry_seq"
+          ]
+        },
+        {
+          "name": "payee_setting_flow_class_check",
+          "type": "CHECK",
+          "def": "CHECK ((flow_class = ANY (ARRAY['internal'::text, 'scope_transfer'::text, 'own_external'::text, 'investment'::text, 'debt_repayment'::text, 'income'::text, 'refund'::text, 'spending'::text])))",
+          "table": "core.payee_setting",
+          "referenced_table": "",
+          "columns": [
+            "flow_class"
+          ]
+        },
+        {
+          "name": "payee_setting_payee_key_not_null",
+          "type": "n",
+          "def": "NOT NULL payee_key",
+          "table": "core.payee_setting",
+          "referenced_table": "",
+          "columns": [
+            "payee_key"
+          ]
+        },
+        {
+          "name": "payee_setting_pkey",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (payee_key)",
+          "table": "core.payee_setting",
+          "referenced_table": "",
+          "columns": [
+            "payee_key"
+          ]
+        }
+      ]
+    },
+    {
       "name": "core.pending_snapshot",
       "type": "BASE TABLE",
       "columns": [
@@ -4137,6 +4458,104 @@
           "referenced_table": "",
           "columns": [
             "running_sum_minor"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "core.series_setting",
+      "type": "BASE TABLE",
+      "columns": [
+        {
+          "name": "entered_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "entry_seq",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "recurring",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "series_key",
+          "type": "text",
+          "nullable": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "series_setting_pkey",
+          "def": "CREATE UNIQUE INDEX series_setting_pkey ON core.series_setting USING btree (series_key)",
+          "table": "core.series_setting",
+          "columns": [
+            "series_key"
+          ]
+        }
+      ],
+      "constraints": [
+        {
+          "name": "series_setting_entered_at_not_null",
+          "type": "n",
+          "def": "NOT NULL entered_at",
+          "table": "core.series_setting",
+          "referenced_table": "",
+          "columns": [
+            "entered_at"
+          ]
+        },
+        {
+          "name": "series_setting_entry_seq_not_null",
+          "type": "n",
+          "def": "NOT NULL entry_seq",
+          "table": "core.series_setting",
+          "referenced_table": "",
+          "columns": [
+            "entry_seq"
+          ]
+        },
+        {
+          "name": "series_setting_pkey",
+          "type": "PRIMARY KEY",
+          "def": "PRIMARY KEY (series_key)",
+          "table": "core.series_setting",
+          "referenced_table": "",
+          "columns": [
+            "series_key"
+          ]
+        },
+        {
+          "name": "series_setting_recurring_check",
+          "type": "CHECK",
+          "def": "CHECK ((recurring = ANY (ARRAY['confirm'::text, 'ignore'::text, 'not_recurring'::text])))",
+          "table": "core.series_setting",
+          "referenced_table": "",
+          "columns": [
+            "recurring"
+          ]
+        },
+        {
+          "name": "series_setting_recurring_not_null",
+          "type": "n",
+          "def": "NOT NULL recurring",
+          "table": "core.series_setting",
+          "referenced_table": "",
+          "columns": [
+            "recurring"
+          ]
+        },
+        {
+          "name": "series_setting_series_key_not_null",
+          "type": "n",
+          "def": "NOT NULL series_key",
+          "table": "core.series_setting",
+          "referenced_table": "",
+          "columns": [
+            "series_key"
           ]
         }
       ]
@@ -7386,6 +7805,12 @@
     }
   ],
   "functions": [
+    {
+      "name": "agent.normalise_payee_name",
+      "return_type": "text",
+      "arguments": "p_name text",
+      "type": "FUNCTION"
+    },
     {
       "name": "raw.json_body",
       "return_type": "jsonb",
