@@ -915,6 +915,10 @@ last check. Units and prices are `numeric`, because providers report them to sev
 These tables reach a live database through the normaliser revision, so upgrading to this version
 needs `finstore renormalise`.
 
+The insight views also add four `core` tables for the operator's rules (`payee_alias`,
+`payee_setting`, `series_setting` and `category_name`) and a `scope` column on `core.account`, so
+that release needs a `renormalise` too: see [The insights release](#the-insights-release).
+
 ### Reading the data
 
 There are four database roles. Three can log in: `finstore_owner` (migrations and `renormalise`),
@@ -1039,6 +1043,62 @@ tested in this order:
 `value_change_minor` is shown whenever both values are known. `tax_year` (such as `2025-26`) is set
 only on an interval of exactly one tax year, 6 April to 5 April. Sibling transfers count as flows of
 each account, so they cancel when a platform's children are added up.
+
+#### Insight views
+
+Eleven views classify the ledger so a reader can ask what was spent, on whom, and what recurs. They
+read `agent.transactions` and the operator's rules; they hold no data of their own. Amounts are
+pence, and every view carries a comment with its exact rules. The MCP tools `spending_summary`,
+`payees`, `cash_flow`, `recurring_payments` and `finance_profile` read them (see
+[The tools](#the-tools)).
+
+| View | One row per | Rules |
+|---|---|---|
+| `agent.account_scopes` | Account | The scope is the operator's setting, else a pot's parent scope, else `joint` or `business` from the account type, else `personal`. `scope_source` says which (`setting`, `parent`, `type`, `default`) |
+| `agent.payee_keys` | Payee key | How keys (`mg:` merchant group, `mu:` Monzo user, `n:` normalised name, `x:` scheme) resolve to a payee. Two `mg:` keys that share a most frequent merchant name merge by themselves; the other kinds never do. An operator merge or separation overrides. `merge_loop` flags a merge that cannot apply |
+| `agent.cash_flows` | Transaction that is not declined | The ledger row with its payee, its account scope and one flow class (below). Pending rows are included, so a reader decides about them. Everything else reads this view |
+| `agent.payees` | Payee and currency | Settled totals (lifetime and last 12 months), the key list, name variants, effective class and category, and the count of recurring series |
+| `agent.payee_years` | Payee, currency and calendar year | Money out and in, and the count, over every class |
+| `agent.payee_rule_status` | Operator rule row | How many transactions the rule matches today. `problem` is `no_match` (it names nothing that exists, an orphaned rule) or `merge_loop` |
+| `agent.recurring_payments` | Recurring series | Declared series (direct debit, standing order, provider subscription) and inferred ones, with cadence, typical amount, annual cost, next expected date, `status`, price changes and `confidence`. See the view comment for the grouping rules |
+| `agent.upcoming_payments` | Payment expected in the next 45 days | Standing orders on their own dates, then recurring series at the dates their cadence gives |
+| `agent.monthly_flows` | Month, scope, currency and status | Income, salary, refunds, spending, debt repayment and the other classes, as plain sums. Settled and pending rows are kept apart (filter `status = 'settled'` for settled figures). `savings_rate` is derived from them |
+| `agent.category_months` | Month, scope, currency and category | Settled spending only, by the effective category (the payee's setting, else the transaction's own) |
+| `agent.anomalies` | Flag on a settled transaction | `unusual_amount`, `possible_duplicate` and `new_large_payee`, with the figure each was compared with |
+
+A flow class says what a transaction is for. The first rule that applies wins; the full order is in
+the comment of `agent.cash_flows`.
+
+| `flow_class` | Meaning | Counted in spending |
+|---|---|---|
+| `spending` | Money out to a payee | Yes |
+| `income` | Money in that is not a refund | No (it is the income side) |
+| `refund` | A card credit, or money in the operator classed as a refund | No (it offsets spending) |
+| `debt_repayment` | An instalment loan payment, or a payee the operator classed so | No |
+| `investment` | Money to an investment payee, as the operator classed it | No |
+| `own_external` | Money to the account holder's own account at a bank finstore does not hold. Set by the operator (`payee class`) or by Monzo's send-to-self flag | No |
+| `scope_transfer` | A move between held accounts of different scopes | No |
+| `internal` | A pot transfer, a Flex move, or a move between held accounts of the same scope | No |
+
+**Corrections.** The rules are guesses, and a few transfers cannot be recognised from the data. The
+operator corrects them with `finstore payee merge`, `separate`, `rename`, `class`, `category` and
+`recurring`, `finstore category name`, and `finstore account scope`. Each is a kept operator entry
+(`payee_rule`, `category_name` or `account_scope`) in `raw`: append-only, never edited, and a later
+entry on the same thing wins. They apply to the whole history at once, not from the day they were
+entered, because the views read the rules at query time. They survive `renormalise`, which
+replays the entries from `raw`. `finstore payee clear` removes a rule by writing a clearing entry.
+After a correction, `finstore payee show --key K` prints the payee's state, and
+`agent.payee_rule_status` lists every rule with its match count: a rule with `problem` `no_match`
+is orphaned, for example because its key's transactions were merged under another name, and can be
+cleared. Run the commands while the service runs: they take the writer lock in turn.
+
+**`spending_summary` changed.** It reads `agent.cash_flows` now and counts the class `spending` for
+money out, and `income` and `refund` for money in. So pot transfers, moves between held accounts,
+investments and debt repayments no longer count, and a payee the operator classed `own_external`
+leaves the total. Pending transactions are no longer counted unless `include_pending` is true
+(they used to be). `flow_classes` chooses the classes by hand; `exclude_pot_transfers` is kept and
+ignored when `flow_classes` is given. A total from before the release will not match one after it,
+and the difference is the classification, not the data.
 
 ### Pending transactions
 
@@ -1362,6 +1422,33 @@ docker exec finstore-db psql -U postgres -d finstore -c '\copy core.reconciliati
 
 After `renormalise`, run both again and compare: transaction counts, dates and reconciliation states
 should match apart from what the release notes say changed.
+
+### The insights release
+
+The release that added the insight views raises the normaliser revision from 6 to 7, so it needs the
+steps above, with these specifics.
+
+1. Take a dump first (`deploy/finstore-dump.sh`).
+2. Stop the service, then run `renormalise --verify` with the new image. The live `core` still has
+   the old shape, so it reports `core.account` as a column difference (its rows are not compared)
+   and the four new rule tables (`payee_alias`, `payee_setting`, `series_setting` and
+   `category_name`) as present on one side only. Both are expected. Every other table must be
+   equal: any other difference is a regression, so stop and read it.
+3. Run `bootstrap`, then `migrate`, which says a `renormalise` is required, then `renormalise`, then
+   start the new image. `bootstrap` must run on this upgrade: it turns JIT off for the database
+   (JIT cost more than it saved on finstore's queries), which the insight views' budgets assume.
+   The setting takes effect for new connections, so the restart picks it up.
+4. Run `renormalise --verify` again. It must exit 0, with the new tables in its comparison.
+
+Corrections are entered after the deploy, so nothing changes in the first run beyond the
+`spending_summary` behaviour described under [Insight views](#insight-views).
+
+**Rollback.** The old image refuses to serve while the stored revision is 7. Either run `migrate`
+and `renormalise` with the old image, or restore the dump from step 1 (see [Restore](#restore)).
+The old image meets the new entry kinds (`payee_rule`, `category_name`, `account_scope`) as
+unknown entries: it counts and logs them, applies none and leaves them in `raw`. So a rollback
+loses the effect of the corrections, never the corrections, and upgrading again and running
+`renormalise` applies them. The function `agent.normalise_payee_name` stays behind; it does no harm.
 
 ## Telemetry
 
