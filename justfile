@@ -114,12 +114,13 @@ schema-docs dest="docs/schema":
     pg_ctl -D "$work/data" -l "$work/server.log" -w -t 60 -o "-c listen_addresses=127.0.0.1 -c port=$port -c unix_socket_directories= -c fsync=off" start >/dev/null
     createdb -h 127.0.0.1 -p "$port" -U postgres finstore
     export FINSTORE_SUPERUSER_DATABASE_URL="postgresql://postgres@127.0.0.1:$port/finstore?sslmode=disable"
-    export FINSTORE_OWNER_DATABASE_URL="postgresql://finstore_owner:schemadocsowner1@127.0.0.1:$port/finstore?sslmode=disable"
-    export FINSTORE_OWNER_PASSWORD=schemadocsowner1 FINSTORE_APP_PASSWORD=schemadocsapp1
+    owner_pw=schemadocsowner1
+    export FINSTORE_OWNER_DATABASE_URL="postgresql://finstore_owner:${owner_pw}@127.0.0.1:$port/finstore?sslmode=disable"
+    export FINSTORE_OWNER_PASSWORD="$owner_pw" FINSTORE_APP_PASSWORD=schemadocsapp1
     "$work/finstore" bootstrap </dev/null
     "$work/finstore" migrate </dev/null
     # tbls reads only the schemas on search_path, and splits the setting on ", ".
-    export TBLS_DSN="postgres://finstore_owner:schemadocsowner1@127.0.0.1:$port/finstore?sslmode=disable&search_path=raw,%20core,%20agent,%20sync,%20secret"
+    export TBLS_DSN="postgres://finstore_owner:${owner_pw}@127.0.0.1:$port/finstore?sslmode=disable&search_path=raw,%20core,%20agent,%20sync,%20secret"
     # Two passes: Mermaid diagrams inside the Markdown, and SVG files beside it. The SVG pass is
     # only mined for its .svg files.
     {{ tbls_dir }}/tbls doc --er-format svg --force --sort "$TBLS_DSN" "$work/svg" >/dev/null
