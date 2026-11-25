@@ -108,7 +108,7 @@ type AccountScope struct {
 // need not exist yet.
 func ValidatePayeeKey(key string) error {
 	if !payeeKeyPattern.MatchString(key) {
-		return fmt.Errorf("%q is not a payee key: it must be mg:, mu:, n: or x: followed by an identifier", key)
+		return errors.New("not a payee key: it must be mg:, mu:, n: or x: followed by an identifier")
 	}
 	return nil
 }
@@ -116,7 +116,7 @@ func ValidatePayeeKey(key string) error {
 // ValidateSeriesKey reports whether key matches the series key grammar ^(dd|so|sub|inf):.+$.
 func ValidateSeriesKey(key string) error {
 	if !seriesKeyPattern.MatchString(key) {
-		return fmt.Errorf("%q is not a series key: it must be dd:, so:, sub: or inf: followed by an identifier", key)
+		return errors.New("not a series key: it must be dd:, so:, sub: or inf: followed by an identifier")
 	}
 	return nil
 }
@@ -312,8 +312,14 @@ func (a *applier) clearRule(ctx context.Context, p PayeeRule, seq int64, at time
 			return err
 		}
 		if p.Clears == ClearMerge {
+			if row.IntoKey == nil {
+				return nil
+			}
 			row.IntoKey = nil
 		} else {
+			if !row.Separate {
+				return nil
+			}
 			row.Separate = false
 		}
 		if !row.Separate && row.IntoKey == nil {
@@ -331,10 +337,19 @@ func (a *applier) clearRule(ctx context.Context, p PayeeRule, seq int64, at time
 	}
 	switch p.Clears {
 	case ClearName:
+		if row.Name == nil {
+			return nil
+		}
 		row.Name = nil
 	case ClearClass:
+		if row.FlowClass == nil && row.Employer == nil {
+			return nil
+		}
 		row.FlowClass, row.Employer = nil, nil
 	case ClearCategory:
+		if row.Category == nil {
+			return nil
+		}
 		row.Category = nil
 	}
 	if row.Name == nil && row.FlowClass == nil && row.Employer == nil && row.Category == nil {

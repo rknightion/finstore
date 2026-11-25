@@ -12,6 +12,23 @@ import (
 	"github.com/rknightion/finstore/internal/store"
 )
 
+func TestRefusalsDoNotEchoTheirInput(t *testing.T) {
+	secret := "Made Up Person 12"
+	for _, err := range []error{
+		ledger.ValidatePayeeRule(ledger.PayeeRule{Action: "separate", PayeeKey: secret}),
+		ledger.ValidatePayeeRule(ledger.PayeeRule{Action: "merge", PayeeKey: "n:acme", IntoKey: secret}),
+		ledger.ValidatePayeeRule(ledger.PayeeRule{Action: "recurring", SeriesKey: "n:" + secret, Recurring: "confirm"}),
+		ledger.ValidatePayeeRule(ledger.PayeeRule{Action: "clear", SeriesKey: secret, Clears: "recurring"}),
+	} {
+		if err == nil {
+			t.Fatal("refusal expected")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("refusal echoes its input: %v", err)
+		}
+	}
+}
+
 func TestValidatePayeeRule(t *testing.T) {
 	long := strings.Repeat("a", 3)
 	cases := []struct {
@@ -226,6 +243,23 @@ func TestSeparateWithMergeOnOneKeyAndEachClear(t *testing.T) {
 	e.rule(ledger.PayeeRule{Action: "rename", PayeeKey: sk, Name: ptr("Made Up")})
 	e.rule(ledger.PayeeRule{Action: "class", PayeeKey: sk, FlowClass: "income", Employer: true})
 	e.rule(ledger.PayeeRule{Action: "category", PayeeKey: sk, Category: "salary"})
+	// A clear of something already unset changes nothing, not even entry_seq.
+	e.rule(ledger.PayeeRule{Action: "rename", PayeeKey: "mg:grp_8", Name: ptr("Other")})
+	before, _ := e.core().GetPayeeSetting(ctx, "mg:grp_8")
+	e.rule(ledger.PayeeRule{Action: "clear", PayeeKey: "mg:grp_8", Clears: "category"})
+	e.rule(ledger.PayeeRule{Action: "clear", PayeeKey: "mg:grp_8", Clears: "class"})
+	after, _ := e.core().GetPayeeSetting(ctx, "mg:grp_8")
+	if after.EntrySeq != before.EntrySeq || !after.EnteredAt.Equal(before.EnteredAt) {
+		t.Fatalf("no-op clear changed the row: %+v -> %+v", before, after)
+	}
+	e.rule(ledger.PayeeRule{Action: "separate", PayeeKey: "n:made up other"})
+	beforeA, _ := e.core().GetPayeeAlias(ctx, "n:made up other")
+	e.rule(ledger.PayeeRule{Action: "clear", PayeeKey: "n:made up other", Clears: "merge"})
+	afterA, _ := e.core().GetPayeeAlias(ctx, "n:made up other")
+	if afterA.EntrySeq != beforeA.EntrySeq {
+		t.Fatalf("no-op merge clear changed the alias: %+v -> %+v", beforeA, afterA)
+	}
+
 	e.rule(ledger.PayeeRule{Action: "clear", PayeeKey: sk, Clears: "class"})
 	s, err := e.core().GetPayeeSetting(ctx, sk)
 	if err != nil || s.FlowClass != nil || s.Employer != nil || s.Name == nil || s.Category == nil {
