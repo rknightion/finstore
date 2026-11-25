@@ -115,15 +115,16 @@ func TestUpsertAccountReadsAndKeepsScope(t *testing.T) {
 	}
 }
 
-// A database built by revision 6, so with no payee function and no insight tables, migrates to
+// A database built by revision 6, so with no payee function, insight tables or insight views (the CASCADE
+// drops the views that read them), migrates to
 // "renormalise required" without error, leaves the function absent, and the swap then creates it.
 func TestMigrateOverRevisionSixWithoutTheFunction(t *testing.T) {
 	c := newCluster(t)
 	ctx := context.Background()
 	owner := openStore(t, c.owner)
-	if _, err := owner.DB().Exec(ctx, `DROP FUNCTION agent.normalise_payee_name(text);
-		DROP TABLE core.payee_alias, core.payee_setting, core.series_setting, core.category_name;
-		ALTER TABLE core.account DROP COLUMN scope;
+	if _, err := owner.DB().Exec(ctx, `DROP FUNCTION agent.normalise_payee_name(text) CASCADE;
+		DROP TABLE core.payee_alias, core.payee_setting, core.series_setting, core.category_name CASCADE;
+		ALTER TABLE core.account DROP COLUMN scope CASCADE;
 		UPDATE core.projection_state SET normaliser_rev = 6`); err != nil {
 		t.Fatal(err)
 	}
