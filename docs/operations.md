@@ -819,7 +819,7 @@ current balances.
 
 | Command | Database role | Behaviour |
 |---|---|---|
-| `finstore bootstrap` | superuser | Creates the four roles (`finstore_owner` and `finstore_app` with their passwords, and `finstore_agent` and `finstore_mcp`, which start with no login), sets the settings of `finstore_mcp`, gives `finstore_mcp` its login and password when `FINSTORE_MCP_PASSWORD` is set (and takes them away when it is not), revokes `TEMPORARY` on the database from every role but the owner, warns on stderr when `finstore_mcp` had changed its own settings (and resets them), and creates the schemas. Safe to run again. Run it before `migrate` |
+| `finstore bootstrap` | superuser | Creates the four roles (`finstore_owner` and `finstore_app` with their passwords, and `finstore_agent` and `finstore_mcp`, which start with no login), sets the settings of `finstore_mcp`, gives `finstore_mcp` its login and password when `FINSTORE_MCP_PASSWORD` is set (and takes them away when it is not), revokes `TEMPORARY` on the database from every role but the owner, turns off JIT for the database (JIT compilation cost more than it saved on finstore's queries), warns on stderr when `finstore_mcp` had changed its own settings (and resets them), and creates the schemas. Safe to run again. Run it before `migrate` |
 | `finstore migrate` | owner | Applies the migrations and the grants. Says so when a `renormalise` is required |
 | `finstore serve` | app | The HTTP server, the scheduler, the Monzo worker and, when TrueLayer is configured, the two TrueLayer workers |
 | `finstore account add`, `finstore account list` | app | Create and list file-fed accounts |
