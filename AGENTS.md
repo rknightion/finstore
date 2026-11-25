@@ -45,6 +45,9 @@ file such as `ROADMAP.md` beside them.
   outside the repository.
 - **Logging is by allow-list.** `internal/semconv` lists the fields a log line may carry and the
   log handler drops the rest. Add a field there, deliberately, or do not log it.
+- **MCP tools read the insight views.** They never restate the views' logic in tool SQL. A change to
+  classification (payees, flow classes, scopes, recurring series) belongs in
+  `internal/store/insight_views.sql`.
 - **Fixtures are written by hand.** A fixture matches the documented shape of an API response or a
   statement, or of a provider's export, capture or document, and holds made-up values. Never
   derive one from a real response, file or page, redacted or not.

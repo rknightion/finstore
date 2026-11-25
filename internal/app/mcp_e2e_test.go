@@ -493,3 +493,132 @@ func TestServeRefusesAnUnreachableMCPDatabase(t *testing.T) {
 		t.Errorf("serve started (%v) or exited %d, want exit %d", s != nil, code, app.ExitError)
 	}
 }
+
+// Insights AC3: the operator's corrections, run through the app's command functions while serve is
+// running, change what the MCP tools read. A payee classed own_external leaves spending, two keys
+// merged are one payee, and a scope change moves a month's figures to the other scope. Every name
+// and amount is made up.
+func TestMCPToolsSeeOperatorCorrections(t *testing.T) {
+	w, cfg := mcpConfig(t, telemetrytest.New(t))
+	cfg.OTLPEndpoint = ""
+	srv := w.fake.Start()
+	t.Cleanup(srv.Close)
+	cfg.MonzoAPIURL = srv.URL
+	w.cfg = cfg
+	now := w.fake.Now()
+	w.fake.AddAccount(monzotest.Account{ID: accountID, Type: "uk_retail", Description: "made-up", Created: now.AddDate(0, 0, -150)})
+	// Three settled payments in the last complete month, under three raw names and no merchant, so
+	// each name is its own payee key.
+	month := time.Date(now.Year(), now.Month(), 1, 12, 0, 0, 0, time.UTC).AddDate(0, -1, 0)
+	for i, p := range []struct {
+		name   string
+		amount int64
+	}{{"Cafe Alpha", -1500}, {"Alpha Coffee House", -500}, {"Quiet Transfer", -2000}} {
+		at := month.AddDate(0, 0, 10+i)
+		w.fake.AddTransaction(monzotest.Transaction{AccountID: accountID, Created: at, Amount: p.amount,
+			Description: p.name, Settled: at.Format(time.RFC3339Nano)})
+	}
+	label := month.Format("2006-01")
+	from, to := month.Format(time.DateOnly), month.AddDate(0, 1, -1).Format(time.DateOnly)
+
+	s := startServe(t, cfg, w, true)
+	connectMonzo(t, s, w)
+	cs, err := mcpSession(t, s.addr, map[string]string{"Tailscale-App-Capabilities": mcpGrant})
+	if err != nil {
+		t.Fatalf("connect: %v\n%s", err, s.stderr.String())
+	}
+	call := func(tool string, args map[string]any, out any) {
+		t.Helper()
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: tool, Arguments: args})
+		if err != nil {
+			t.Fatalf("%s: %v", tool, err)
+		}
+		structured(t, res, out)
+	}
+	summary := func() map[string]mcpserver.SummaryGroup {
+		t.Helper()
+		var sum mcpserver.SummaryOutput
+		call("spending_summary", map[string]any{"from": from, "to": to, "group_by": "payee"}, &sum)
+		by := map[string]mcpserver.SummaryGroup{}
+		for _, g := range sum.Groups {
+			by[g.Key] = g
+		}
+		return by
+	}
+	payees := func() map[string]mcpserver.PayeeRow {
+		t.Helper()
+		var out mcpserver.PayeesOutput
+		call("payees", map[string]any{}, &out)
+		by := map[string]mcpserver.PayeeRow{}
+		for _, p := range out.Payees {
+			by[p.PayeeName] = p
+		}
+		return by
+	}
+	months := func() map[string]mcpserver.MonthFlow {
+		t.Helper()
+		var out mcpserver.CashFlowOutput
+		call("cash_flow", map[string]any{"from_month": label, "to_month": label}, &out)
+		by := map[string]mcpserver.MonthFlow{}
+		for _, m := range out.Months {
+			by[m.Scope] = m
+		}
+		return by
+	}
+
+	// Before any correction every payee is spending in the personal scope.
+	if g := summary(); len(g) != 3 || g["Quiet Transfer"].TotalMinor != 2000 || g["Cafe Alpha"].TotalMinor != 1500 || g["Alpha Coffee House"].TotalMinor != 500 {
+		t.Fatalf("summary before = %+v", g)
+	}
+	if p := payees(); len(p) != 3 || len(p["Cafe Alpha"].Keys) != 1 {
+		t.Fatalf("payees before = %+v", p)
+	}
+	if m := months(); len(m) != 1 || m["personal"].SpendingMinor != 4000 {
+		t.Fatalf("months before = %+v", m)
+	}
+
+	run := func(name string, fn func(ctx context.Context, e app.Env) int) {
+		t.Helper()
+		if code, out := w.command(nil, fn); code != app.ExitOK {
+			t.Fatalf("%s exit %d: %s\n%s", name, code, w.stderr.String(), out)
+		}
+	}
+	before := payees()
+	transfer, alpha, alphaLtd := before["Quiet Transfer"].PayeeID, before["Cafe Alpha"].PayeeID, before["Alpha Coffee House"].PayeeID
+	run("payee class", func(ctx context.Context, e app.Env) int {
+		return app.PayeeClass(ctx, e, transfer, "own_external", false)
+	})
+	run("payee merge", func(ctx context.Context, e app.Env) int { return app.PayeeMerge(ctx, e, alphaLtd, alpha) })
+	scope := "joint"
+	run("account scope", func(ctx context.Context, e app.Env) int { return app.AccountScope(ctx, e, "monzo-current", &scope) })
+
+	// The payee leaves spending, the two keys read as one payee, and the month moved to joint.
+	g := summary()
+	if _, ok := g["Quiet Transfer"]; ok || len(g) != 1 {
+		t.Errorf("summary after = %+v, want only the merged payee", g)
+	}
+	for _, v := range g {
+		if v.TotalMinor != 2000 || v.Count != 2 {
+			t.Errorf("merged payee in the summary = %+v, want 2000 over 2 payments", v)
+		}
+	}
+	p := payees()
+	if len(p) != 2 {
+		t.Fatalf("payees after = %+v, want 2", p)
+	}
+	for name, row := range p {
+		if row.PayeeID == transfer {
+			if row.FlowClass == nil || *row.FlowClass != "own_external" || row.OutMinor != 2000 {
+				t.Errorf("%s = %+v, want class own_external and 2000 out", name, row)
+			}
+			continue
+		}
+		if len(row.Keys) != 2 || row.OutMinor != 2000 || row.TxnCount != 2 {
+			t.Errorf("%s = %+v, want two keys, 2000 out over 2 payments", name, row)
+		}
+	}
+	m := months()
+	if len(m) != 1 || m["joint"].SpendingMinor != 2000 || m["joint"].OwnExternalOutMinor != 2000 {
+		t.Errorf("months after = %+v, want joint with 2000 spending and 2000 own_external out", m)
+	}
+}
