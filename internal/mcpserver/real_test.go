@@ -196,6 +196,85 @@ func TestRealReaderAnswersEveryTool(t *testing.T) {
 		}
 	})
 
+	t.Run("summary reads the flow classes", func(t *testing.T) {
+		var out SummaryOutput
+		base := map[string]any{"from": "2030-03-01", "to": "2030-03-31", "group_by": "payee"}
+		with := func(extra map[string]any) map[string]any {
+			m := map[string]any{}
+			for k, v := range base {
+				m[k] = v
+			}
+			for k, v := range extra {
+				m[k] = v
+			}
+			return m
+		}
+		decode(t, r.call(semconv.MCPToolSpendingSummary, base), &out)
+		if len(out.Groups) != 2 || out.Groups[0].Key != "Shop" || out.Groups[0].TotalMinor != 1250 || out.Groups[1].Key != "Beans" || out.Groups[1].TotalMinor != 450 {
+			t.Errorf("payee summary = %+v", out.Groups)
+		}
+		decode(t, r.call(semconv.MCPToolSpendingSummary, with(map[string]any{"direction": "in"})), &out)
+		if len(out.Groups) != 2 {
+			t.Errorf("payee summary in = %+v", out.Groups)
+		}
+		// A class nothing has: nothing counts. Pending rows and pot transfers change nothing here.
+		decode(t, r.call(semconv.MCPToolSpendingSummary, with(map[string]any{"flow_classes": []string{"investment"}, "include_pending": true, "exclude_pot_transfers": false})), &out)
+		if len(out.Groups) != 0 || out.Groups == nil {
+			t.Errorf("investment summary = %+v, want an empty list", out.Groups)
+		}
+		decode(t, r.call(semconv.MCPToolSpendingSummary, with(map[string]any{"group_by": "category"})), &out)
+		if len(out.Groups) != 2 || out.Groups[0].Key != "groceries" || out.Groups[1].Key != "eating_out" {
+			t.Errorf("category summary = %+v", out.Groups)
+		}
+	})
+	t.Run("recurring_payments", func(t *testing.T) {
+		var out RecurringPaymentsOutput
+		decode(t, r.call(semconv.MCPToolRecurringPayments, map[string]any{}), &out)
+		if out.Series == nil || out.AnnualCostTotal == nil || len(out.Series) != 0 || out.Truncated {
+			t.Errorf("recurring = %+v, want empty lists", out)
+		}
+	})
+	t.Run("payees", func(t *testing.T) {
+		var out PayeesOutput
+		decode(t, r.call(semconv.MCPToolPayees, map[string]any{}), &out)
+		if len(out.Payees) < 3 || out.Truncated || out.Payees[0].PayeeName != "Shop" || out.Payees[0].OutMinor != 1250 ||
+			out.Payees[0].Currency != "GBP" || len(out.Payees[0].Years) != 1 || out.Payees[0].Years[0].Year != 2030 {
+			t.Errorf("payees = %+v", out)
+		}
+		decode(t, r.call(semconv.MCPToolPayees, map[string]any{"query": "BEANS", "from": "2030-03-01", "to": "2030-03-01"}), &out)
+		if len(out.Payees) != 1 || out.Payees[0].PayeeName != "Beans" || out.Payees[0].OutMinor != 450 || out.Payees[0].TxnCount != 1 {
+			t.Errorf("payees in a range = %+v", out)
+		}
+		decode(t, r.call(semconv.MCPToolPayees, map[string]any{"limit": 1}), &out)
+		if len(out.Payees) != 1 || !out.Truncated {
+			t.Errorf("payees limit 1 = %+v", out)
+		}
+	})
+	t.Run("cash_flow", func(t *testing.T) {
+		var out CashFlowOutput
+		// The fixture is dated 2030: the default range (the last 12 complete months) holds none of it.
+		decode(t, r.call(semconv.MCPToolCashFlow, map[string]any{}), &out)
+		if len(out.Months) != 0 || out.Months == nil || out.Categories == nil || out.Upcoming == nil {
+			t.Errorf("default range = %+v", out)
+		}
+		decode(t, r.call(semconv.MCPToolCashFlow, map[string]any{"from_month": "2030-03", "to_month": "2030-03", "scopes": []string{"personal"}, "category_limit": 1}), &out)
+		if len(out.Months) != 2 || out.Months[0].Currency != "EUR" || out.Months[0].IncomeMinor != 2000 || out.Months[1].Currency != "GBP" ||
+			out.Months[1].IncomeMinor != 100000 || out.Months[1].SpendingMinor != 1700 || out.Months[1].NetMinor != 98300 ||
+			len(out.Categories) != 1 || out.Categories[0].SpendingMinor != 1250 || out.Truncated {
+			t.Errorf("cash flow = %+v", out)
+		}
+	})
+	t.Run("finance_profile", func(t *testing.T) {
+		var out FinanceProfileOutput
+		decode(t, r.call(semconv.MCPToolFinanceProfile, map[string]any{}), &out)
+		if out.Span.FirstDate == nil || *out.Span.FirstDate != "2030-03-01" || *out.Span.LastDate != "2030-03-04" || len(out.Accounts) != 1 ||
+			out.Accounts[0].Slug != "uk_retail" || out.Accounts[0].Scope != "personal" || out.Accounts[0].ScopeSource != "default" ||
+			out.SalaryDay != nil || len(out.ToCorrect.UnclassifiedSpending) != 1 || out.ToCorrect.UnclassifiedSpending[0].Count != 2 ||
+			out.ToCorrect.UnclassifiedSpending[0].AmountMinor != 1700 || out.Truncated {
+			t.Errorf("finance profile = %+v", out)
+		}
+	})
+
 	// Every call above was observed, none as anything but ok.
 	for k := range r.counts() {
 		if !strings.Contains(k, "/ok/") {
@@ -297,4 +376,26 @@ func TestRealReaderStatementTimeoutIsATimeout(t *testing.T) {
 		t.Fatalf("result %v after %v, want an error near the 15 s statement timeout", res.IsError, took)
 	}
 	r.onlyCall(semconv.MCPToolQuerySQL, semconv.MCPOutcomeTimeout, semconv.MCPClientUnknown)
+}
+
+// The insight tools refuse invalid input as invalid, in one line, whichever layer notices (the
+// store's own checks are tested in package store).
+func TestRealReaderInsightToolsRefuseInvalidInput(t *testing.T) {
+	r := newRealRig(t, newRealCluster(t))
+	for tool, args := range map[string]map[string]any{
+		semconv.MCPToolRecurringPayments: {"status": []string{"gone"}},
+		semconv.MCPToolPayees:            {"sort": "alphabet"},
+		semconv.MCPToolCashFlow:          {"from_month": "2030-13"},
+		semconv.MCPToolSpendingSummary:   {"from": "2030-01-01", "to": "2030-01-02", "group_by": "payee", "flow_classes": []string{"pocket"}},
+	} {
+		res := r.call(tool, args)
+		if !res.IsError || strings.Contains(resultText(res), "\n") || resultText(res) == "" {
+			t.Errorf("%s: result = %v %q, want a one-line error", tool, res.IsError, resultText(res))
+		}
+	}
+	if counts := r.counts(); counts["recurring_payments/invalid/"+semconv.MCPClientUnknown] != 1 ||
+		counts["payees/invalid/"+semconv.MCPClientUnknown] != 1 || counts["cash_flow/invalid/"+semconv.MCPClientUnknown] != 1 ||
+		counts["spending_summary/invalid/"+semconv.MCPClientUnknown] != 1 {
+		t.Errorf("counter = %v", counts)
+	}
 }

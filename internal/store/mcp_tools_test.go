@@ -466,6 +466,7 @@ func TestSpendingSummaryRefusesBadInput(t *testing.T) {
 		"bad date":         {GroupBy: store.GroupMonth, From: "yesterday"},
 		"bad slug":         {GroupBy: store.GroupMonth, Accounts: []string{"NOT A SLUG"}},
 		"limit":            {GroupBy: store.GroupMonth, Limit: store.CuratedMaxLimit + 1},
+		"flow class":       {GroupBy: store.GroupPayee, FlowClasses: []string{"spendin"}},
 	} {
 		_, _, err := f.r.SpendingSummary(context.Background(), p)
 		if !errors.Is(err, store.ErrInvalid) || store.Outcome(err) != store.OutcomeInvalid {

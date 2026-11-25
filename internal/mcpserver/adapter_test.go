@@ -31,6 +31,15 @@ type fakeStore struct {
 	portfolio func(store.PortfolioParams) ([]store.PortfolioAccount, bool, error)
 	pension   func(store.PensionSummaryParams) (store.PensionSummary, bool, error)
 
+	recurring func(store.RecurringParams) (store.Recurring, bool, error)
+	payees    func(store.PayeesParams) ([]store.PayeeRow, bool, error)
+	cashFlow  func(store.CashFlowParams) (store.CashFlow, bool, error)
+	profile   func(store.FinanceProfileParams) (store.FinanceProfile, bool, error)
+
+	gotRecurring store.RecurringParams
+	gotPayees    store.PayeesParams
+	gotCashFlow  store.CashFlowParams
+	gotProfile   store.FinanceProfileParams
 	gotSearch    store.SearchParams
 	gotSummary   store.SummaryParams
 	gotLimits    store.Limits
@@ -67,6 +76,165 @@ func (f *fakeStore) PensionSummary(_ context.Context, p store.PensionSummaryPara
 		return store.PensionSummary{}, false, nil
 	}
 	return f.pension(p)
+}
+
+func (f *fakeStore) RecurringPayments(_ context.Context, p store.RecurringParams) (store.Recurring, bool, error) {
+	f.gotRecurring = p
+	if f.recurring == nil {
+		return store.Recurring{}, false, nil
+	}
+	return f.recurring(p)
+}
+func (f *fakeStore) Payees(_ context.Context, p store.PayeesParams) ([]store.PayeeRow, bool, error) {
+	f.gotPayees = p
+	if f.payees == nil {
+		return nil, false, nil
+	}
+	return f.payees(p)
+}
+func (f *fakeStore) CashFlow(_ context.Context, p store.CashFlowParams) (store.CashFlow, bool, error) {
+	f.gotCashFlow = p
+	if f.cashFlow == nil {
+		return store.CashFlow{}, false, nil
+	}
+	return f.cashFlow(p)
+}
+func (f *fakeStore) FinanceProfile(_ context.Context, p store.FinanceProfileParams) (store.FinanceProfile, bool, error) {
+	f.gotProfile = p
+	if f.profile == nil {
+		return store.FinanceProfile{}, false, nil
+	}
+	return f.profile(p)
+}
+
+// The adapter passes the four insight tools' parameters to the store and maps every field of their
+// rows. All values are made up.
+func TestAdapterMapsTheInsightTools(t *testing.T) {
+	str := func(s string) *string { return &s }
+	i64 := func(n int64) *int64 { return &n }
+	rate := 0.25
+	yes := true
+	f := &fakeStore{
+		summary: func(store.SummaryParams) ([]store.SummaryGroup, bool, error) { return nil, false, nil },
+		recurring: func(store.RecurringParams) (store.Recurring, bool, error) {
+			return store.Recurring{
+				Series: []store.RecurringSeries{{SeriesKey: "inf:1", PayeeID: "n:x", PayeeName: "X", Evidence: "inferred", Cadence: "monthly",
+					AmountKind: "variable", Occurrences: 6, FirstDate: "2030-01-01", LastDate: "2030-06-01", LastAmountMinor: 11,
+					TypicalAmountMinor: 10, Currency: "GBP", AnnualCostMinor: i64(120), NextExpectedDate: str("2030-07-01"), Status: "due",
+					PriceChanges: []store.PriceChange{{Date: "2030-03-01", FromMinor: 9, ToMinor: 10}}, Change12mMinor: i64(2),
+					FlowClass: "spending", Category: str("k"), CategoryName: str("K"), AccountSlugs: []string{"a", "b"},
+					OperatorState: str("confirmed"), Confidence: "medium"}},
+				AnnualCostTotal: []store.AnnualCostTotal{{Currency: "GBP", TotalMinor: 120}},
+			}, true, nil
+		},
+		payees: func(store.PayeesParams) ([]store.PayeeRow, bool, error) {
+			return []store.PayeeRow{{PayeeID: "n:x", PayeeName: "X", Currency: "GBP", FlowClass: str("income"), Category: str("k"),
+				CategoryName: str("K"), Employer: &yes, FirstDate: "2030-01-01", LastDate: "2030-02-01", TxnCount: 3, OutMinor: 4, InMinor: 5,
+				Keys: []string{"n:x", "mg:1"}, NameVariants: []string{"X", "x ltd"},
+				Years: []store.PayeeYear{{Year: 2030, OutMinor: 4, InMinor: 5, TxnCount: 3}}}}, false, nil
+		},
+		cashFlow: func(store.CashFlowParams) (store.CashFlow, bool, error) {
+			return store.CashFlow{
+				Months: []store.MonthFlow{{Month: "2030-03", Scope: "joint", Currency: "GBP", IncomeMinor: 1, SalaryMinor: 2, RefundMinor: 3,
+					SpendingMinor: 4, DebtRepaymentMinor: 5, InvestmentOutMinor: 6, InvestmentInMinor: 7, OwnExternalOutMinor: 8,
+					OwnExternalInMinor: 9, ScopeTransferOutMinor: 10, ScopeTransferInMinor: 11, InternalOutMinor: 12, InternalInMinor: 13,
+					NetMinor: 14, SavingsRate: &rate}},
+				Categories: []store.CategoryMonth{{Month: "2030-03", Scope: "joint", Currency: "GBP", Category: str("k"), CategoryName: str("K"),
+					SpendingMinor: 4, TxnCount: 2}},
+				Upcoming: []store.UpcomingPayment{{Date: "2030-04-01", PayeeID: str("n:x"), PayeeName: "X", AmountMinor: 7, Currency: "GBP",
+					Source: "inferred", SeriesKey: str("inf:1"), AccountSlug: str("a")}},
+			}, true, nil
+		},
+		profile: func(store.FinanceProfileParams) (store.FinanceProfile, bool, error) {
+			return store.FinanceProfile{
+				Span:           store.ProfileSpan{FirstDate: str("2030-01-01"), LastDate: str("2030-06-01")},
+				Accounts:       []store.ProfileAccount{{Slug: "a", Source: "monzo", Scope: "personal", ScopeSource: "default"}},
+				MonthlyMedians: []store.ProfileMedian{{Scope: "personal", Currency: "GBP", IncomeMinor: 1, SalaryMinor: 2, SpendingMinor: 3, SavingsRate: &rate}},
+				SalaryDay:      i64(25),
+				Recurring:      []store.ProfileRecurring{{Evidence: "inferred", Currency: "GBP", Count: 2, AnnualCostMinor: 3}},
+				TopPayees:      []store.ProfilePayee{{PayeeID: "n:x", PayeeName: "X", Currency: "GBP", SpendingMinor: 9}},
+				TopSeries:      []store.ProfileSeries{{SeriesKey: "inf:1", PayeeName: "X", Currency: "GBP", AnnualCostMinor: 8}},
+				Anomalies90d:   []store.ProfileAnomalyCount{{Kind: "possible_duplicate", Count: 2}},
+				ToCorrect: store.ProfileToCorrect{UnnamedCategories: []string{"category_1"},
+					UnclassifiedSpending:    []store.ProfileUnclassified{{Currency: "GBP", Count: 3, AmountMinor: 4}},
+					UnclassifiedOBTransfers: 5, UnpairedCardCredits: 6, RuleProblems: 7},
+			}, false, nil
+		},
+	}
+	r := adapterRig(t, f)
+
+	var rec RecurringPaymentsOutput
+	decode(t, r.call(semconv.MCPToolRecurringPayments, map[string]any{"status": []string{"due"}, "include_ignored": true,
+		"changed_only": true, "query": "x", "sort": "change_12m", "limit": 4}), &rec)
+	if g := f.gotRecurring; strings.Join(g.Statuses, ",") != "due" || !g.IncludeIgnored || !g.ChangedOnly || g.Query != "x" ||
+		g.Sort != "change_12m" || g.Limit != 4 {
+		t.Errorf("store recurring params = %+v", g)
+	}
+	if !rec.Truncated || len(rec.Series) != 1 || len(rec.AnnualCostTotal) != 1 || rec.AnnualCostTotal[0].TotalMinor != 120 {
+		t.Fatalf("recurring = %+v", rec)
+	}
+	if v := rec.Series[0]; v.SeriesKey != "inf:1" || v.Cadence != "monthly" || v.Occurrences != 6 || *v.AnnualCostMinor != 120 ||
+		*v.NextExpectedDate != "2030-07-01" || len(v.PriceChanges) != 1 || v.PriceChanges[0].ToMinor != 10 || *v.Change12mMinor != 2 ||
+		strings.Join(v.AccountSlugs, ",") != "a,b" || *v.OperatorState != "confirmed" || *v.CategoryName != "K" || v.Confidence != "medium" ||
+		v.LastAmountMinor != 11 || v.TypicalAmountMinor != 10 || v.AmountKind != "variable" || v.Status != "due" {
+		t.Errorf("series = %+v", v)
+	}
+
+	var pa PayeesOutput
+	decode(t, r.call(semconv.MCPToolPayees, map[string]any{"query": "x", "flow_class": "income", "from": "2030-01-02", "to": "2030-03-04",
+		"sort": "in", "limit": 6}), &pa)
+	if g := f.gotPayees; g.Query != "x" || g.FlowClass != "income" || g.From != "2030-01-02" || g.To != "2030-03-04" || g.Sort != "in" || g.Limit != 6 {
+		t.Errorf("store payees params = %+v", g)
+	}
+	if pa.Truncated || len(pa.Payees) != 1 {
+		t.Fatalf("payees = %+v", pa)
+	}
+	if v := pa.Payees[0]; v.PayeeName != "X" || *v.FlowClass != "income" || !*v.Employer || v.TxnCount != 3 || v.OutMinor != 4 || v.InMinor != 5 ||
+		strings.Join(v.Keys, ",") != "n:x,mg:1" || strings.Join(v.NameVariants, ",") != "X,x ltd" || len(v.Years) != 1 || v.Years[0].Year != 2030 ||
+		*v.CategoryName != "K" || v.FirstDate != "2030-01-01" || v.LastDate != "2030-02-01" {
+		t.Errorf("payee = %+v", v)
+	}
+
+	var cf CashFlowOutput
+	decode(t, r.call(semconv.MCPToolCashFlow, map[string]any{"from_month": "2030-01", "to_month": "2030-03", "scopes": []string{"joint"},
+		"category_limit": 3, "include_pending": true, "limit": 8}), &cf)
+	if g := f.gotCashFlow; g.FromMonth != "2030-01" || g.ToMonth != "2030-03" || strings.Join(g.Scopes, ",") != "joint" || g.CategoryLimit != 3 ||
+		!g.IncludePending || g.Limit != 8 {
+		t.Errorf("store cash flow params = %+v", g)
+	}
+	if !cf.Truncated || len(cf.Months) != 1 || len(cf.Categories) != 1 || len(cf.Upcoming) != 1 {
+		t.Fatalf("cash flow = %+v", cf)
+	}
+	if m := cf.Months[0]; m.Month != "2030-03" || m.SalaryMinor != 2 || m.InternalInMinor != 13 || m.NetMinor != 14 || *m.SavingsRate != 0.25 ||
+		m.ScopeTransferOutMinor != 10 || m.OwnExternalInMinor != 9 || m.InvestmentOutMinor != 6 || m.DebtRepaymentMinor != 5 {
+		t.Errorf("month = %+v", m)
+	}
+	if c := cf.Categories[0]; *c.Category != "k" || *c.CategoryName != "K" || c.TxnCount != 2 {
+		t.Errorf("category = %+v", c)
+	}
+	if u := cf.Upcoming[0]; u.Date != "2030-04-01" || *u.PayeeID != "n:x" || u.AmountMinor != 7 || u.Source != "inferred" || *u.SeriesKey != "inf:1" || *u.AccountSlug != "a" {
+		t.Errorf("upcoming = %+v", u)
+	}
+
+	var fp FinanceProfileOutput
+	decode(t, r.call(semconv.MCPToolFinanceProfile, map[string]any{}), &fp)
+	if f.gotProfile.Limit != store.CuratedDefaultLimit {
+		t.Errorf("store profile params = %+v", f.gotProfile)
+	}
+	if fp.Truncated || *fp.Span.FirstDate != "2030-01-01" || *fp.Span.LastDate != "2030-06-01" || len(fp.Accounts) != 1 || fp.Accounts[0].ScopeSource != "default" ||
+		len(fp.MonthlyMedians) != 1 || *fp.MonthlyMedians[0].SavingsRate != 0.25 || *fp.SalaryDay != 25 || fp.Recurring[0].Count != 2 ||
+		fp.TopPayees[0].SpendingMinor != 9 || fp.TopSeries[0].AnnualCostMinor != 8 || fp.Anomalies90d[0].Count != 2 ||
+		fp.ToCorrect.UnnamedCategories[0] != "category_1" || fp.ToCorrect.UnclassifiedSpending[0].AmountMinor != 4 ||
+		fp.ToCorrect.UnclassifiedOBTransfers != 5 || fp.ToCorrect.UnpairedCardCredits != 6 || fp.ToCorrect.RuleProblems != 7 {
+		t.Errorf("finance profile = %+v", fp)
+	}
+
+	// spending_summary passes the new inputs on.
+	decode(t, r.call(semconv.MCPToolSpendingSummary, map[string]any{"from": "2030-01-02", "to": "2030-03-04", "group_by": "payee",
+		"flow_classes": []string{"spending", "refund"}, "include_pending": true}), &SummaryOutput{})
+	if g := f.gotSummary; strings.Join(g.FlowClasses, ",") != "spending,refund" || !g.IncludePending || g.GroupBy != "payee" {
+		t.Errorf("store summary params = %+v", g)
+	}
 }
 
 // The adapter passes the investment tools' parameters to the store and maps every field of their

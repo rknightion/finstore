@@ -17,6 +17,10 @@ type storeReader interface {
 	Query(ctx context.Context, sql string, limits store.Limits) (store.Result, error)
 	Portfolio(ctx context.Context, p store.PortfolioParams) ([]store.PortfolioAccount, bool, error)
 	PensionSummary(ctx context.Context, p store.PensionSummaryParams) (store.PensionSummary, bool, error)
+	RecurringPayments(ctx context.Context, p store.RecurringParams) (store.Recurring, bool, error)
+	Payees(ctx context.Context, p store.PayeesParams) ([]store.PayeeRow, bool, error)
+	CashFlow(ctx context.Context, p store.CashFlowParams) (store.CashFlow, bool, error)
+	FinanceProfile(ctx context.Context, p store.FinanceProfileParams) (store.FinanceProfile, bool, error)
 }
 
 // FromStore returns the Reader the tools read through, backed by the store's MCP reader. It maps the
@@ -96,7 +100,8 @@ func (a adapter) SpendingSummary(ctx context.Context, p SummaryParams) ([]Summar
 	exclude := p.ExcludePotTransfers
 	rows, truncated, err := a.r.SpendingSummary(ctx, store.SummaryParams{
 		GroupBy: p.GroupBy, From: p.From.Format(time.DateOnly), To: p.To.Format(time.DateOnly),
-		Accounts: p.Accounts, Direction: p.Direction, ExcludePotTransfers: &exclude, Limit: p.Limits.MaxRows,
+		Accounts: p.Accounts, Direction: p.Direction, ExcludePotTransfers: &exclude, FlowClasses: p.FlowClasses,
+		IncludePending: p.IncludePending, Limit: p.Limits.MaxRows,
 	})
 	if err != nil {
 		return nil, false, err
@@ -178,6 +183,110 @@ func (a adapter) PensionSummary(ctx context.Context, p PensionSummaryParams) (Pe
 	}
 	for i, v := range s.Missing {
 		out.Missing[i] = MissingData(v)
+	}
+	return out, truncated, nil
+}
+
+func (a adapter) RecurringPayments(ctx context.Context, p RecurringParams) (RecurringData, bool, error) {
+	rec, truncated, err := a.r.RecurringPayments(ctx, store.RecurringParams{Statuses: p.Statuses,
+		IncludeIgnored: p.IncludeIgnored, ChangedOnly: p.ChangedOnly, Query: p.Query, Sort: p.Sort, Limit: p.Limits.MaxRows})
+	if err != nil {
+		return RecurringData{}, false, err
+	}
+	out := RecurringData{Series: make([]RecurringSeries, len(rec.Series)), AnnualCostTotal: make([]AnnualCostTotal, len(rec.AnnualCostTotal))}
+	for i, v := range rec.Series {
+		changes := make([]PriceChange, len(v.PriceChanges))
+		for j, c := range v.PriceChanges {
+			changes[j] = PriceChange(c)
+		}
+		out.Series[i] = RecurringSeries{SeriesKey: v.SeriesKey, PayeeID: v.PayeeID, PayeeName: v.PayeeName,
+			Evidence: v.Evidence, Cadence: v.Cadence, AmountKind: v.AmountKind, Occurrences: v.Occurrences,
+			FirstDate: v.FirstDate, LastDate: v.LastDate, LastAmountMinor: v.LastAmountMinor,
+			TypicalAmountMinor: v.TypicalAmountMinor, Currency: v.Currency, AnnualCostMinor: v.AnnualCostMinor,
+			NextExpectedDate: v.NextExpectedDate, Status: v.Status, PriceChanges: changes, Change12mMinor: v.Change12mMinor,
+			FlowClass: v.FlowClass, Category: v.Category, CategoryName: v.CategoryName, AccountSlugs: v.AccountSlugs,
+			OperatorState: v.OperatorState, Confidence: v.Confidence}
+	}
+	for i, v := range rec.AnnualCostTotal {
+		out.AnnualCostTotal[i] = AnnualCostTotal(v)
+	}
+	return out, truncated, nil
+}
+
+func (a adapter) Payees(ctx context.Context, p PayeesParams) ([]PayeeRow, bool, error) {
+	rows, truncated, err := a.r.Payees(ctx, store.PayeesParams{Query: p.Query, FlowClass: p.FlowClass,
+		From: day(p.From), To: day(p.To), Sort: p.Sort, Limit: p.Limits.MaxRows})
+	if err != nil {
+		return nil, false, err
+	}
+	out := make([]PayeeRow, len(rows))
+	for i, v := range rows {
+		years := make([]PayeeYear, len(v.Years))
+		for j, y := range v.Years {
+			years[j] = PayeeYear(y)
+		}
+		out[i] = PayeeRow{PayeeID: v.PayeeID, PayeeName: v.PayeeName, Currency: v.Currency, FlowClass: v.FlowClass,
+			Category: v.Category, CategoryName: v.CategoryName, Employer: v.Employer, FirstDate: v.FirstDate,
+			LastDate: v.LastDate, TxnCount: v.TxnCount, OutMinor: v.OutMinor, InMinor: v.InMinor, Keys: v.Keys,
+			NameVariants: v.NameVariants, Years: years}
+	}
+	return out, truncated, nil
+}
+
+func (a adapter) CashFlow(ctx context.Context, p CashFlowParams) (CashFlowData, bool, error) {
+	cf, truncated, err := a.r.CashFlow(ctx, store.CashFlowParams{FromMonth: p.FromMonth, ToMonth: p.ToMonth, Scopes: p.Scopes,
+		CategoryLimit: p.CategoryLimit, IncludePending: p.IncludePending, Limit: p.Limits.MaxRows})
+	if err != nil {
+		return CashFlowData{}, false, err
+	}
+	out := CashFlowData{Months: make([]MonthFlow, len(cf.Months)), Categories: make([]CategoryMonth, len(cf.Categories)),
+		Upcoming: make([]UpcomingPayment, len(cf.Upcoming))}
+	for i, v := range cf.Months {
+		out.Months[i] = MonthFlow(v)
+	}
+	for i, v := range cf.Categories {
+		out.Categories[i] = CategoryMonth(v)
+	}
+	for i, v := range cf.Upcoming {
+		out.Upcoming[i] = UpcomingPayment(v)
+	}
+	return out, truncated, nil
+}
+
+func (a adapter) FinanceProfile(ctx context.Context, p FinanceProfileParams) (FinanceProfileData, bool, error) {
+	v, truncated, err := a.r.FinanceProfile(ctx, store.FinanceProfileParams{Limit: p.Limits.MaxRows})
+	if err != nil {
+		return FinanceProfileData{}, false, err
+	}
+	out := FinanceProfileData{Span: ProfileSpan(v.Span), SalaryDay: v.SalaryDay,
+		Accounts: make([]ProfileAccount, len(v.Accounts)), MonthlyMedians: make([]ProfileMedian, len(v.MonthlyMedians)),
+		Recurring: make([]ProfileRecurring, len(v.Recurring)), TopPayees: make([]ProfilePayee, len(v.TopPayees)),
+		TopSeries: make([]ProfileSeries, len(v.TopSeries)), Anomalies90d: make([]ProfileAnomalyCount, len(v.Anomalies90d))}
+	for i, x := range v.Accounts {
+		out.Accounts[i] = ProfileAccount(x)
+	}
+	for i, x := range v.MonthlyMedians {
+		out.MonthlyMedians[i] = ProfileMedian(x)
+	}
+	for i, x := range v.Recurring {
+		out.Recurring[i] = ProfileRecurring(x)
+	}
+	for i, x := range v.TopPayees {
+		out.TopPayees[i] = ProfilePayee(x)
+	}
+	for i, x := range v.TopSeries {
+		out.TopSeries[i] = ProfileSeries(x)
+	}
+	for i, x := range v.Anomalies90d {
+		out.Anomalies90d[i] = ProfileAnomalyCount(x)
+	}
+	tc := v.ToCorrect
+	out.ToCorrect = ProfileToCorrect{UnnamedCategories: tc.UnnamedCategories,
+		UnclassifiedSpending:    make([]ProfileUnclassified, len(tc.UnclassifiedSpending)),
+		UnclassifiedOBTransfers: tc.UnclassifiedOBTransfers, UnpairedCardCredits: tc.UnpairedCardCredits,
+		RuleProblems: tc.RuleProblems}
+	for i, x := range tc.UnclassifiedSpending {
+		out.ToCorrect.UnclassifiedSpending[i] = ProfileUnclassified(x)
 	}
 	return out, truncated, nil
 }
