@@ -46,6 +46,9 @@ of each transaction, balances, and a coverage view that says what is held for ea
 it agrees with the bank's balance, and where the gaps are. The role `finstore_agent` can read those
 views and nothing else: not the raw payloads, not the tokens.
 
+Every table and view, with its columns, types and comments, is described in
+[docs/schema/](docs/schema/README.md), generated from the migrations by `just schema-docs`.
+
 Agents read the data through an MCP endpoint at `/mcp` on the tailnet; see docs/operations.md.
 
 ## Development
