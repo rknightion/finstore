@@ -681,6 +681,19 @@ func (f *insightFixture) flowTxns() {
 	f.tx(itx{acct: "card", key: "cc4_in_b", date: "2026-03-18", amt: 5500, desc: "PAYMENT RECEIVED THANK YOU"})
 	f.tx(itx{acct: "cur", key: "cc4_out", date: "2026-03-18", amt: -5500, desc: "MADE UP CARD CO"})
 
+	// One debit, two card credits of its amount, only one of which names the debit's account: the
+	// debit has two possible partners, so neither credit pairs with it.
+	f.tx(itx{acct: "cur", key: "two_out", date: "2026-03-26", amt: -6600, desc: "MADE UP CARD CO"})
+	f.tx(itx{acct: "card", key: "two_in_named", date: "2026-03-26", amt: 6600, desc: "PAYMENT RECEIVED THANK YOU", cp: "Current", detail: cpDetail("account_id", "acc_cur")})
+	f.tx(itx{acct: "card", key: "two_in_plain", date: "2026-03-26", amt: 6600, desc: "PAYMENT RECEIVED THANK YOU"})
+	// A card credit and a transfer between held accounts of the same amount: the transfer is
+	// already classified (rule 3, or rule 6 across scopes) and is not a card payment, so the credit
+	// stays a refund.
+	f.tx(itx{acct: "cur", key: "held_out", date: "2026-03-27", amt: -7700, cp: "Savings", detail: cpDetail("account_id", "acc_sav")})
+	f.tx(itx{acct: "card", key: "held_credit", date: "2026-03-27", amt: 7700, desc: "PAYMENT RECEIVED THANK YOU"})
+	f.tx(itx{acct: "cur", key: "xheld_out", date: "2026-03-27", amt: -7800, cp: "Joint", detail: cpDetail("account_id", "acc_joint")})
+	f.tx(itx{acct: "card", key: "xheld_credit", date: "2026-03-27", amt: 7800, desc: "PAYMENT RECEIVED THANK YOU"})
+
 	// Rule 5, in each direction.
 	f.tx(itx{acct: "cur", key: "inv_out", date: "2026-03-05", amt: -1000, desc: "BROKER CO"})
 	f.tx(itx{acct: "cur", key: "inv_in", date: "2026-03-06", amt: 500, desc: "BROKER CO"})
@@ -773,6 +786,10 @@ func TestFlowClasses(t *testing.T) {
 		"cc2_in": {"refund", "card_credit", ""}, "cc2_out": {"spending", "direction", ""},
 		"cc3_in": {"refund", "card_credit", ""}, "cc3_out": {"debt_repayment", "rule", ""},
 		"cc4_in_a": {"refund", "card_credit", ""}, "cc4_in_b": {"refund", "card_credit", ""}, "cc4_out": {"spending", "direction", ""},
+
+		"two_out": {"spending", "direction", ""}, "two_in_named": {"internal", "own_account", ""}, "two_in_plain": {"refund", "card_credit", ""},
+		"held_out": {"internal", "own_account", ""}, "held_credit": {"refund", "card_credit", ""},
+		"xheld_out": {"scope_transfer", "own_account", ""}, "xheld_credit": {"refund", "card_credit", ""},
 
 		"inv_out": {"investment", "rule", ""}, "inv_in": {"investment", "rule", ""},
 		"inc_neg": {"spending", "direction", ""}, "inc_pos": {"income", "rule", ""},

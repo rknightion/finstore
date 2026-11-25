@@ -497,9 +497,11 @@ transaction U when:
     and their dates are at most the pairing window apart (Detection parameters);
 *   U identifies T's account: U's counterparty matches T's account by `bank_ref` or `source_key`;
     or one of them is a positive row on a `credit_card` account and the other is a negative row on
-    a non-card account whose payee has no `class` setting;
-*   exactly one U satisfies this for T, and T is the only such transaction for U. Otherwise neither
-    pairs.
+    a non-card account whose payee has no `class` setting and which has no held-account
+    counterparty (a transfer between held accounts is not a card payment);
+*   exactly one U satisfies this for T, and T is the only such transaction for U, counting
+    candidate pairs in both directions (a row that is T in one candidate and U in another still has
+    one partner only). Otherwise neither pairs.
 
 This classifies the Open Banking side of a transfer from a held Monzo account (Problem 3), and both
 sides of a held credit card repayment: the card side is positive, so without pairing it would be a
