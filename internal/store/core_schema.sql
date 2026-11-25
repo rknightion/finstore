@@ -22,6 +22,9 @@ CREATE TABLE {{schema}}.account (
   -- the last day the account has transactions on, set by an account_end operator entry; null
   -- while it has none. Its later rows stay here but the agent views leave them out.
   ended_on date,
+  -- the operator's scope for the account, set by an account_scope operator entry; null while it
+  -- has none. agent.account_scopes resolves the scope the views use (pot, type and default rules).
+  scope text CHECK (scope IN ('personal', 'joint', 'business')),
   -- the source's whole account object (a TrueLayer account or card, as the bank listed it). Null
   -- when the source gives none: Monzo's is read from raw by agent.accounts instead.
   detail jsonb,
@@ -221,3 +224,44 @@ CREATE TABLE {{schema}}.holding_check (
   instrument_id uuid NOT NULL REFERENCES {{schema}}.instrument(id), checked_as_of date NOT NULL,
   expected_units numeric NOT NULL, reported_units numeric NOT NULL, difference numeric NOT NULL,
   PRIMARY KEY (account_id, instrument_id));
+
+-- The operator's payee, series and category rules, as effective state. The ledger writes them
+-- from payee_rule and category_name operator entries, the way account_end sets ended_on: a later
+-- entry replaces an earlier one, so a view reads current state with a plain join.
+
+-- Merge and separate settings, one row per key named. Targets are stored as named and resolved by
+-- the views, because automatic groups change as transactions arrive.
+CREATE TABLE {{schema}}.payee_alias (
+  payee_key     text PRIMARY KEY,
+  separate      boolean NOT NULL DEFAULT false,
+  into_key      text,                      -- merge target, or null
+  name_sample   text,                      -- raw name seen when the key is n:
+  entry_seq     bigint NOT NULL,           -- the raw.operator_entry.seq that last changed the row
+  entered_at    timestamptz NOT NULL,
+  CHECK (separate OR into_key IS NOT NULL));
+
+-- Settings named on a payee key. A null column has no setting.
+CREATE TABLE {{schema}}.payee_setting (
+  payee_key     text PRIMARY KEY,
+  name          text,
+  flow_class    text CHECK (flow_class IN ('internal', 'scope_transfer', 'own_external',
+                                           'investment', 'debt_repayment', 'income',
+                                           'refund', 'spending')),
+  employer      boolean,                   -- only with flow_class income
+  category      text,
+  name_sample   text,
+  entry_seq     bigint NOT NULL,           -- the entry that last changed the row
+  entered_at    timestamptz NOT NULL);
+
+-- Operator decisions about a recurring series.
+CREATE TABLE {{schema}}.series_setting (
+  series_key  text PRIMARY KEY,
+  recurring   text NOT NULL CHECK (recurring IN ('confirm', 'ignore', 'not_recurring')),
+  entry_seq   bigint NOT NULL,
+  entered_at  timestamptz NOT NULL);
+
+CREATE TABLE {{schema}}.category_name (
+  category    text PRIMARY KEY,            -- as agent.transactions.category
+  name        text NOT NULL,
+  entry_seq   bigint NOT NULL,
+  entered_at  timestamptz NOT NULL);

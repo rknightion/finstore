@@ -20,6 +20,9 @@ var coreSchemaSQL string
 //go:embed agent_views.sql
 var agentViewsSQL string
 
+//go:embed insight_views.sql
+var insightViewsSQL string
+
 //go:embed grants.sql
 var grantsSQL string
 
@@ -130,14 +133,19 @@ func createCoreTables(ctx context.Context, q DBTX, schema string) error {
 	return nil
 }
 
-// applyViewsAndGrants drops every view in agent, creates the agent views on core and applies the
-// grant matrix.
+// applyViewsAndGrants drops every view in agent, creates the agent views on core, creates the
+// insight functions and applies the grant matrix.
 func applyViewsAndGrants(ctx context.Context, q DBTX) error {
 	if err := dropAgentViews(ctx, q); err != nil {
 		return err
 	}
 	if _, err := q.Exec(ctx, agentViewsSQL); err != nil {
 		return fmt.Errorf("store: create agent views: %w", err)
+	}
+	// The payee function and its EXECUTE grant live in one file, after the views are dropped and
+	// before grants.sql, which Migrate also runs alone before any function exists.
+	if _, err := q.Exec(ctx, insightViewsSQL); err != nil {
+		return fmt.Errorf("store: create insight functions: %w", err)
 	}
 	if _, err := q.Exec(ctx, grantsSQL); err != nil {
 		return fmt.Errorf("store: apply grants: %w", err)

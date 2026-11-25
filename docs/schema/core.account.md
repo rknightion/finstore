@@ -15,6 +15,7 @@
 | name | text |  | false |  |  |  |
 | opened_on | date |  | true |  |  |  |
 | parent_id | uuid |  | true |  |  |  |
+| scope | text |  | true |  |  |  |
 | slug | text |  | false |  |  |  |
 | source | text |  | false |  |  |  |
 | source_key | text |  | false |  |  |  |
@@ -32,6 +33,7 @@
 | account_id_not_null | n | NOT NULL id |
 | account_name_not_null | n | NOT NULL name |
 | account_pkey | PRIMARY KEY | PRIMARY KEY (id) |
+| account_scope_check | CHECK | CHECK ((scope = ANY (ARRAY['personal'::text, 'joint'::text, 'business'::text]))) |
 | account_slug_key | UNIQUE | UNIQUE (slug) |
 | account_slug_not_null | n | NOT NULL slug |
 | account_source_key_not_null | n | NOT NULL source_key |
@@ -83,6 +85,7 @@ erDiagram
   text name
   date opened_on
   uuid parent_id
+  text scope
   text slug
   text source
   text source_key
