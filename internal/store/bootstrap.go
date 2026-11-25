@@ -137,6 +137,12 @@ func Bootstrap(ctx context.Context, superuserURL, ownerPassword, appPassword str
 			dbID, pgx.Identifier{RoleApp}.Sanitize(), pgx.Identifier{RoleAgent}.Sanitize(), pgx.Identifier{RoleMCP}.Sanitize())); err != nil {
 			return fmt.Errorf("store: bootstrap: revoke temporary on database: %w", err)
 		}
+		// JIT compilation cost more than it saved on finstore's queries (the larger insight views spent
+		// most of their time compiling). A database-level setting reaches every role's new sessions;
+		// RoleMCP's own settings do not name jit, so its reset above leaves this in force.
+		if _, err := tx.Exec(ctx, "ALTER DATABASE "+dbID+" SET jit = off"); err != nil {
+			return fmt.Errorf("store: bootstrap: turn off jit on database: %w", err)
+		}
 		if _, err := tx.Exec(ctx, fmt.Sprintf("GRANT CREATE, CONNECT, TEMPORARY ON DATABASE %s TO %s", dbID, owner)); err != nil {
 			return fmt.Errorf("store: bootstrap: grant database to owner: %w", err)
 		}
