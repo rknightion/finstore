@@ -2,7 +2,7 @@
 
 ## Description
 
-One row per row of the operator rule tables (rule_table payee_alias, payee_setting, series_setting or category_name), with key (for an n: rule, the key its name_sample normalises to now; for a series rule the series key; for a category name the category), detail (the row's settings as JSON), entered_at, matches, last_match_date and problem. problem is null, no_match (nothing the rule names currently exists) or merge_loop (the merge could not be applied because its chain loops or runs past ten steps). For payee_alias, matches means the key itself has a transaction; for payee_setting, that some transaction belongs to the payee the key resolves to, so a setting on a merge target that has no transactions of its own still matches; for category_name, a transaction carries the category or a payee setting gives it. For series_setting, a series matches while a declared id (dd:, so:, sub:) is on a transaction or an inf: key names an existing transaction; until the recurring payments view exists, an inferred series that has since gained an earlier transaction is not detected.
+One row per row of the operator rule tables (rule_table payee_alias, payee_setting, series_setting or category_name), with key (for an n: rule, the key its name_sample normalises to now; for a series rule the series key; for a category name the category), detail (the row's settings as JSON), entered_at, matches, last_match_date and problem. problem is null, no_match (nothing the rule names currently exists) or merge_loop (the merge could not be applied because its chain loops or runs past ten steps). For payee_alias, matches means the key itself has a transaction; for payee_setting, that some transaction belongs to the payee the key resolves to, so a setting on a merge target that has no transactions of its own still matches; for category_name, a transaction carries the category or a payee setting gives it. For series_setting, a series matches while a declared id (dd:, so:, sub:) is on a transaction, or while agent.recurring_payments lists a series with the inf: key (so a decision that named a series which has since gained an earlier transaction, and so a new key, is no_match); a not_recurring decision hides its series from that view, so it matches while the transaction its inf: key names still exists.
 
 <details>
 <summary><strong>Table Definition</strong></summary>
@@ -34,10 +34,22 @@ CREATE VIEW payee_rule_status AS (
            FROM (( SELECT k.key,
                     t.txn_date
                    FROM (transactions t
-                     CROSS JOIN LATERAL unnest(ARRAY[('dd:'::text || ((t.detail -> 'metadata'::text) ->> 'bacs_direct_debit_instruction_id'::text)), ('so:'::text || ((t.detail -> 'metadata'::text) ->> 'series_id'::text)), ('sub:'::text || ((t.detail -> 'metadata'::text) ->> 'subscription_id'::text)), ('inf:'::text || (t.id)::text)]) k(key))
+                     CROSS JOIN LATERAL unnest(ARRAY[('dd:'::text || ((t.detail -> 'metadata'::text) ->> 'bacs_direct_debit_instruction_id'::text)), ('so:'::text || ((t.detail -> 'metadata'::text) ->> 'series_id'::text)), ('sub:'::text || ((t.detail -> 'metadata'::text) ->> 'subscription_id'::text))]) k(key))
                   WHERE ((t.status <> 'declined'::text) AND (k.key IS NOT NULL))) d
              JOIN series_setting s ON ((s.series_key = d.key)))
           GROUP BY d.key
+        UNION ALL
+         SELECT r.series_key,
+            r.last_date
+           FROM (recurring_payments r
+             JOIN series_setting s ON ((s.series_key = r.series_key)))
+          WHERE (r.series_key ~~ 'inf:%'::text)
+        UNION ALL
+         SELECT s.series_key,
+            t.txn_date
+           FROM (series_setting s
+             JOIN transactions t ON ((s.series_key = ('inf:'::text || (t.id)::text))))
+          WHERE ((s.recurring = 'not_recurring'::text) AND (t.status <> 'declined'::text))
         ), categories AS (
          SELECT u.category,
             max(u.last_date) AS last_date
@@ -113,7 +125,10 @@ UNION ALL
             ELSE NULL::text
         END AS problem
    FROM (series_setting s
-     LEFT JOIN declared d ON ((d.key = s.series_key)))
+     LEFT JOIN ( SELECT declared.key,
+            max(declared.last_date) AS last_date
+           FROM declared
+          GROUP BY declared.key) d ON ((d.key = s.series_key)))
 UNION ALL
  SELECT 'category_name'::text AS rule_table,
     n.category AS key,
