@@ -156,3 +156,51 @@ func TestABadSettingStopsTheCommandWithoutEchoingIt(t *testing.T) {
 		t.Fatalf("stderr echoes the value: %q", errOut)
 	}
 }
+
+func TestPayeeCategoryAndScopeCommandsTakeFlagsOnly(t *testing.T) {
+	for _, args := range [][]string{
+		{"payee"},
+		{"payee", "nonsense"},
+		{"payee", "merge", "--key", "n:made-up"},
+		{"payee", "merge", "--into", "n:made-up"},
+		{"payee", "merge", "--key", "n:a", "--into", "n:b", "stray"},
+		{"payee", "separate"},
+		{"payee", "rename", "--key", "n:a"},
+		{"payee", "class", "--key", "n:a"},
+		{"payee", "category", "--key", "n:a"},
+		{"payee", "recurring", "--series", "sub:n:a"},
+		{"payee", "clear", "--key", "n:a"},
+		{"payee", "clear", "--series", "sub:n:a", "--what", "name"},
+		{"payee", "clear"},
+		{"category"},
+		{"category", "name", "--category", "made-up"},
+		{"category", "clear"},
+		{"account", "scope", "--slug", "bank-joint"},
+		{"account", "scope", "--scope", "joint"},
+		{"account", "scope", "--slug", "bank-joint", "--scope", "joint", "--clear"},
+	} {
+		code, _, errOut := runWith(t, nil, args...)
+		if code != exitUsage || errOut == "" {
+			t.Errorf("%v: code %d, stderr %q", args, code, errOut)
+		}
+	}
+	// Well-formed commands go on to need the database.
+	for _, args := range [][]string{
+		{"payee", "merge", "--key", "n:a", "--into", "mg:b"},
+		{"payee", "recurring", "--series", "sub:n:a", "--decision", "not-recurring"},
+		{"payee", "clear", "--key", "n:a", "--what", "class"},
+		{"payee", "clear", "--series", "sub:n:a"},
+		{"category", "name", "--category", "made-up", "--name", "Made up"},
+		{"account", "scope", "--slug", "bank-joint", "--clear"},
+	} {
+		code, _, errOut := runWith(t, nil, args...)
+		if code != 1 || !strings.Contains(errOut, "FINSTORE_DATABASE_URL") {
+			t.Errorf("%v: code %d, stderr %q", args, code, errOut)
+		}
+	}
+	// A refused entry stops before the database is needed, and says why.
+	code, _, errOut := runWith(t, nil, "payee", "class", "--key", "n:a", "--class", "spending", "--employer")
+	if code != 1 || !strings.Contains(errOut, "employer") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+}

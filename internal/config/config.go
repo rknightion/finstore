@@ -231,6 +231,8 @@ var requirements = map[string][]string{
 	"bootstrap":    {EnvSuperuserDatabaseURL, EnvAppPassword, EnvOwnerPassword},
 	"import":       {EnvDatabaseURL},
 	"account":      {EnvDatabaseURL},
+	"payee":        {EnvDatabaseURL},
+	"category":     {EnvDatabaseURL},
 	"load-capture": {EnvDatabaseURL},
 	"coverage":     {EnvDatabaseURL},
 	"healthcheck":  {},
