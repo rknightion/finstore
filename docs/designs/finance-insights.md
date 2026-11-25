@@ -688,7 +688,7 @@ is a plain sum.
     `next_amount_minor`; these are the bank's own schedule;
 *   each `active`, `due` or `overdue` series at its `next_expected_date` with its
     `typical_amount_minor`, then at each later date its cadence gives within the window, except:
-    *   series with evidence `standing_order`, which the standing order rows above cover;
+    *   series with evidence `standing_order` where a live standing order row is on one of the series' accounts, which those rows cover (without one, for example with no Open Banking connection, the series is projected like any other);
     *   ignored series.
 
     A standing order that Monzo's data does not mark with `series_id` (an Open Banking account's,
