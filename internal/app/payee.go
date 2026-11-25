@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -15,41 +16,36 @@ import (
 // The writing commands of `finstore payee`, `finstore category` and `finstore account scope`. Each
 // validates its entry with the ledger's own functions before it writes anything, so a refused
 // command leaves no raw row; a valid entry is inserted and normalised in one writer transaction.
-// The commands take their keys as given: resolving a key to its canonical payee is a later change.
+// The payee commands that name a key read the views first (see writePayeeRule); the others take their
+// arguments as given.
 
-// PayeeMerge writes a merge of the payee key into another.
+// PayeeMerge writes a merge of the payee key into another. It refuses a target that already
+// resolves to the key's payee and one whose own merge chain returns to the key.
 func PayeeMerge(ctx context.Context, e Env, key, into string) int {
-	return writeEntry(ctx, e, "payee merge", "payee", ledger.EntryPayeeRule,
-		ledger.PayeeRule{Action: ledger.ActionMerge, PayeeKey: key, IntoKey: into},
-		fmt.Sprintf("payee %s merged into %s", key, into))
+	return writePayeeRule(ctx, e, "payee merge", ledger.PayeeRule{Action: ledger.ActionMerge, PayeeKey: key, IntoKey: into}, false)
 }
 
 // PayeeSeparate writes a separation: the key is never merged into another payee.
 func PayeeSeparate(ctx context.Context, e Env, key string) int {
-	return writeEntry(ctx, e, "payee separate", "payee", ledger.EntryPayeeRule,
-		ledger.PayeeRule{Action: ledger.ActionSeparate, PayeeKey: key},
-		fmt.Sprintf("payee %s kept separate", key))
+	return writePayeeRule(ctx, e, "payee separate", ledger.PayeeRule{Action: ledger.ActionSeparate, PayeeKey: key}, false)
 }
 
-// PayeeRename writes a display name for the payee key.
+// PayeeRename writes a display name for the payee the key belongs to.
 func PayeeRename(ctx context.Context, e Env, key, name string) int {
-	return writeEntry(ctx, e, "payee rename", "payee", ledger.EntryPayeeRule,
-		ledger.PayeeRule{Action: ledger.ActionRename, PayeeKey: key, Name: &name},
-		fmt.Sprintf("payee %s renamed", key))
+	return writePayeeRule(ctx, e, "payee rename", ledger.PayeeRule{Action: ledger.ActionRename, PayeeKey: key, Name: &name}, true)
 }
 
-// PayeeClass writes a flow class for the payee key, with the employer flag for income.
+// PayeeClass writes a flow class for the payee the key belongs to, with the employer flag for
+// income.
 func PayeeClass(ctx context.Context, e Env, key, class string, employer bool) int {
-	return writeEntry(ctx, e, "payee class", "payee", ledger.EntryPayeeRule,
-		ledger.PayeeRule{Action: ledger.ActionClass, PayeeKey: key, FlowClass: class, Employer: employer},
-		fmt.Sprintf("payee %s set to class %s", key, class))
+	return writePayeeRule(ctx, e, "payee class",
+		ledger.PayeeRule{Action: ledger.ActionClass, PayeeKey: key, FlowClass: class, Employer: employer}, true)
 }
 
-// PayeeCategory writes a category for the payee key.
+// PayeeCategory writes a category for the payee the key belongs to.
 func PayeeCategory(ctx context.Context, e Env, key, category string) int {
-	return writeEntry(ctx, e, "payee category", "payee", ledger.EntryPayeeRule,
-		ledger.PayeeRule{Action: ledger.ActionCategory, PayeeKey: key, Category: category},
-		fmt.Sprintf("payee %s set to category %s", key, category))
+	return writePayeeRule(ctx, e, "payee category",
+		ledger.PayeeRule{Action: ledger.ActionCategory, PayeeKey: key, Category: category}, true)
 }
 
 // PayeeRecurring writes a decision about a recurring series. The command's word for no is
@@ -66,13 +62,11 @@ func PayeeRecurring(ctx context.Context, e Env, series, decision string) int {
 // PayeeClear removes a setting of a payee key (what is merge, separate, name, class or category),
 // or with a non-empty series the decision about that series. Exactly one of key and series is set.
 func PayeeClear(ctx context.Context, e Env, key, what, series string) int {
-	rule := ledger.PayeeRule{Action: ledger.ActionClear, PayeeKey: key, Clears: what}
-	done := fmt.Sprintf("payee %s: %s cleared", key, what)
 	if series != "" {
-		rule = ledger.PayeeRule{Action: ledger.ActionClear, SeriesKey: series, Clears: ledger.ClearRecurring}
-		done = fmt.Sprintf("series %s: decision cleared", series)
+		rule := ledger.PayeeRule{Action: ledger.ActionClear, SeriesKey: series, Clears: ledger.ClearRecurring}
+		return writeEntry(ctx, e, "payee clear", "payee", ledger.EntryPayeeRule, rule, fmt.Sprintf("series %s: decision cleared", series))
 	}
-	return writeEntry(ctx, e, "payee clear", "payee", ledger.EntryPayeeRule, rule, done)
+	return writePayeeRule(ctx, e, "payee clear", ledger.PayeeRule{Action: ledger.ActionClear, PayeeKey: key, Clears: what}, false)
 }
 
 // CategoryName writes a display name for a category.
@@ -157,4 +151,100 @@ func checkScopeAccount(ctx context.Context, tx pgx.Tx, slug string) error {
 		return err
 	}
 	return ledger.ValidateScopeTarget(acc)
+}
+
+// writePayeeRule writes a payee rule on a key and prints the payee's new effective state as one
+// line. With canonical set the rule is written against the canonical key of the key given (when
+// any transaction gives the key a payee), as the settings commands do. When the key written is an
+// n: key that has transactions, name_sample is filled from its most frequent raw name. A merge is
+// refused when the target already resolves to the key's payee or its merge chain returns to the
+// key; the refusal names the flag and never the key, which can carry a name.
+func writePayeeRule(ctx context.Context, e Env, command string, rule ledger.PayeeRule, canonical bool) int {
+	return e.withTelemetry(ctx, command, func(ctx context.Context, t cliTelemetry) int {
+		if err := ledger.ValidatePayeeRule(rule); err != nil {
+			return e.fail(err)
+		}
+		var state store.PayeeState
+		err := withWriter(ctx, e, t, "payee", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
+			if canonical {
+				id, _, ok, err := store.PayeeOf(ctx, tx, rule.PayeeKey)
+				if err != nil {
+					return err
+				}
+				if ok {
+					rule.PayeeKey = id
+				}
+			}
+			if rule.Action == ledger.ActionMerge {
+				if err := checkMerge(ctx, tx, rule.PayeeKey, rule.IntoKey); err != nil {
+					return err
+				}
+			}
+			if strings.HasPrefix(rule.PayeeKey, "n:") && rule.Action != ledger.ActionClear {
+				sample, err := store.MostFrequentName(ctx, tx, rule.PayeeKey)
+				if err != nil {
+					return err
+				}
+				if sample != "" {
+					rule.NameSample = &sample
+				}
+			}
+			if err := ledger.ValidatePayeeRule(rule); err != nil {
+				return err
+			}
+			body, err := json.Marshal(rule)
+			if err != nil {
+				return err
+			}
+			if _, err := store.InsertOperatorEntry(ctx, tx, store.OperatorEntry{Kind: ledger.EntryPayeeRule, Payload: body, EnteredAt: e.now()}); err != nil {
+				return err
+			}
+			if _, err := l.CatchUp(ctx, tx, store.SchemaCore); err != nil {
+				return err
+			}
+			state, err = store.EffectivePayeeState(ctx, tx, rule.PayeeKey)
+			return err
+		})
+		if err != nil {
+			return e.fail(err)
+		}
+		printPayeeState(e, state)
+		return ExitOK
+	})
+}
+
+// checkMerge refuses a merge of key into target when the target already resolves to the same
+// payee as the key, or when following the target's merge chain returns to the key.
+func checkMerge(ctx context.Context, q store.DBTX, key, target string) error {
+	keyID, _, keyOK, err := store.PayeeOf(ctx, q, key)
+	if err != nil {
+		return err
+	}
+	targetID, _, targetOK, err := store.PayeeOf(ctx, q, target)
+	if err != nil {
+		return err
+	}
+	if keyOK && targetOK && keyID == targetID {
+		return errors.New("--into already resolves to the same payee as --key")
+	}
+	returns, err := store.MergeChainReturns(ctx, q, key, target)
+	if err != nil {
+		return err
+	}
+	if returns {
+		return errors.New("--into has a merge chain that returns to --key")
+	}
+	return nil
+}
+
+// printPayeeState prints the effective state of a payee on one line.
+func printPayeeState(e Env, s store.PayeeState) {
+	class, category := s.FlowClass, s.Category
+	if class == "" {
+		class = "-"
+	}
+	if category == "" {
+		category = "-"
+	}
+	_, _ = fmt.Fprintf(e.Stdout, "%s %q class=%s category=%s keys=%d\n", s.PayeeID, s.Name, class, category, s.Keys)
 }
