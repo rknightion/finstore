@@ -67,11 +67,3 @@ file such as `ROADMAP.md` beside them.
 
 - `docs/operations.md` - read before changing a command's behaviour, the schemas or the deploy
   example: it is the operator's contract.
-
-## Cursor Cloud specific instructions
-
-- The image provides PostgreSQL 18 server binaries. The tests create and stop their own clusters.
-- Run `just fmt-check vet </dev/null` for fast feedback and `just check </dev/null` for the full
-  source gate. The tests use local fixtures. The vulnerability check uses the public Go database.
-- The running application needs its deployment configuration and database. Live bank connections
-  require authorized credentials.
