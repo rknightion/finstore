@@ -22,7 +22,7 @@ CREATE VIEW anomalies AS (
             ((t.local_currency IS NOT NULL) AND (t.local_currency <> c.currency) AND (jsonb_path_exists(t.detail, '$."fees"?(@.type() == "number" && @ != 0)'::jsonpath) OR jsonb_path_exists(t.detail, '$."fees".*?(@.type() == "number" && @ != 0)'::jsonpath))) AS foreign_fee,
             row_number() OVER (PARTITION BY c.payee_id ORDER BY c.txn_date, c.id) AS payee_rn,
                 CASE
-                    WHEN (c.flow_class = 'spending'::text) THEN row_number() OVER (PARTITION BY c.payee_id, c.account_slug, c.currency, c.amount_minor, c.flow_class ORDER BY c.txn_date, c.id)
+                    WHEN (c.flow_class = 'spending'::text) THEN row_number() OVER (PARTITION BY c.payee_id, c.account_slug, c.currency, c.amount_minor, c.flow_class ORDER BY COALESCE(t.created_at, (c.txn_date)::timestamp with time zone), c.id)
                     ELSE NULL::bigint
                 END AS same_rn,
             (c.flow_class = 'spending'::text) AS is_spend
