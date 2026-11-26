@@ -199,7 +199,7 @@ and `agent.recurring_payments` as a table, without new grants.
 ### CUJ 7: Was I charged twice?
 
 An MCP client reads `agent.anomalies` (through `query_sql`) or the anomaly counts in
-`finance_profile`, and finds a payment taken twice within two days, a charge far above what a payee
+`finance_profile`, and finds a payment taken twice within two hours, a charge far above what a payee
 usually takes, a large first payment to a new payee, or a foreign-currency fee. The owner checks
 each with the bank or merchant.
 
@@ -705,7 +705,7 @@ a null `account_slug`. Columns: `date`, `payee_id` (null for a standing order ro
 | `kind` | Rule |
 |---|---|
 | `unusual_amount` | class `spending`, and the amount is far above the payee's earlier spending ([thresholds](#detection-parameters)) |
-| `possible_duplicate` | another settled spending transaction with the same payee, account and amount within the duplicate window, neither in a series with a `weekly` or shorter cadence |
+| `possible_duplicate` | another settled spending transaction with the same payee, account, currency and amount created within the duplicate window, unless the amount is a habit: the earlier of the two already has three or more earlier transactions with that payee, account, currency and amount |
 | `new_large_payee` | class `spending`, the payee's first transaction, and at least the large payee threshold |
 | `foreign_fee` | `local_currency` differs from `currency` and the transaction carried a non-zero fee in `detail.fees` |
 
@@ -727,8 +727,9 @@ not a design change.
 | Regularity limit | mean absolute deviation from the median gap at most 20% of the median |
 | Grace (`due`) | `max(3, 10% of the median gap)` days |
 | Pairing window | 3 days |
-| `unusual_amount` | at least six earlier spending transactions with the payee; amount more than three times their median and at least 2,000 pence above it |
-| Duplicate window | 2 days |
+| `unusual_amount` | at least twelve earlier spending transactions with the payee; amount at least 5,000 pence, more than five times their median, at least 5,000 pence above it and more than six scaled median absolute deviations (1.4826 times the MAD, at least 10 percent of the median) above it |
+| Duplicate window | 2 hours between `created_at` (a statement file's date counts as midnight) |
+| Duplicate habit | three earlier transactions with the same payee, account, currency and amount |
 | Large payee threshold | 25,000 pence |
 | Upcoming window | 45 days |
 
@@ -912,7 +913,7 @@ computed per cluster.
 | Views slow down as data grows | Scalability | Tools time out | Equality joins; budgets measured at acceptance; Alternative B as the next step | Low at the current size; grows with history |
 | Untrusted text reaches an agent | Security | Prompt injection through payee names or descriptions | Tool descriptions say the text is data; the MCP endpoint stays read-only, so injected text cannot change stored state | Low |
 | Payee names leave the database | Privacy | Bank data in logs or public text | No new log fields; CLI output goes only to the operator's terminal; fixtures are made up | Low |
-| Anomaly false positives | Usability | Noise in `finance_profile` | Thresholds pinned in tests and tunable; series members at weekly or shorter cadence are exempt from duplicate checks; the acceptance step reviews the last 90 days' flags with the operator | Low after tuning |
+| Anomaly false positives | Usability | Noise in `finance_profile` | Thresholds pinned in tests and tunable; the gated timing test counts the flags in 90 days over a generated busy account (4 after tuning, 238 before); amounts a payee has charged on the account three times before are exempt from duplicate checks, and an unusual amount must clear a robust spread as well as a ratio and a floor; the acceptance step reviews the last 90 days' flags with the operator | Low after tuning |
 
 ## Open Questions
 

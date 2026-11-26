@@ -271,7 +271,7 @@ func newEstate(t *testing.T) *estate {
 	// What the operator could still correct.
 	e.spend(itx{acct: "cur", key: "big", date: e.at(-20), amt: -30000, desc: "Big Co"})
 	e.spend(itx{acct: "cur", key: "dup1", date: e.at(-5), amt: -1234, desc: "Dup Co"})
-	e.spend(itx{acct: "cur", key: "dup2", date: e.at(-4), amt: -1234, desc: "Dup Co"})
+	e.spend(itx{acct: "cur", key: "dup2", date: e.at(-5), amt: -1234, desc: "Dup Co"})
 	e.spend(itx{acct: "cur", key: "latest", date: e.at(-1), amt: -100, desc: "Latest Co"})
 	e.spend(itx{acct: "cur", key: "custom", date: e.at(-15), amt: -500, desc: "Custom Co", category: "category_zz9"})
 	e.spend(itx{acct: "cur", key: "named", date: e.at(-16), amt: -400, desc: "Named Co", category: "category_named1"})
