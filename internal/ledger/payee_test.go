@@ -51,6 +51,9 @@ func TestValidatePayeeRule(t *testing.T) {
 		{"income employer", ledger.PayeeRule{Action: "class", PayeeKey: "n:acme", FlowClass: "income", Employer: true}, ""},
 		{"employer without income", ledger.PayeeRule{Action: "class", PayeeKey: "n:acme", FlowClass: "spending", Employer: true}, "employer"},
 		{"unknown class", ledger.PayeeRule{Action: "class", PayeeKey: "n:acme", FlowClass: "gift"}, "flow_class"},
+		{"borrowing", ledger.PayeeRule{Action: "class", PayeeKey: "n:acme", FlowClass: "borrowing"}, ""},
+		{"debt repayment", ledger.PayeeRule{Action: "class", PayeeKey: "n:acme", FlowClass: "debt_repayment"}, ""},
+		{"employer with borrowing", ledger.PayeeRule{Action: "class", PayeeKey: "n:acme", FlowClass: "borrowing", Employer: true}, "employer"},
 		{"category", ledger.PayeeRule{Action: "category", PayeeKey: "n:acme", Category: "groceries"}, ""},
 		{"category blank", ledger.PayeeRule{Action: "category", PayeeKey: "n:acme"}, "category"},
 		{"recurring", ledger.PayeeRule{Action: "recurring", SeriesKey: "sub:mg:grp_1", Recurring: "confirm"}, ""},
@@ -169,6 +172,14 @@ func TestPayeeRuleEntriesNormaliseWithTheEntrysSeqAndTime(t *testing.T) {
 	s, _ = e.core().GetPayeeSetting(ctx, "mg:grp_1")
 	if s.FlowClass == nil || *s.FlowClass != "spending" || s.Employer != nil {
 		t.Fatalf("setting after a new class %+v", s)
+	}
+	// Borrowing is a class an operator may set, and the core table takes it.
+	if _, bad := e.rule(ledger.PayeeRule{Action: "class", PayeeKey: "mg:grp_1", FlowClass: "borrowing"}); bad != 0 {
+		t.Fatalf("%d unparseable after a borrowing class", bad)
+	}
+	s, _ = e.core().GetPayeeSetting(ctx, "mg:grp_1")
+	if s.FlowClass == nil || *s.FlowClass != "borrowing" || s.Employer != nil {
+		t.Fatalf("setting after the borrowing class %+v", s)
 	}
 
 	seq, _ = e.rule(ledger.PayeeRule{Action: "recurring", SeriesKey: "sub:mg:grp_1", Recurring: "confirm"})

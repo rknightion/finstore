@@ -19,7 +19,7 @@
 | ---- | ---- | ---------- |
 | payee_setting_entered_at_not_null | n | NOT NULL entered_at |
 | payee_setting_entry_seq_not_null | n | NOT NULL entry_seq |
-| payee_setting_flow_class_check | CHECK | CHECK ((flow_class = ANY (ARRAY['internal'::text, 'scope_transfer'::text, 'own_external'::text, 'investment'::text, 'debt_repayment'::text, 'income'::text, 'refund'::text, 'spending'::text]))) |
+| payee_setting_flow_class_check | CHECK | CHECK ((flow_class = ANY (ARRAY['internal'::text, 'scope_transfer'::text, 'own_external'::text, 'investment'::text, 'debt_repayment'::text, 'borrowing'::text, 'income'::text, 'refund'::text, 'spending'::text]))) |
 | payee_setting_payee_key_not_null | n | NOT NULL payee_key |
 | payee_setting_pkey | PRIMARY KEY | PRIMARY KEY (payee_key) |
 

@@ -245,7 +245,7 @@ CREATE TABLE {{schema}}.payee_setting (
   payee_key     text PRIMARY KEY,
   name          text,
   flow_class    text CHECK (flow_class IN ('internal', 'scope_transfer', 'own_external',
-                                           'investment', 'debt_repayment', 'income',
+                                           'investment', 'debt_repayment', 'borrowing', 'income',
                                            'refund', 'spending')),
   employer      boolean,                   -- only with flow_class income
   category      text,

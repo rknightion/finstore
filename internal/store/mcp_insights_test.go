@@ -252,6 +252,10 @@ func newEstate(t *testing.T) *estate {
 	e.tx(itx{acct: "biz", key: "inc1", date: e.monthDate(1, 25), amt: 300000, desc: "Biz Employer"})
 	e.tx(itx{acct: "biz", key: "inc2", date: e.monthDate(2, 10), amt: 200000, desc: "Biz Other"})
 	e.tx(itx{acct: "biz", key: "inc3", date: e.monthDate(3, 25), amt: 100000, desc: "Biz Employer"})
+	// A lender classed for debt: its money in is borrowing, not income, in two of the three months.
+	e.setting("n:biz lender", "", "debt_repayment", "", "", nil, 104)
+	e.tx(itx{acct: "biz", key: "loan1", date: e.monthDate(1, 2), amt: 60000, desc: "Biz Lender"})
+	e.tx(itx{acct: "biz", key: "loan2", date: e.monthDate(2, 2), amt: 40000, desc: "Biz Lender"})
 	e.spend(itx{acct: "biz", key: "m1g1", date: e.monthDate(1, 3), amt: -20000, desc: "Grocer Biz", category: "groceries"})
 	e.spend(itx{acct: "biz", key: "m1g2", date: e.monthDate(1, 6), amt: -20000, desc: "Grocer Biz", category: "groceries"})
 	e.spend(itx{acct: "biz", key: "m1c", date: e.monthDate(1, 9), amt: -20000, desc: "Cafe Biz", category: "eating_out"})
@@ -579,14 +583,14 @@ func TestCashFlowTool(t *testing.T) {
 		}
 	}
 	m3, m2, m1 := cf.Months[0], cf.Months[1], cf.Months[2]
-	if m1.IncomeMinor != 300000 || m1.SalaryMinor != 300000 || m1.SpendingMinor != 100000 || m1.NetMinor != 200000 ||
+	if m1.IncomeMinor != 300000 || m1.SalaryMinor != 300000 || m1.SpendingMinor != 100000 || m1.NetMinor != 260000 || m1.BorrowingMinor != 60000 ||
 		m1.SavingsRate == nil || *m1.SavingsRate != 0.6667 || m1.RefundMinor != 0 || m1.InternalOutMinor != 0 {
 		t.Errorf("month 1 = %+v", m1)
 	}
-	if m2.IncomeMinor != 200000 || m2.SalaryMinor != 0 || m2.SpendingMinor != 50000 || m2.NetMinor != 150000 || m2.SavingsRate == nil || *m2.SavingsRate != 0.75 {
+	if m2.IncomeMinor != 200000 || m2.SalaryMinor != 0 || m2.SpendingMinor != 50000 || m2.NetMinor != 190000 || m2.BorrowingMinor != 40000 || m2.SavingsRate == nil || *m2.SavingsRate != 0.75 {
 		t.Errorf("month 2 = %+v", m2)
 	}
-	if m3.IncomeMinor != 100000 || m3.SalaryMinor != 100000 || m3.SpendingMinor != 100000 || m3.NetMinor != 0 || m3.SavingsRate == nil || *m3.SavingsRate != 0 {
+	if m3.IncomeMinor != 100000 || m3.SalaryMinor != 100000 || m3.SpendingMinor != 100000 || m3.NetMinor != 0 || m3.BorrowingMinor != 0 || m3.SavingsRate == nil || *m3.SavingsRate != 0 {
 		t.Errorf("month 3 = %+v", m3)
 	}
 	// Categories: the top ones by spending in each month and scope, ties by category.
@@ -769,7 +773,7 @@ func TestFinanceProfileTool(t *testing.T) {
 			biz = &p.MonthlyMedians[i]
 		}
 	}
-	if biz == nil || biz.IncomeMinor != 200000 || biz.SalaryMinor != 100000 || biz.SpendingMinor != 100000 ||
+	if biz == nil || biz.IncomeMinor != 200000 || biz.SalaryMinor != 100000 || biz.BorrowingMinor != 40000 || biz.SpendingMinor != 100000 ||
 		biz.SavingsRate == nil || *biz.SavingsRate != 0.6667 {
 		t.Errorf("business medians = %+v", biz)
 	}

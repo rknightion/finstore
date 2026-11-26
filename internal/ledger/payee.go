@@ -56,9 +56,10 @@ const (
 // FlowClassIncome is the flow class that takes the employer flag.
 const FlowClassIncome = "income"
 
-// FlowClasses are the flow classes an operator may set on a payee.
+// FlowClasses are the flow classes an operator may set on a payee. debt_repayment on a lender
+// also makes its positive rows borrowing; borrowing sets only those.
 var FlowClasses = []string{"internal", "scope_transfer", "own_external", "investment",
-	"debt_repayment", FlowClassIncome, "refund", "spending"}
+	"debt_repayment", "borrowing", FlowClassIncome, "refund", "spending"}
 
 // AccountScopes are the scopes an operator may set on an account.
 var AccountScopes = []string{"personal", "joint", "business"}

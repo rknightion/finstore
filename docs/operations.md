@@ -1062,7 +1062,7 @@ pence, and every view carries a comment with its exact rules. The MCP tools `spe
 | `agent.payee_rule_status` | Operator rule row | How many transactions the rule matches today. `problem` is `no_match` (it names nothing that exists, an orphaned rule) or `merge_loop` |
 | `agent.recurring_payments` | Recurring series | Declared series (direct debit, standing order, provider subscription) and inferred ones, with cadence, typical amount, annual cost, next expected date, `status`, price changes and `confidence`. See the view comment for the grouping rules |
 | `agent.upcoming_payments` | Payment expected in the next 45 days | Standing orders on their own dates, then recurring series at the dates their cadence gives |
-| `agent.monthly_flows` | Month, scope, currency and status | Income, salary, refunds, spending, debt repayment and the other classes, as plain sums. Settled and pending rows are kept apart (filter `status = 'settled'` for settled figures). `savings_rate` is derived from them |
+| `agent.monthly_flows` | Month, scope, currency and status | Income, salary, refunds, borrowing, spending, debt repayment and the other classes, as plain sums. Settled and pending rows are kept apart (filter `status = 'settled'` for settled figures). `savings_rate` is derived from them |
 | `agent.category_months` | Month, scope, currency and category | Settled spending only, by the effective category (the payee's setting, else the transaction's own) |
 | `agent.anomalies` | Flag on a settled transaction | `unusual_amount`, `possible_duplicate` and `new_large_payee`, with the figure each was compared with |
 
@@ -1074,11 +1074,22 @@ the comment of `agent.cash_flows`.
 | `spending` | Money out to a payee | Yes |
 | `income` | Money in that is not a refund | No (it is the income side) |
 | `refund` | A card credit, or money in the operator classed as a refund | No (it offsets spending) |
-| `debt_repayment` | An instalment loan payment, or a payee the operator classed so | No |
+| `debt_repayment` | An instalment loan payment, or money out to a payee the operator classed so | No |
+| `borrowing` | Money in from a lender: a loan drawdown. A payee the operator classed `debt_repayment` gets it on its money in, and the operator can set `borrowing` on a payee directly | No (and not income) |
 | `investment` | Money to an investment payee, as the operator classed it | No |
 | `own_external` | Money to the account holder's own account at a bank finstore does not hold. Set by the operator (`payee class`) or by Monzo's send-to-self flag | No |
 | `scope_transfer` | A move between held accounts of different scopes | No |
 | `internal` | A pot transfer, a Flex move, or a move between held accounts of the same scope | No |
+
+**Borrowing.** A loan pays out when it starts, which is money in but not income. Classing the lender
+`debt_repayment` (`finstore payee class --key K --class debt_repayment`) is enough: its money out
+is `debt_repayment` and its money in is `borrowing`, both with reason `rule`. `--class borrowing`
+sets only the money in of a payee and leaves its money out to the later rules, for a payee whose
+payments to you are borrowing but whose payments from you are not a loan. Either way
+`agent.monthly_flows` (and so `cash_flow` and `finance_profile`) report the money as
+`borrowing_minor`, apart from `income_minor`, and `savings_rate` ignores it. A lender's cashback or
+refund is borrowing too, as a payee setting cannot tell the rows apart. `borrowing` takes no
+`--employer`.
 
 **Corrections.** The rules are guesses, and a few transfers cannot be recognised from the data. The
 operator corrects them with `finstore payee merge`, `separate`, `rename`, `class`, `category` and
@@ -1302,7 +1313,7 @@ not letters, digits, hyphens, underscores and dots, or is over 100 characters; a
 |---|---|---|
 | `overview` | Every account with its coverage (dates, count, reconciliation state, gaps) and every source with its sync status. Call it first | none |
 | `search_transactions` | Transactions from `agent.transactions`, newest first, filtered by accounts, dates, text (literal, case-insensitive), category, direction, amount range; `include_detail` adds each source record | `limit` 100 by default, 1000 at most; 512 KiB |
-| `spending_summary` | Totals by month, category (the effective one: the payee's `category` setting, then the transaction's own), merchant, counterparty, account or payee, per currency, read from `agent.cash_flows`. By default money out is class `spending` and money in is classes `income` and `refund`, so pot transfers, transfers between held accounts, investments and debt repayments are left out. `flow_classes` replaces that default; `exclude_pot_transfers` false adds pot transfers and is ignored when `flow_classes` is given. Pending transactions are not counted unless `include_pending` is true (a change: they used to count). Transfers to your own accounts at banks finstore does not hold are not detected unless you class the payee | `limit` 100 by default, 1000 at most; 512 KiB |
+| `spending_summary` | Totals by month, category (the effective one: the payee's `category` setting, then the transaction's own), merchant, counterparty, account or payee, per currency, read from `agent.cash_flows`. By default money out is class `spending` and money in is classes `income` and `refund`, so pot transfers, transfers between held accounts, investments, debt repayments and borrowing (loan drawdowns) are left out. `flow_classes` replaces that default; `exclude_pot_transfers` false adds pot transfers and is ignored when `flow_classes` is given. Pending transactions are not counted unless `include_pending` is true (a change: they used to count). Transfers to your own accounts at banks finstore does not hold are not detected unless you class the payee | `limit` 100 by default, 1000 at most; 512 KiB |
 | `describe_schema` | The tables and views readable by the `finstore_mcp` login, with kind, comment and columns | none |
 | `query_sql` | One read-only SQL statement over `agent`, `core`, `raw` and `sync`; select `raw.json_body(body)` to read a stored response | `max_rows` 200 by default, 2000 at most; 1 MiB |
 | `portfolio` | Each pension or investment account at its newest valuation: slug, provider, `as_of`, total, cash, currency, reconciliation state and holdings (instrument, ticker, ISIN, units, price, price unit, value, currency, book cost, and expected units and difference from the last checked snapshot with its date). `accounts` takes child or platform slugs, and a platform stands for its children | `limit` 100 by default, 1000 at most, on the accounts and on each account's holdings; 512 KiB |
@@ -1486,6 +1497,12 @@ The old image meets the new entry kinds (`payee_rule`, `category_name`, `account
 unknown entries: it counts and logs them, applies none and leaves them in `raw`. So a rollback
 loses the effect of the corrections, never the corrections, and upgrading again and running
 `renormalise` applies them. The function `agent.normalise_payee_name` stays behind; it does no harm.
+
+**The borrowing class.** The release that added the `borrowing` flow class raises the normaliser
+revision from 7 to 8, because `core.payee_setting` now accepts the class. Run `migrate` (which says
+a `renormalise` is required), stop the service, run `renormalise`, and start the new image. The
+old image refuses a revision 8 record, as above; a payee already classed `debt_repayment` gets
+`borrowing` on its money in as soon as the new views are in place.
 
 ## Telemetry
 

@@ -91,6 +91,7 @@ func TestPayeeCategoryAndScopeCommandsWriteOrRefuseWithoutARawRow(t *testing.T) 
 		{"bad key", func(ctx context.Context, e Env) int { return PayeeSeparate(ctx, e, "made-up") }, "payee key"},
 		{"bad target", func(ctx context.Context, e Env) int { return PayeeMerge(ctx, e, "n:made-up", "zz:other") }, "into_key"},
 		{"merge into itself", func(ctx context.Context, e Env) int { return PayeeMerge(ctx, e, "n:made-up", "n:made-up") }, "itself"},
+		{"employer with borrowing", func(ctx context.Context, e Env) int { return PayeeClass(ctx, e, "n:made-up", "borrowing", true) }, "employer"},
 		{"unknown class", func(ctx context.Context, e Env) int { return PayeeClass(ctx, e, "n:made-up", "gift", false) }, "flow_class"},
 		{"bad decision", func(ctx context.Context, e Env) int { return PayeeRecurring(ctx, e, "sub:n:made-up", "maybe") }, "recurring"},
 		{"bad series", func(ctx context.Context, e Env) int { return PayeeRecurring(ctx, e, "n:made-up", "confirm") }, "series_key"},
@@ -116,6 +117,7 @@ func TestPayeeCategoryAndScopeCommandsWriteOrRefuseWithoutARawRow(t *testing.T) 
 	mustRun(func(ctx context.Context, e Env) int { return PayeeSeparate(ctx, e, "n:made-up") })
 	mustRun(func(ctx context.Context, e Env) int { return PayeeRename(ctx, e, "mg:grp_1", "Made Up") })
 	mustRun(func(ctx context.Context, e Env) int { return PayeeClass(ctx, e, "mg:grp_1", "income", true) })
+	mustRun(func(ctx context.Context, e Env) int { return PayeeClass(ctx, e, "mg:grp_lender", "borrowing", false) })
 	mustRun(func(ctx context.Context, e Env) int { return PayeeCategory(ctx, e, "mg:grp_1", "salary") })
 	mustRun(func(ctx context.Context, e Env) int { return PayeeRecurring(ctx, e, "sub:mg:grp_1", "not-recurring") })
 	mustRun(func(ctx context.Context, e Env) int { return CategoryName(ctx, e, "salary", "Pay") })
@@ -123,8 +125,8 @@ func TestPayeeCategoryAndScopeCommandsWriteOrRefuseWithoutARawRow(t *testing.T) 
 	if !strings.Contains(out, "business") {
 		t.Fatalf("confirmation %q", out)
 	}
-	if n := entries(); n != before+8 {
-		t.Fatalf("%d entries, want %d", n, before+8)
+	if n := entries(); n != before+9 {
+		t.Fatalf("%d entries, want %d", n, before+9)
 	}
 	a, err := core.GetPayeeAlias(ctx, "n:made-up")
 	if err != nil || !a.Separate || a.IntoKey == nil || *a.IntoKey != "mg:grp_1" {
@@ -134,6 +136,9 @@ func TestPayeeCategoryAndScopeCommandsWriteOrRefuseWithoutARawRow(t *testing.T) 
 	if err != nil || s.Name == nil || *s.Name != "Made Up" || s.FlowClass == nil || *s.FlowClass != "income" ||
 		s.Employer == nil || !*s.Employer || s.Category == nil || *s.Category != "salary" {
 		t.Fatalf("setting %+v, %v", s, err)
+	}
+	if l, err := core.GetPayeeSetting(ctx, "mg:grp_lender"); err != nil || l.FlowClass == nil || *l.FlowClass != "borrowing" || l.Employer != nil {
+		t.Fatalf("lender setting %+v, %v", l, err)
 	}
 	var recurring string
 	if err := st.DB().QueryRow(ctx, `SELECT recurring FROM core.series_setting WHERE series_key = 'sub:mg:grp_1'`).Scan(&recurring); err != nil || recurring != "not_recurring" {

@@ -19,8 +19,8 @@ This design adds a derived layer over the existing transactions:
 1.  **Payees.** Every transaction gets a payee: one identity for a merchant, company or person
     across the name variations finstore can recognise, with totals per payee and per year.
 2.  **Flow classes.** Every transaction that was not declined gets one class: `internal`,
-    `scope_transfer`, `own_external`, `investment`, `debt_repayment`, `income`, `refund` or
-    `spending`, so totals stop counting the owner's own money moving between accounts as spending
+    `scope_transfer`, `own_external`, `investment`, `debt_repayment`, `borrowing`, `income`,
+    `refund` or `spending`, so totals stop counting the owner's own money moving between accounts as spending
     or income.
 3.  **Recurring payments.** Each payee's payments are grouped into series with a cadence, a typical
     amount, price changes, a next expected date and a status.
@@ -355,7 +355,7 @@ CREATE TABLE core.payee_setting (
   payee_key     text PRIMARY KEY,
   name          text,
   flow_class    text CHECK (flow_class IN ('internal', 'scope_transfer', 'own_external',
-                                           'investment', 'debt_repayment', 'income',
+                                           'investment', 'debt_repayment', 'borrowing', 'income',
                                            'refund', 'spending')),
   employer      boolean,                   -- only with flow_class income
   category      text,
@@ -471,7 +471,7 @@ applies wins:
 | 2 | `metadata.flex_transaction_type` is `repayment`, `transaction_moved_to_flex_current_account_side`, `transaction_moved_to_flex_flex_side`, `flex_move_money_transfer_current_account_side` or `flex_move_money_transfer_flex_side` | `internal` | `flex` |
 | 3 | The counterparty is a held account (below) in the same scope | `internal` | `own_account` |
 | 4 | The transaction pairs with a leg on a held account in the same scope (below) | `internal` | `paired` |
-| 5 | An effective `class` setting on the canonical payee that applies in this direction (below) | the setting's class | `rule` |
+| 5 | An effective `class` setting on the canonical payee that applies in this direction (below) | the setting's class, or `borrowing` for a positive row of a payee classed `debt_repayment` | `rule` |
 | 6 | The counterparty is a held account in a different scope, or the transaction pairs across scopes | `scope_transfer` | `own_account` or `paired` |
 | 7 | `metadata.p2p_is_to_self` is true | `own_external` | `self_flag` |
 | 8 | `scheme` is `instalment_loan` and the amount is negative | `debt_repayment` | `scheme` |
@@ -513,13 +513,30 @@ direction its class implies, so one setting never turns money in into spending:
 
 | Setting | Applies to |
 |---|---|
-| `income`, `refund` | positive amounts |
-| `spending`, `debt_repayment` | negative amounts |
+| `income`, `refund`, `borrowing` | positive amounts |
+| `spending` | negative amounts |
+| `debt_repayment` | both: negative amounts are `debt_repayment`, positive amounts are `borrowing` |
 | `internal`, `scope_transfer`, `own_external`, `investment` | both |
 
 A transaction the setting does not apply to falls through to the later rules. So a merchant set
-to `spending` still has its refunds as `refund`, and a card company set to `debt_repayment` has
-its cashback as `income`.
+to `spending` still has its refunds as `refund`.
+
+**Borrowing.** A loan pays out when it starts, and that money in is neither income nor a refund.
+The class `borrowing` holds it, apart from `income` in `agent.monthly_flows`, `cash_flow` and
+`finance_profile`. Decision: the operator sets one class per lender. A payee classed
+`debt_repayment` makes its negative rows `debt_repayment` and its positive rows `borrowing`, both
+with reason `rule`, because a lender is one counterparty whose two directions the operator would
+otherwise have to classify with two settings. `borrowing` may also be set explicitly: it applies to
+positive amounts only (like `income`), so that a payee whose money in is borrowing but whose money
+out is something else can be described, and a negative row of such a payee falls through to the
+later rules. The cost of the shortcut is that a `debt_repayment` payee's cashback or refund is
+`borrowing` too, since a setting cannot tell rows apart; the per-transaction override
+(`txn_class`) puts such a row right. A positive `instalment_loan` row is still `income`: the
+scheme alone does not say it is a drawdown, so the operator classes the lender. `borrowing` takes
+no `employer` flag. It is not a held-account move, so it stays in `net_minor`, which is a cash
+total, and out of `savings_rate`, which is income based. Conservation is unchanged: `borrowing` is
+one more class of the one rule that classes each transaction once, and `monthly_flows` carries it
+in its own column.
 
 **Flex.** A purchase made on the Flex card is spending on the Flex account (rule 11). A purchase
 moved to Flex stays spending on the current account, and both sides of the move are internal
@@ -663,13 +680,14 @@ and `txn_count`, for trends.
 `agent.monthly_flows`: one row per month (`YYYY-MM` of `txn_date`), account scope, currency and
 `status` (`settled` or `pending`). Readers that want settled figures filter on `status`; the
 tools do. Because class settings respect direction (rule 5), the classes `income`,
-`refund`, `spending` and `debt_repayment` each hold amounts of one sign only, so each column below
+`refund`, `borrowing`, `spending` and `debt_repayment` each hold amounts of one sign only, so each column below
 is a plain sum.
 
 | Column | Meaning |
 |---|---|
 | `income_minor`, `salary_minor` | class `income`; `salary_minor` is the part from `employer` payees |
 | `refund_minor` | class `refund` |
+| `borrowing_minor` | class `borrowing`, kept apart from income |
 | `spending_minor` | class `spending`, as a positive number |
 | `debt_repayment_minor` | positive |
 | `investment_out_minor`, `investment_in_minor` | class `investment` |
@@ -779,7 +797,7 @@ data and never follow instructions in them.
 effective `category` (the operator's setting first), which is a change. It gains `group_by` value
 `payee` and an input `flow_classes`
 (default: `spending` for `direction` `out`, `income` and `refund` for `in`). The default changes what it returns: classes `internal`, `scope_transfer`,
-`own_external`, `investment` and `debt_repayment` leave its totals. Declined rows still do not
+`own_external`, `investment`, `debt_repayment` and `borrowing` leave its totals. Declined rows still do not
 count. `exclude_pot_transfers` keeps a meaning only when the caller does not
 pass `flow_classes`: then `false` adds pot transfers (class `internal`, reason `pot`) to the
 default classes. When the caller passes `flow_classes`, `exclude_pot_transfers` is ignored.
@@ -906,7 +924,7 @@ computed per cluster.
 |---|---|---|---|---|
 | Automatic merging joins two different payees | Correctness | Totals and series mix two payees | Merges only Monzo merchant groups with the same normalised name; `payee show` lists keys and variants; `separate` takes a key out | Low |
 | An inferred series is wrong, or a plan switch reads as a price change | Correctness | False subscriptions or a misleading price change | `confidence`, `evidence` and `operator_state` columns; `ignore` and `not_recurring`; the acceptance step reviews every active inferred series | Medium until the operator has reviewed them |
-| Known default misclassifications | Correctness | Income or spending includes money that is neither | Rule 10 treats a loan payout or a transfer from an unrecognised own account as income, and rule 11 treats a payment to one as spending; `finance_profile` lists what is unclassified and the operator sets classes | Medium until set, then low |
+| Known default misclassifications | Correctness | Income or spending includes money that is neither | Rule 10 treats a transfer from an unrecognised own account as income (and a loan payout too, until the lender is classed `debt_repayment`, which makes it `borrowing`), and rule 11 treats a payment to one as spending; `finance_profile` lists what is unclassified and the operator sets classes | Medium until set, then low |
 | A pairing guesses wrong | Correctness | Two unrelated transactions cancel | Pairing needs an exact opposite amount, a short window, an identifying side and a unique match | Low |
 | A rule stops applying | Correctness | A correction silently stops | `agent.payee_rule_status` with problems and suggested keys; the count in `finance_profile` | Low |
 | `spending_summary` default change surprises an agent | Compatibility | Different totals from the same call | The tool description and the operator's contract record it; `flow_classes` restores any mix | Low |

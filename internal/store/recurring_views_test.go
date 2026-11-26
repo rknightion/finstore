@@ -191,7 +191,7 @@ func TestRecurringViewColumns(t *testing.T) {
 	requireColumns(t, f.q, "upcoming_payments", []string{"date", "payee_id", "payee_name", "amount_minor", "currency",
 		"source", "series_key", "account_slug"})
 	requireColumns(t, f.q, "monthly_flows", []string{"month", "scope", "currency", "status", "income_minor", "salary_minor",
-		"refund_minor", "spending_minor", "debt_repayment_minor", "investment_out_minor", "investment_in_minor",
+		"refund_minor", "borrowing_minor", "spending_minor", "debt_repayment_minor", "investment_out_minor", "investment_in_minor",
 		"own_external_out_minor", "own_external_in_minor", "scope_transfer_out_minor", "scope_transfer_in_minor",
 		"internal_out_minor", "internal_in_minor", "net_minor", "savings_rate"})
 	requireColumns(t, f.q, "category_months", []string{"month", "scope", "currency", "category", "category_name",
@@ -714,6 +714,7 @@ func TestMonthlyFlowsAndCategoryMonths(t *testing.T) {
 	r.setting("n:broker co", "", "investment", "", "", nil, 2)
 	r.setting("n:rent co", "", "", "bills", "", nil, 3)
 	r.exec(`INSERT INTO core.category_name (category, name, entry_seq, entered_at) VALUES ('groceries', 'Food shop', 4, now()), ('bills', 'Bills', 5, now())`)
+	r.setting("n:lender co", "", "debt_repayment", "", "", nil, 6)
 
 	// Personal scope, settled.
 	tx("cur", "big_employer", 10, 300000, nil)
@@ -722,6 +723,8 @@ func TestMonthlyFlowsAndCategoryMonths(t *testing.T) {
 	tx("cur", "supermarket", 13, -40000, func(x *itx) { x.category = "groceries" })
 	tx("cur", "rent_co", 14, -10000, func(x *itx) { x.category = "housing" }) // the payee's category setting wins
 	tx("cur", "loan_co", 15, -10000, func(x *itx) { x.scheme = "instalment_loan" })
+	// A drawdown from a payee classed for debt is borrowing, not income.
+	tx("cur", "lender_co", 15, 50000, nil)
 	tx("cur", "broker_out", 16, -15000, func(x *itx) { x.desc = "BROKER CO" })
 	tx("cur", "broker_in", 17, 3000, func(x *itx) { x.desc = "BROKER CO" })
 	tx("cur", "self_out", 18, -7000, func(x *itx) { x.detail = md("p2p_is_to_self", true) })
@@ -740,10 +743,10 @@ func TestMonthlyFlowsAndCategoryMonths(t *testing.T) {
 	tx("joint", "joint_shop", 12, -20000, func(x *itx) { x.category = "groceries" })
 
 	type mrow struct {
-		income, salary, refund, spending, debt, invOut, invIn, selfOut, selfIn, scopeOut, scopeIn, intOut, intIn, net int64
-		rate                                                                                                          *float64
+		income, salary, refund, borrowing, spending, debt, invOut, invIn, selfOut, selfIn, scopeOut, scopeIn, intOut, intIn, net int64
+		rate                                                                                                                     *float64
 	}
-	rows, err := r.q.Query(context.Background(), `SELECT scope, currency, status, income_minor, salary_minor, refund_minor, spending_minor,
+	rows, err := r.q.Query(context.Background(), `SELECT scope, currency, status, income_minor, salary_minor, refund_minor, borrowing_minor, spending_minor,
 		debt_repayment_minor, investment_out_minor, investment_in_minor, own_external_out_minor, own_external_in_minor,
 		scope_transfer_out_minor, scope_transfer_in_minor, internal_out_minor, internal_in_minor, net_minor, savings_rate::float8
 		FROM agent.monthly_flows WHERE month = $1`, month)
@@ -754,7 +757,7 @@ func TestMonthlyFlowsAndCategoryMonths(t *testing.T) {
 	for rows.Next() {
 		var scope, cur, status string
 		var x mrow
-		if err := rows.Scan(&scope, &cur, &status, &x.income, &x.salary, &x.refund, &x.spending, &x.debt, &x.invOut, &x.invIn,
+		if err := rows.Scan(&scope, &cur, &status, &x.income, &x.salary, &x.refund, &x.borrowing, &x.spending, &x.debt, &x.invOut, &x.invIn,
 			&x.selfOut, &x.selfIn, &x.scopeOut, &x.scopeIn, &x.intOut, &x.intIn, &x.net, &x.rate); err != nil {
 			t.Fatal(err)
 		}
@@ -765,8 +768,8 @@ func TestMonthlyFlowsAndCategoryMonths(t *testing.T) {
 		t.Fatalf("monthly_flows has %d rows for %s, want 3 (personal settled, personal pending, joint settled): %+v", len(got), month, got)
 	}
 	p := got["personal/GBP/settled"]
-	want := mrow{income: 305000, salary: 300000, refund: 2000, spending: 50000, debt: 10000, invOut: 15000, invIn: 3000,
-		selfOut: 7000, selfIn: 1000, scopeOut: 9000, intOut: 2600, intIn: 600, net: 229000}
+	want := mrow{income: 305000, salary: 300000, refund: 2000, borrowing: 50000, spending: 50000, debt: 10000, invOut: 15000, invIn: 3000,
+		selfOut: 7000, selfIn: 1000, scopeOut: 9000, intOut: 2600, intIn: 600, net: 279000}
 	rate := p.rate
 	p.rate = nil
 	if p != want {
