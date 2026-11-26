@@ -829,6 +829,7 @@ current balances.
 | `finstore account scope --slug S --scope personal\|joint\|business`, `finstore account scope --slug S --clear` | app | Sets an account's scope, or removes the setting. A pot is refused: it takes its parent's scope |
 | `finstore payee merge --key K --into K`, `separate --key K`, `rename --key K --name N`, `class --key K --class C [--employer]`, `category --key K --category C`, `recurring --series S --decision confirm\|ignore\|not-recurring`, `clear --key K --what merge\|separate\|name\|class\|category`, `clear --series S` | app | Records an operator rule about a payee key or a recurring series, as a `payee_rule` entry. The entry is checked before anything is written: a refusal names the reason and writes nothing. `rename`, `class` and `category` write against the canonical key of the key given (a key with no transactions is written as given), and a rule on an `n:` key with transactions keeps its most frequent raw name as `name_sample`. `merge` is refused when `--into` already resolves to the payee of `--key` or its merge chain returns to `--key`. Each command on a key prints the payee's effective state as `<payee id> "<name>" class=<class> category=<category> keys=<count>` |
 | `finstore payee list [--query T] [--limit N]`, `finstore payee show --key K` | app | Reads `agent.payees` and prints, to standard output only, `list` one row per payee and currency (default 50 rows, `--query` a case-insensitive part of the name) and `show` the keys, name variants, rules with their status and recurring series of the payee that `--key` belongs to. Writes nothing |
+| `finstore txn class --id U --class C [--employer]`, `finstore txn clear --id U` | app | Sets the flow class of one transaction, or removes it, as a `txn_class` entry (the id is the one `agent.transactions` shows). The entry is checked before anything is written. An id no transaction has, or a declined transaction, is refused without repeating the id; `clear` also takes the id of a transaction that has gone, while an override for it is stored. `--employer` only with `--class income`. The override applies after the pot, Flex, held-account and pairing rules and before the payee's class setting, in either direction; when one of those four rules classifies the transaction the command still writes the entry and prints a note that the override will not apply |
 | `finstore category name --category C --name N`, `finstore category clear --category C` | app | Names a category, or removes its name, as a `category_name` entry |
 | `finstore import` | app | Imports one statement from standard input |
 | `finstore load-capture --dir PATH [--dir PATH]...` | app | Loads API responses captured before the service existed. Loading twice loads once, and a capture older than what is already held never replaces newer data. A capture loaded while it was still running, then loaded again once it has finished, gets the completion of a finished fetch whose pages it already holds, without storing them again |
@@ -918,6 +919,8 @@ needs `finstore renormalise`.
 The insight views also add four `core` tables for the operator's rules (`payee_alias`,
 `payee_setting`, `series_setting` and `category_name`) and a `scope` column on `core.account`, so
 that release needs a `renormalise` too: see [The insights release](#the-insights-release).
+`core.txn_class`, for the per-transaction override, came with normaliser revision 9, so an upgrade
+from an earlier revision needs `finstore renormalise` once more.
 
 ### Reading the data
 
@@ -1093,8 +1096,8 @@ refund is borrowing too, as a payee setting cannot tell the rows apart. `borrowi
 
 **Corrections.** The rules are guesses, and a few transfers cannot be recognised from the data. The
 operator corrects them with `finstore payee merge`, `separate`, `rename`, `class`, `category` and
-`recurring`, `finstore category name`, and `finstore account scope`. Each is a kept operator entry
-(`payee_rule`, `category_name` or `account_scope`) in `raw`: append-only, never edited, and a later
+`recurring`, `finstore category name`, `finstore account scope` and `finstore txn class`. Each is a
+kept operator entry (`payee_rule`, `category_name`, `account_scope` or `txn_class`) in `raw`: append-only, never edited, and a later
 entry on the same thing wins. They apply to the whole history at once, not from the day they were
 entered, because the views read the rules at query time. They survive `renormalise`, which
 replays the entries from `raw`. `finstore payee clear` removes a rule by writing a clearing entry.
@@ -1102,6 +1105,13 @@ After a correction, `finstore payee show --key K` prints the payee's state, and
 `agent.payee_rule_status` lists every rule with its match count: a rule with `problem` `no_match`
 is orphaned, for example because its key's transactions were merged under another name, and can be
 cleared. Run the commands while the service runs: they take the writer lock in turn.
+
+**One transaction, not a payee.** A payee mixing kinds of money under one name (a company you own
+that pays salary and takes loan repayments) cannot be classed as a whole. `finstore txn class --id U
+--class own_external` (or `--class income --employer` for the salary) changes that one transaction
+only, with `flow_reason` `txn_rule`; `finstore txn clear --id U` puts it back. The override beats the
+payee's class setting but never a pot, Flex, held-account or same-scope pairing classification.
+`agent.monthly_flows` and `agent.payees` (`employer`) reflect it.
 
 **`spending_summary` changed.** It reads `agent.cash_flows` now and counts the class `spending` for
 money out, and `income` and `refund` for money in. So pot transfers, moves between held accounts,

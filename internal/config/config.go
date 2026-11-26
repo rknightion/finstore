@@ -233,6 +233,7 @@ var requirements = map[string][]string{
 	"account":      {EnvDatabaseURL},
 	"payee":        {EnvDatabaseURL},
 	"category":     {EnvDatabaseURL},
+	"txn":          {EnvDatabaseURL},
 	"load-capture": {EnvDatabaseURL},
 	"coverage":     {EnvDatabaseURL},
 	"healthcheck":  {},

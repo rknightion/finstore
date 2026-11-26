@@ -75,6 +75,8 @@ func (a *applier) operatorEntry(ctx context.Context, e *store.OperatorEntry) err
 		return a.payeeRule(ctx, e.Payload, e.Seq, e.EnteredAt)
 	case EntryCategoryName:
 		return a.categoryName(ctx, e.Payload, e.Seq, e.EnteredAt)
+	case EntryTxnClass:
+		return a.txnClass(ctx, e.Payload, e.Seq, e.EnteredAt)
 	case EntryAccountScope:
 		return a.accountScope(ctx, e.Payload)
 	}

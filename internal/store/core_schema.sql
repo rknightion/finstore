@@ -260,6 +260,18 @@ CREATE TABLE {{schema}}.series_setting (
   entry_seq   bigint NOT NULL,
   entered_at  timestamptz NOT NULL);
 
+-- The operator's flow class for one transaction: the effective state of the txn_class entries, last
+-- entry wins, a clear removes the row. txn_id is not a foreign key: the row is applied by agent.cash_flows
+-- wherever the transaction exists.
+CREATE TABLE {{schema}}.txn_class (
+  txn_id      uuid PRIMARY KEY,
+  flow_class  text NOT NULL CHECK (flow_class IN ('internal', 'scope_transfer', 'own_external',
+                                                  'investment', 'debt_repayment', 'borrowing', 'income',
+                                                  'refund', 'spending')),
+  employer    boolean NOT NULL DEFAULT false CHECK (NOT employer OR flow_class = 'income'),
+  entry_seq   bigint NOT NULL,
+  entered_at  timestamptz NOT NULL);
+
 CREATE TABLE {{schema}}.category_name (
   category    text PRIMARY KEY,            -- as agent.transactions.category
   name        text NOT NULL,

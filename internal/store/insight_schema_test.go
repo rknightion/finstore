@@ -19,7 +19,7 @@ func TestInsightTablesAndScopeExistInEveryBuild(t *testing.T) {
 	}
 	defer func() { _ = store.DropCoreNext(ctx, owner.DB()) }()
 	for _, schema := range []string{"core", "core_next"} {
-		for _, table := range []string{"payee_alias", "payee_setting", "series_setting", "category_name"} {
+		for _, table := range []string{"payee_alias", "payee_setting", "series_setting", "category_name", "txn_class"} {
 			var ok bool
 			if err := owner.DB().QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = $1 AND tablename = $2)`,
 				schema, table).Scan(&ok); err != nil || !ok {
@@ -38,6 +38,8 @@ func TestInsightTablesAndScopeExistInEveryBuild(t *testing.T) {
 			`INSERT INTO ` + schema + `.payee_alias (payee_key, entry_seq, entered_at) VALUES ('n:made up', 1, now())`,
 			`INSERT INTO ` + schema + `.payee_setting (payee_key, flow_class, entry_seq, entered_at) VALUES ('n:made up', 'bogus', 1, now())`,
 			`INSERT INTO ` + schema + `.series_setting (series_key, recurring, entry_seq, entered_at) VALUES ('sub:made up', 'bogus', 1, now())`,
+			`INSERT INTO ` + schema + `.txn_class (txn_id, flow_class, entry_seq, entered_at) VALUES (gen_random_uuid(), 'bogus', 1, now())`,
+			`INSERT INTO ` + schema + `.txn_class (txn_id, flow_class, employer, entry_seq, entered_at) VALUES (gen_random_uuid(), 'spending', true, 1, now())`,
 		}
 		for _, q := range bad {
 			if _, err := owner.DB().Exec(ctx, q); err == nil {
@@ -49,6 +51,7 @@ func TestInsightTablesAndScopeExistInEveryBuild(t *testing.T) {
 			`INSERT INTO ` + schema + `.payee_setting (payee_key, flow_class, employer, entry_seq, entered_at) VALUES ('n:made up', 'income', true, 1, now())`,
 			`INSERT INTO ` + schema + `.series_setting (series_key, recurring, entry_seq, entered_at) VALUES ('sub:made up', 'confirm', 1, now())`,
 			`INSERT INTO ` + schema + `.category_name (category, name, entry_seq, entered_at) VALUES ('eating_out', 'Eating out', 1, now())`,
+			`INSERT INTO ` + schema + `.txn_class (txn_id, flow_class, employer, entry_seq, entered_at) VALUES (gen_random_uuid(), 'income', true, 1, now())`,
 		}
 		for _, q := range good {
 			if _, err := owner.DB().Exec(ctx, q); err != nil {
@@ -123,7 +126,7 @@ func TestMigrateOverRevisionSixWithoutTheFunction(t *testing.T) {
 	ctx := context.Background()
 	owner := openStore(t, c.owner)
 	if _, err := owner.DB().Exec(ctx, `DROP FUNCTION agent.normalise_payee_name(text) CASCADE;
-		DROP TABLE core.payee_alias, core.payee_setting, core.series_setting, core.category_name CASCADE;
+		DROP TABLE core.payee_alias, core.payee_setting, core.series_setting, core.category_name, core.txn_class CASCADE;
 		ALTER TABLE core.account DROP COLUMN scope CASCADE;
 		UPDATE core.projection_state SET normaliser_rev = 6`); err != nil {
 		t.Fatal(err)

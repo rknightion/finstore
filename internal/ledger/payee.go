@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/rknightion/finstore/internal/store"
 )
 
@@ -20,6 +22,8 @@ const (
 	EntryPayeeRule = "payee_rule"
 	// EntryCategoryName names a category, or clears its name. Payload: CategoryName.
 	EntryCategoryName = "category_name"
+	// EntryTxnClass sets the flow class of one transaction, or clears it. Payload: TxnClass.
+	EntryTxnClass = "txn_class"
 	// EntryAccountScope sets an account's scope, or clears it. Payload: AccountScope.
 	EntryAccountScope = "account_scope"
 )
@@ -103,6 +107,45 @@ type CategoryName struct {
 type AccountScope struct {
 	Slug  string  `json:"slug"`
 	Scope *string `json:"scope"`
+}
+
+// TxnClass is the payload of a txn_class operator entry. A null FlowClass clears the override of
+// the transaction. A later entry for the same transaction replaces an earlier one. Employer only
+// goes with income.
+type TxnClass struct {
+	TxnID     string  `json:"txn_id"`
+	FlowClass *string `json:"flow_class"`
+	Employer  bool    `json:"employer,omitempty"`
+}
+
+// ParseTxnID reads the transaction id of a txn_class entry. The error carries no part of id.
+func ParseTxnID(id string) (uuid.UUID, error) {
+	u, err := uuid.Parse(id)
+	if err != nil {
+		return uuid.Nil, errors.New("txn_id must be a transaction id (a UUID)")
+	}
+	return u, nil
+}
+
+// ValidateTxnClass checks a txn_class payload. Whether the transaction exists is the CLI's question:
+// a rebuild may apply the entry before the transaction is loaded, so the ledger cannot ask it.
+func ValidateTxnClass(p TxnClass) error {
+	if _, err := ParseTxnID(p.TxnID); err != nil {
+		return err
+	}
+	if p.FlowClass == nil {
+		if p.Employer {
+			return errors.New("employer is accepted only with flow_class income")
+		}
+		return nil
+	}
+	if !slices.Contains(FlowClasses, *p.FlowClass) {
+		return fmt.Errorf("flow_class must be one of %s", strings.Join(FlowClasses, ", "))
+	}
+	if p.Employer && *p.FlowClass != FlowClassIncome {
+		return errors.New("employer is accepted only with flow_class income")
+	}
+	return nil
 }
 
 // ValidatePayeeKey reports whether key matches the payee key grammar ^(mg|mu|n|x):.+$. The payee
@@ -370,6 +413,19 @@ func (a *applier) categoryName(ctx context.Context, payload []byte, seq int64, a
 		return a.core.DeleteCategoryName(ctx, p.Category)
 	}
 	return a.core.PutCategoryName(ctx, store.CategoryName{Category: p.Category, Name: *p.Name, EntrySeq: seq, EnteredAt: at})
+}
+
+// txnClass sets or clears the class override of one transaction.
+func (a *applier) txnClass(ctx context.Context, payload []byte, seq int64, at time.Time) error {
+	var p TxnClass
+	if err := json.Unmarshal(payload, &p); err != nil || ValidateTxnClass(p) != nil {
+		return unparseable("bad_payload")
+	}
+	id, _ := ParseTxnID(p.TxnID)
+	if p.FlowClass == nil {
+		return a.core.DeleteTxnClass(ctx, id)
+	}
+	return a.core.PutTxnClass(ctx, store.TxnClass{TxnID: id, FlowClass: *p.FlowClass, Employer: p.Employer, EntrySeq: seq, EnteredAt: at})
 }
 
 // accountScope sets or clears core.account.scope through the read and upsert path account_end uses.

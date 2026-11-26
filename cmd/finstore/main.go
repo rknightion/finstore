@@ -49,6 +49,7 @@ commands:
   payee merge|separate|rename|class|category|recurring|clear
                               record an operator rule about a payee or a recurring series
   category name|clear         name a category, or clear its name
+  txn class|clear             set the flow class of one transaction, or clear it
   import                      import one statement from standard input
   load-capture                load API responses captured before the service existed
   coverage [--json]           print what is held for each account, and the gaps
@@ -129,6 +130,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return runPayee(ctx, env, rest, flags, parse)
 	case "category":
 		return runCategory(ctx, env, rest, flags, parse)
+	case "txn":
+		return runTxn(ctx, env, rest, flags, parse)
 	case "import":
 		fs := flags(command)
 		account := fs.String("account", "", "slug of the account the statement belongs to, or of the platform for an investment file")
@@ -359,6 +362,35 @@ func runPayee(ctx context.Context, env app.Env, args []string,
 		return app.PayeeClear(ctx, env, *key, *what, *series)
 	default:
 		_, _ = fmt.Fprintf(env.Stderr, "finstore payee: unknown subcommand %q\n", args[0])
+		return exitUsage
+	}
+}
+
+func runTxn(ctx context.Context, env app.Env, args []string,
+	flags func(string) *flag.FlagSet, parse func(*flag.FlagSet, []string) bool,
+) int {
+	if len(args) == 0 {
+		_, _ = fmt.Fprintln(env.Stderr, "finstore txn: expected class or clear")
+		return exitUsage
+	}
+	command := "txn " + args[0]
+	fs := flags(command)
+	id := fs.String("id", "", "the transaction id, as agent.transactions shows it")
+	switch args[0] {
+	case "class":
+		class := fs.String("class", "", "the flow class: "+strings.Join(ledger.FlowClasses, ", "))
+		employer := fs.Bool("employer", false, "the transaction is pay from an employer (only with --class income)")
+		if !parse(fs, args[1:]) || !requireFlags(env, command, map[string]string{"id": *id, "class": *class}) {
+			return exitUsage
+		}
+		return app.TxnClass(ctx, env, *id, *class, *employer)
+	case "clear":
+		if !parse(fs, args[1:]) || !requireFlags(env, command, map[string]string{"id": *id}) {
+			return exitUsage
+		}
+		return app.TxnClear(ctx, env, *id)
+	default:
+		_, _ = fmt.Fprintf(env.Stderr, "finstore txn: unknown subcommand %q\n", args[0])
 		return exitUsage
 	}
 }
