@@ -1055,7 +1055,7 @@ pence, and every view carries a comment with its exact rules. The MCP tools `spe
 | View | One row per | Rules |
 |---|---|---|
 | `agent.account_scopes` | Account | The scope is the operator's setting, else a pot's parent scope, else `joint` or `business` from the account type, else `personal`. `scope_source` says which (`setting`, `parent`, `type`, `default`) |
-| `agent.payee_keys` | Payee key | How keys (`mg:` merchant group, `mu:` Monzo user, `n:` normalised name, `x:` scheme) resolve to a payee. Two `mg:` keys that share a most frequent merchant name merge by themselves; the other kinds never do. An operator merge or separation overrides. `merge_loop` flags a merge that cannot apply |
+| `agent.payee_keys` | Payee key | How keys (`mg:` merchant group, `mu:` Monzo user; an id starting `anonuser_` is not one, so that row takes its `n:` key from the counterparty name, `n:` normalised name, `x:` scheme) resolve to a payee. Two `mg:` keys that share a most frequent merchant name merge by themselves; the other kinds never do. An operator merge or separation overrides. `merge_loop` flags a merge that cannot apply |
 | `agent.cash_flows` | Transaction that is not declined | The ledger row with its payee, its account scope and one flow class (below). Pending rows are included, so a reader decides about them. Everything else reads this view |
 | `agent.payees` | Payee and currency | Settled totals (lifetime and last 12 months), the key list, name variants, effective class and category, and the count of recurring series |
 | `agent.payee_years` | Payee, currency and calendar year | Money out and in, and the count, over every class |

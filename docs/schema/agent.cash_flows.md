@@ -47,7 +47,10 @@ CREATE VIEW cash_flows AS (
             (((t.detail -> 'metadata'::text) ->> 'flex_transaction_type'::text) = ANY (ARRAY['repayment'::text, 'transaction_moved_to_flex_current_account_side'::text, 'transaction_moved_to_flex_flex_side'::text, 'flex_move_money_transfer_current_account_side'::text, 'flex_move_money_transfer_flex_side'::text])) AS is_flex,
             COALESCE((((t.detail -> 'metadata'::text) ->> 'p2p_is_to_self'::text) = 'true'::text), false) AS self_flag,
             NULLIF(((t.detail -> 'merchant'::text) ->> 'group_id'::text), ''::text) AS mgid,
-            NULLIF(((t.detail -> 'counterparty'::text) ->> 'user_id'::text), ''::text) AS muid,
+                CASE
+                    WHEN (((t.detail -> 'counterparty'::text) ->> 'user_id'::text) ~~ 'anonuser\_%'::text) THEN NULL::text
+                    ELSE NULLIF(((t.detail -> 'counterparty'::text) ->> 'user_id'::text), ''::text)
+                END AS muid,
             NULLIF(((t.detail -> 'counterparty'::text) ->> 'account_id'::text), ''::text) AS cp_acct,
             NULLIF(regexp_replace(COALESCE(((t.detail -> 'counterparty'::text) ->> 'sort_code'::text), ''::text), '\D'::text, ''::text, 'g'::text), ''::text) AS cp_sc,
             NULLIF(regexp_replace(COALESCE(((t.detail -> 'counterparty'::text) ->> 'account_number'::text), ''::text), '\D'::text, ''::text, 'g'::text), ''::text) AS cp_an,
