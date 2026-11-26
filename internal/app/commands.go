@@ -78,6 +78,7 @@ var investmentFormats = map[string]ledger.InvestmentNormaliser{
 	string(importer.FormatFidelitySummaryCSV):      importer.FidelitySummaryNormaliser{},
 	string(importer.FormatFidelityTradeNotePDF):    importer.FidelityTradeNoteNormaliser{},
 	string(importer.FormatFidelityTransactionsCSV): importer.FidelityTransactionsNormaliser{},
+	string(importer.FormatFreetradeActivityCSV):    importer.FreetradeActivityNormaliser{},
 }
 
 // rejectionText says in the operator's terms why the projection refused a file. The categories
@@ -336,7 +337,7 @@ var (
 	currencyRE   = regexp.MustCompile(`^[A-Z]{3}$`)
 	accountTypes = []string{"current", "joint", "savings", "mortgage", typePlatform}
 	// platformProviders are the values of --provider.
-	platformProviders = []string{ledger.ProviderFidelity, ledger.ProviderAviva}
+	platformProviders = []string{ledger.ProviderFidelity, ledger.ProviderAviva, ledger.ProviderFreetrade}
 )
 
 func (s AccountSpec) validate() error {

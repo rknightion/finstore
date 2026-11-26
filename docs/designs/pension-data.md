@@ -208,6 +208,7 @@ but are left out of the `agent` views and of replay, and its verdict comes from 
 | `fidelity-trade-note-pdf` | fidelity | PDF | `trade_note` | Trade notes |
 | `aviva-capture-json` | aviva | JSON | `capture` | Holdings, valuations, contributions |
 | `aviva-annual-pdf` | aviva | PDF | `statement` | Statement, transfers out |
+| `freetrade-activity-csv` | freetrade | CSV | `ledger` | Events (added later: see `docs/operations.md`, Freetrade activity statements) |
 
 ### Data model
 

@@ -37,7 +37,7 @@
 | investment_event_cash_minor_not_null | n | NOT NULL cash_minor |
 | investment_event_currency_not_null | n | NOT NULL currency |
 | investment_event_current_hash_not_null | n | NOT NULL current_hash |
-| investment_event_event_type_check | CHECK | CHECK ((event_type = ANY (ARRAY['contribution'::text, 'buy'::text, 'sell'::text, 'transfer_in'::text, 'transfer_out'::text, 'fee'::text, 'tax'::text, 'interest'::text, 'withdrawal'::text, 'adjustment'::text, 'sibling_transfer'::text, 'internal'::text]))) |
+| investment_event_event_type_check | CHECK | CHECK ((event_type = ANY (ARRAY['contribution'::text, 'buy'::text, 'sell'::text, 'transfer_in'::text, 'transfer_out'::text, 'fee'::text, 'tax'::text, 'interest'::text, 'withdrawal'::text, 'adjustment'::text, 'sibling_transfer'::text, 'internal'::text, 'income'::text, 'corporate_action'::text]))) |
 | investment_event_event_type_not_null | n | NOT NULL event_type |
 | investment_event_first_seen_at_not_null | n | NOT NULL first_seen_at |
 | investment_event_flow_minor_not_null | n | NOT NULL flow_minor |

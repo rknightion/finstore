@@ -164,8 +164,10 @@ CREATE TABLE {{schema}}.direct_debit_version (
 -- sequence, so a rebuild gives identical rows. Money is an integer in the currency's minor unit;
 -- units and prices are numeric and cross the Go boundary as decimal text, never a float. Stored
 -- units are unsigned on an event, and event_type gives direction; a cash row stores no units.
--- gross_minor is the row's amount as printed. An event's effective date is settle_date, or
--- order_date when it has none.
+-- gross_minor is the row's amount as printed, in the event's currency (as is price); cash_minor
+-- and flow_minor are always in the account's currency, so a row printed in another currency
+-- carries its cash effect converted at its own printed rate. An event's effective date is
+-- settle_date, or order_date when it has none.
 CREATE TABLE {{schema}}.instrument (
   id uuid PRIMARY KEY, provider text NOT NULL, provider_key text NOT NULL, ticker text,
   UNIQUE (provider, provider_key));
@@ -178,7 +180,8 @@ CREATE TABLE {{schema}}.investment_event (
   id uuid PRIMARY KEY, account_id uuid NOT NULL REFERENCES {{schema}}.account(id),
   source text NOT NULL, source_key text NOT NULL, event_type text NOT NULL
     CHECK (event_type IN ('contribution','buy','sell','transfer_in','transfer_out','fee','tax',
-                          'interest','withdrawal','adjustment','sibling_transfer','internal')),
+                          'interest','withdrawal','adjustment','sibling_transfer','internal',
+                          'income','corporate_action')),
   provider_type text NOT NULL, instrument_id uuid REFERENCES {{schema}}.instrument(id),
   instrument_name text, order_date date NOT NULL, settle_date date,
   units numeric, price numeric, price_unit text CHECK (price_unit IN ('GBP','GBX')),

@@ -49,7 +49,8 @@ type AccountAdd struct {
 	Currency       string `json:"currency"`
 	Name           string `json:"name"`
 	ExpectsImports bool   `json:"expects_imports"`
-	// Provider is required for type platform (fidelity or aviva) and refused for any other type.
+	// Provider is required for type platform (fidelity, aviva or freetrade) and refused for any
+	// other type.
 	Provider string `json:"provider,omitempty"`
 }
 

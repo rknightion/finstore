@@ -229,7 +229,11 @@ func sanitiseInvestmentResult(provider string, r InvestmentResult) (out Investme
 		if a.AccountKey == "" || accounts[a.AccountKey] || !slices.Contains(p.products, a.Product) {
 			return out, false
 		}
-		if _, ok := lastFour(a.AccountKey); !ok {
+		if p.productKeys {
+			if a.AccountKey != a.Product {
+				return out, false
+			}
+		} else if _, ok := lastFour(a.AccountKey); !ok {
 			return out, false
 		}
 		accounts[a.AccountKey] = true
@@ -347,7 +351,7 @@ func sanitiseInvestmentResult(provider string, r InvestmentResult) (out Investme
 func validEventType(t string) bool {
 	switch t {
 	case EventContribution, EventBuy, EventSell, EventTransferIn, EventTransferOut, EventFee, EventTax, EventInterest,
-		EventWithdrawal, EventAdjustment, EventSiblingTransfer, EventInternal:
+		EventWithdrawal, EventAdjustment, EventSiblingTransfer, EventInternal, EventIncome, EventCorporateAction:
 		return true
 	}
 	return false
