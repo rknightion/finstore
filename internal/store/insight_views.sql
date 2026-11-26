@@ -92,7 +92,7 @@ CREATE VIEW agent.payee_keys AS
 WITH RECURSIVE txn AS MATERIALIZED (
   SELECT t.txn_date,
          nullif(t.detail -> 'merchant' ->> 'group_id', '') AS mgid,
-         nullif(t.detail -> 'counterparty' ->> 'user_id', '') AS muid,
+         CASE WHEN t.detail -> 'counterparty' ->> 'user_id' LIKE 'anonuser\_%' THEN NULL ELSE nullif(t.detail -> 'counterparty' ->> 'user_id', '') END AS muid,
          coalesce(nullif(t.counterparty, ''), nullif(t.description, '')) AS key_name,
          coalesce(nullif(t.merchant_name, ''), nullif(t.detail -> 'merchant' ->> 'name', '')) AS mname,
          coalesce(nullif(t.scheme, ''), 'unknown') AS scheme
@@ -224,7 +224,7 @@ LEFT JOIN s_name sn ON sn.pid = kc.payee_id
 LEFT JOIN s_class sc ON sc.pid = kc.payee_id
 LEFT JOIN s_cat sy ON sy.pid = kc.payee_id;
 
-COMMENT ON VIEW agent.payee_keys IS $c$How payee keys resolve to payees: one row per payee key that has a transaction that is not declined, or that an operator payee rule names (txn_count 0 then). payee_id is the canonical key. Rules: keys are mg:<merchant group id>, mu:<Monzo user id>, n:<normalised name> or x:<scheme>. Two mg: keys are one automatic group when the most frequent normalised merchant name of each (ties by the lowest name) is the same; mu:, n: and x: keys never merge automatically. A key with an operator separate setting leaves its group. A group is identified by its member with the earliest first transaction, ties by the lowest key. An operator merge on any member moves the whole group into the payee its target key belongs to; when members carry different merges the highest entry_seq wins. Merge targets are followed at most ten steps; a loop or a longer chain leaves the group unmerged and sets merge_loop. setting_name, setting_flow_class, setting_employer and setting_category are the payee's operator settings, collected from every key of the payee, per setting the non-null value with the highest entry_seq. A rule stored against an n: key resolves through normalise_payee_name(name_sample), so it follows the normaliser. group_id is the identity of the key's own group.$c$;
+COMMENT ON VIEW agent.payee_keys IS $c$How payee keys resolve to payees: one row per payee key that has a transaction that is not declined, or that an operator payee rule names (txn_count 0 then). payee_id is the canonical key. Rules: keys are mg:<merchant group id>, mu:<Monzo user id>, n:<normalised name> or x:<scheme>. A Monzo user id that starts with anonuser_ is not an identity (Monzo makes a new one for each payment from a counterparty outside Monzo), so such a transaction is keyed by its counterparty name (n:) like one without a user id. Two mg: keys are one automatic group when the most frequent normalised merchant name of each (ties by the lowest name) is the same; mu:, n: and x: keys never merge automatically. A key with an operator separate setting leaves its group. A group is identified by its member with the earliest first transaction, ties by the lowest key. An operator merge on any member moves the whole group into the payee its target key belongs to; when members carry different merges the highest entry_seq wins. Merge targets are followed at most ten steps; a loop or a longer chain leaves the group unmerged and sets merge_loop. setting_name, setting_flow_class, setting_employer and setting_category are the payee's operator settings, collected from every key of the payee, per setting the non-null value with the highest entry_seq. A rule stored against an n: key resolves through normalise_payee_name(name_sample), so it follows the normaliser. group_id is the identity of the key's own group.$c$;
 
 -- cash_flows: every transaction that is not declined, once, with its payee and one flow class. The
 -- first rule that applies wins (see the view comment). Held accounts are matched by equality joins
@@ -253,7 +253,7 @@ tx AS MATERIALIZED (
            'flex_move_money_transfer_current_account_side', 'flex_move_money_transfer_flex_side') AS is_flex,
          coalesce(t.detail -> 'metadata' ->> 'p2p_is_to_self' = 'true', false) AS self_flag,
          nullif(t.detail -> 'merchant' ->> 'group_id', '') AS mgid,
-         nullif(t.detail -> 'counterparty' ->> 'user_id', '') AS muid,
+         CASE WHEN t.detail -> 'counterparty' ->> 'user_id' LIKE 'anonuser\_%' THEN NULL ELSE nullif(t.detail -> 'counterparty' ->> 'user_id', '') END AS muid,
          nullif(t.detail -> 'counterparty' ->> 'account_id', '') AS cp_acct,
          nullif(regexp_replace(coalesce(t.detail -> 'counterparty' ->> 'sort_code', ''), '\D', '', 'g'), '') AS cp_sc,
          nullif(regexp_replace(coalesce(t.detail -> 'counterparty' ->> 'account_number', ''), '\D', '', 'g'), '') AS cp_an,
