@@ -546,68 +546,71 @@
 <!-- agent.monthly_flows -->
 <g id="node13" class="node">
 <title>agent.monthly_flows</title>
-<polygon fill="#efefef" stroke="none" points="4208.18,-2284.2 4208.18,-2319.8 4449.33,-2319.8 4449.33,-2284.2 4208.18,-2284.2"/>
-<polygon fill="none" stroke="black" points="4208.18,-2284.2 4208.18,-2319.8 4449.33,-2319.8 4449.33,-2284.2 4208.18,-2284.2"/>
-<text text-anchor="start" x="4215.18" y="-2297.6" font-family="Arial Bold" font-size="18.00">agent.monthly_flows</text>
-<text text-anchor="start" x="4367.66" y="-2297.6" font-family="Arial" font-size="14.00">    </text>
-<text text-anchor="start" x="4398.78" y="-2297.6" font-family="Arial" font-size="14.00" fill="#666666">[VIEW]</text>
-<polygon fill="none" stroke="black" points="4208.18,-2253.4 4208.18,-2284.2 4449.33,-2284.2 4449.33,-2253.4 4208.18,-2253.4"/>
-<text text-anchor="start" x="4215.18" y="-2265.6" font-family="Arial" font-size="14.00">currency </text>
-<text text-anchor="start" x="4272.75" y="-2265.6" font-family="Arial" font-size="14.00" fill="#666666">[text]</text>
-<polygon fill="none" stroke="black" points="4208.18,-2222.6 4208.18,-2253.4 4449.33,-2253.4 4449.33,-2222.6 4208.18,-2222.6"/>
-<text text-anchor="start" x="4215.18" y="-2234.8" font-family="Arial" font-size="14.00">debt_repayment_minor </text>
-<text text-anchor="start" x="4363.04" y="-2234.8" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
-<polygon fill="none" stroke="black" points="4208.18,-2191.8 4208.18,-2222.6 4449.33,-2222.6 4449.33,-2191.8 4208.18,-2191.8"/>
-<text text-anchor="start" x="4215.18" y="-2204" font-family="Arial" font-size="14.00">income_minor </text>
-<text text-anchor="start" x="4306.99" y="-2204" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
-<polygon fill="none" stroke="black" points="4208.18,-2161 4208.18,-2191.8 4449.33,-2191.8 4449.33,-2161 4208.18,-2161"/>
-<text text-anchor="start" x="4215.18" y="-2173.2" font-family="Arial" font-size="14.00">internal_in_minor </text>
-<text text-anchor="start" x="4326.46" y="-2173.2" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
-<polygon fill="none" stroke="black" points="4208.18,-2130.2 4208.18,-2161 4449.33,-2161 4449.33,-2130.2 4208.18,-2130.2"/>
-<text text-anchor="start" x="4215.18" y="-2142.4" font-family="Arial" font-size="14.00">internal_out_minor </text>
-<text text-anchor="start" x="4335.03" y="-2142.4" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
-<polygon fill="none" stroke="black" points="4208.18,-2099.4 4208.18,-2130.2 4449.33,-2130.2 4449.33,-2099.4 4208.18,-2099.4"/>
-<text text-anchor="start" x="4215.18" y="-2111.6" font-family="Arial" font-size="14.00">investment_in_minor </text>
-<text text-anchor="start" x="4348.24" y="-2111.6" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
-<polygon fill="none" stroke="black" points="4208.18,-2068.6 4208.18,-2099.4 4449.33,-2099.4 4449.33,-2068.6 4208.18,-2068.6"/>
-<text text-anchor="start" x="4215.18" y="-2080.8" font-family="Arial" font-size="14.00">investment_out_minor </text>
-<text text-anchor="start" x="4356.8" y="-2080.8" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
-<polygon fill="none" stroke="black" points="4208.18,-2037.8 4208.18,-2068.6 4449.33,-2068.6 4449.33,-2037.8 4208.18,-2037.8"/>
-<text text-anchor="start" x="4215.18" y="-2050" font-family="Arial" font-size="14.00">month </text>
-<text text-anchor="start" x="4257.98" y="-2050" font-family="Arial" font-size="14.00" fill="#666666">[text]</text>
-<polygon fill="none" stroke="black" points="4208.18,-2007 4208.18,-2037.8 4449.33,-2037.8 4449.33,-2007 4208.18,-2007"/>
-<text text-anchor="start" x="4215.18" y="-2019.2" font-family="Arial" font-size="14.00">net_minor </text>
-<text text-anchor="start" x="4281.32" y="-2019.2" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
-<polygon fill="none" stroke="black" points="4208.18,-1976.2 4208.18,-2007 4449.33,-2007 4449.33,-1976.2 4208.18,-1976.2"/>
-<text text-anchor="start" x="4215.18" y="-1988.4" font-family="Arial" font-size="14.00">own_external_in_minor </text>
-<text text-anchor="start" x="4363.82" y="-1988.4" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
-<polygon fill="none" stroke="black" points="4208.18,-1945.4 4208.18,-1976.2 4449.33,-1976.2 4449.33,-1945.4 4208.18,-1945.4"/>
-<text text-anchor="start" x="4215.18" y="-1957.6" font-family="Arial" font-size="14.00">own_external_out_minor </text>
-<text text-anchor="start" x="4372.38" y="-1957.6" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
-<polygon fill="none" stroke="black" points="4208.18,-1914.6 4208.18,-1945.4 4449.33,-1945.4 4449.33,-1914.6 4208.18,-1914.6"/>
-<text text-anchor="start" x="4215.18" y="-1926.8" font-family="Arial" font-size="14.00">refund_minor </text>
-<text text-anchor="start" x="4301.56" y="-1926.8" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
-<polygon fill="none" stroke="black" points="4208.18,-1883.8 4208.18,-1914.6 4449.33,-1914.6 4449.33,-1883.8 4208.18,-1883.8"/>
-<text text-anchor="start" x="4215.18" y="-1896" font-family="Arial" font-size="14.00">salary_minor </text>
-<text text-anchor="start" x="4299.2" y="-1896" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
-<polygon fill="none" stroke="black" points="4208.18,-1853 4208.18,-1883.8 4449.33,-1883.8 4449.33,-1853 4208.18,-1853"/>
-<text text-anchor="start" x="4215.18" y="-1865.2" font-family="Arial" font-size="14.00">savings_rate </text>
-<text text-anchor="start" x="4298.45" y="-1865.2" font-family="Arial" font-size="14.00" fill="#666666">[numeric]</text>
-<polygon fill="none" stroke="black" points="4208.18,-1822.2 4208.18,-1853 4449.33,-1853 4449.33,-1822.2 4208.18,-1822.2"/>
-<text text-anchor="start" x="4215.18" y="-1834.4" font-family="Arial" font-size="14.00">scope </text>
-<text text-anchor="start" x="4256.43" y="-1834.4" font-family="Arial" font-size="14.00" fill="#666666">[text]</text>
-<polygon fill="none" stroke="black" points="4208.18,-1791.4 4208.18,-1822.2 4449.33,-1822.2 4449.33,-1791.4 4208.18,-1791.4"/>
-<text text-anchor="start" x="4215.18" y="-1803.6" font-family="Arial" font-size="14.00">scope_transfer_in_minor </text>
-<text text-anchor="start" x="4373.15" y="-1803.6" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
-<polygon fill="none" stroke="black" points="4208.18,-1760.6 4208.18,-1791.4 4449.33,-1791.4 4449.33,-1760.6 4208.18,-1760.6"/>
-<text text-anchor="start" x="4215.18" y="-1772.8" font-family="Arial" font-size="14.00">scope_transfer_out_minor </text>
-<text text-anchor="start" x="4381.71" y="-1772.8" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
-<polygon fill="none" stroke="black" points="4208.18,-1729.8 4208.18,-1760.6 4449.33,-1760.6 4449.33,-1729.8 4208.18,-1729.8"/>
-<text text-anchor="start" x="4215.18" y="-1742" font-family="Arial" font-size="14.00">spending_minor </text>
-<text text-anchor="start" x="4318.69" y="-1742" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
-<polygon fill="none" stroke="black" points="4208.18,-1699 4208.18,-1729.8 4449.33,-1729.8 4449.33,-1699 4208.18,-1699"/>
-<text text-anchor="start" x="4215.18" y="-1711.2" font-family="Arial" font-size="14.00">status </text>
-<text text-anchor="start" x="4256.42" y="-1711.2" font-family="Arial" font-size="14.00" fill="#666666">[text]</text>
+<polygon fill="#efefef" stroke="none" points="4208.18,-2299.6 4208.18,-2335.2 4449.33,-2335.2 4449.33,-2299.6 4208.18,-2299.6"/>
+<polygon fill="none" stroke="black" points="4208.18,-2299.6 4208.18,-2335.2 4449.33,-2335.2 4449.33,-2299.6 4208.18,-2299.6"/>
+<text text-anchor="start" x="4215.18" y="-2313" font-family="Arial Bold" font-size="18.00">agent.monthly_flows</text>
+<text text-anchor="start" x="4367.66" y="-2313" font-family="Arial" font-size="14.00">    </text>
+<text text-anchor="start" x="4398.78" y="-2313" font-family="Arial" font-size="14.00" fill="#666666">[VIEW]</text>
+<polygon fill="none" stroke="black" points="4208.18,-2268.8 4208.18,-2299.6 4449.33,-2299.6 4449.33,-2268.8 4208.18,-2268.8"/>
+<text text-anchor="start" x="4215.18" y="-2281" font-family="Arial" font-size="14.00">borrowing_minor </text>
+<text text-anchor="start" x="4323.34" y="-2281" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
+<polygon fill="none" stroke="black" points="4208.18,-2238 4208.18,-2268.8 4449.33,-2268.8 4449.33,-2238 4208.18,-2238"/>
+<text text-anchor="start" x="4215.18" y="-2250.2" font-family="Arial" font-size="14.00">currency </text>
+<text text-anchor="start" x="4272.75" y="-2250.2" font-family="Arial" font-size="14.00" fill="#666666">[text]</text>
+<polygon fill="none" stroke="black" points="4208.18,-2207.2 4208.18,-2238 4449.33,-2238 4449.33,-2207.2 4208.18,-2207.2"/>
+<text text-anchor="start" x="4215.18" y="-2219.4" font-family="Arial" font-size="14.00">debt_repayment_minor </text>
+<text text-anchor="start" x="4363.04" y="-2219.4" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
+<polygon fill="none" stroke="black" points="4208.18,-2176.4 4208.18,-2207.2 4449.33,-2207.2 4449.33,-2176.4 4208.18,-2176.4"/>
+<text text-anchor="start" x="4215.18" y="-2188.6" font-family="Arial" font-size="14.00">income_minor </text>
+<text text-anchor="start" x="4306.99" y="-2188.6" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
+<polygon fill="none" stroke="black" points="4208.18,-2145.6 4208.18,-2176.4 4449.33,-2176.4 4449.33,-2145.6 4208.18,-2145.6"/>
+<text text-anchor="start" x="4215.18" y="-2157.8" font-family="Arial" font-size="14.00">internal_in_minor </text>
+<text text-anchor="start" x="4326.46" y="-2157.8" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
+<polygon fill="none" stroke="black" points="4208.18,-2114.8 4208.18,-2145.6 4449.33,-2145.6 4449.33,-2114.8 4208.18,-2114.8"/>
+<text text-anchor="start" x="4215.18" y="-2127" font-family="Arial" font-size="14.00">internal_out_minor </text>
+<text text-anchor="start" x="4335.03" y="-2127" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
+<polygon fill="none" stroke="black" points="4208.18,-2084 4208.18,-2114.8 4449.33,-2114.8 4449.33,-2084 4208.18,-2084"/>
+<text text-anchor="start" x="4215.18" y="-2096.2" font-family="Arial" font-size="14.00">investment_in_minor </text>
+<text text-anchor="start" x="4348.24" y="-2096.2" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
+<polygon fill="none" stroke="black" points="4208.18,-2053.2 4208.18,-2084 4449.33,-2084 4449.33,-2053.2 4208.18,-2053.2"/>
+<text text-anchor="start" x="4215.18" y="-2065.4" font-family="Arial" font-size="14.00">investment_out_minor </text>
+<text text-anchor="start" x="4356.8" y="-2065.4" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
+<polygon fill="none" stroke="black" points="4208.18,-2022.4 4208.18,-2053.2 4449.33,-2053.2 4449.33,-2022.4 4208.18,-2022.4"/>
+<text text-anchor="start" x="4215.18" y="-2034.6" font-family="Arial" font-size="14.00">month </text>
+<text text-anchor="start" x="4257.98" y="-2034.6" font-family="Arial" font-size="14.00" fill="#666666">[text]</text>
+<polygon fill="none" stroke="black" points="4208.18,-1991.6 4208.18,-2022.4 4449.33,-2022.4 4449.33,-1991.6 4208.18,-1991.6"/>
+<text text-anchor="start" x="4215.18" y="-2003.8" font-family="Arial" font-size="14.00">net_minor </text>
+<text text-anchor="start" x="4281.32" y="-2003.8" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
+<polygon fill="none" stroke="black" points="4208.18,-1960.8 4208.18,-1991.6 4449.33,-1991.6 4449.33,-1960.8 4208.18,-1960.8"/>
+<text text-anchor="start" x="4215.18" y="-1973" font-family="Arial" font-size="14.00">own_external_in_minor </text>
+<text text-anchor="start" x="4363.82" y="-1973" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
+<polygon fill="none" stroke="black" points="4208.18,-1930 4208.18,-1960.8 4449.33,-1960.8 4449.33,-1930 4208.18,-1930"/>
+<text text-anchor="start" x="4215.18" y="-1942.2" font-family="Arial" font-size="14.00">own_external_out_minor </text>
+<text text-anchor="start" x="4372.38" y="-1942.2" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
+<polygon fill="none" stroke="black" points="4208.18,-1899.2 4208.18,-1930 4449.33,-1930 4449.33,-1899.2 4208.18,-1899.2"/>
+<text text-anchor="start" x="4215.18" y="-1911.4" font-family="Arial" font-size="14.00">refund_minor </text>
+<text text-anchor="start" x="4301.56" y="-1911.4" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
+<polygon fill="none" stroke="black" points="4208.18,-1868.4 4208.18,-1899.2 4449.33,-1899.2 4449.33,-1868.4 4208.18,-1868.4"/>
+<text text-anchor="start" x="4215.18" y="-1880.6" font-family="Arial" font-size="14.00">salary_minor </text>
+<text text-anchor="start" x="4299.2" y="-1880.6" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
+<polygon fill="none" stroke="black" points="4208.18,-1837.6 4208.18,-1868.4 4449.33,-1868.4 4449.33,-1837.6 4208.18,-1837.6"/>
+<text text-anchor="start" x="4215.18" y="-1849.8" font-family="Arial" font-size="14.00">savings_rate </text>
+<text text-anchor="start" x="4298.45" y="-1849.8" font-family="Arial" font-size="14.00" fill="#666666">[numeric]</text>
+<polygon fill="none" stroke="black" points="4208.18,-1806.8 4208.18,-1837.6 4449.33,-1837.6 4449.33,-1806.8 4208.18,-1806.8"/>
+<text text-anchor="start" x="4215.18" y="-1819" font-family="Arial" font-size="14.00">scope </text>
+<text text-anchor="start" x="4256.43" y="-1819" font-family="Arial" font-size="14.00" fill="#666666">[text]</text>
+<polygon fill="none" stroke="black" points="4208.18,-1776 4208.18,-1806.8 4449.33,-1806.8 4449.33,-1776 4208.18,-1776"/>
+<text text-anchor="start" x="4215.18" y="-1788.2" font-family="Arial" font-size="14.00">scope_transfer_in_minor </text>
+<text text-anchor="start" x="4373.15" y="-1788.2" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
+<polygon fill="none" stroke="black" points="4208.18,-1745.2 4208.18,-1776 4449.33,-1776 4449.33,-1745.2 4208.18,-1745.2"/>
+<text text-anchor="start" x="4215.18" y="-1757.4" font-family="Arial" font-size="14.00">scope_transfer_out_minor </text>
+<text text-anchor="start" x="4381.71" y="-1757.4" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
+<polygon fill="none" stroke="black" points="4208.18,-1714.4 4208.18,-1745.2 4449.33,-1745.2 4449.33,-1714.4 4208.18,-1714.4"/>
+<text text-anchor="start" x="4215.18" y="-1726.6" font-family="Arial" font-size="14.00">spending_minor </text>
+<text text-anchor="start" x="4318.69" y="-1726.6" font-family="Arial" font-size="14.00" fill="#666666">[bigint]</text>
+<polygon fill="none" stroke="black" points="4208.18,-1683.6 4208.18,-1714.4 4449.33,-1714.4 4449.33,-1683.6 4208.18,-1683.6"/>
+<text text-anchor="start" x="4215.18" y="-1695.8" font-family="Arial" font-size="14.00">status </text>
+<text text-anchor="start" x="4256.42" y="-1695.8" font-family="Arial" font-size="14.00" fill="#666666">[text]</text>
 </g>
 <!-- agent.payee_keys -->
 <g id="node14" class="node">

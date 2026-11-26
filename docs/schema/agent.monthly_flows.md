@@ -2,7 +2,7 @@
 
 ## Description
 
-One row per month (YYYY-MM of txn_date), account scope, currency and status (settled or pending: pending rows are kept apart, so readers wanting settled figures filter on status = 'settled'), over agent.cash_flows. Amounts are pence. Class settings respect direction, so income, refund, spending and debt_repayment each hold one sign and every column is a plain sum. income_minor is class income and salary_minor the part from payees with an employer setting; refund_minor is class refund; spending_minor is class spending and debt_repayment_minor class debt_repayment, both as positive numbers; the _out and _in columns split classes investment, own_external, scope_transfer and internal by sign (both positive). net_minor is the signed sum of every class except internal and scope_transfer. savings_rate is (income - (spending - refund) - debt_repayment) / income, rounded to four places, null when income is 0. Internal and scope_transfer legs between held accounts cancel when both legs are held and in the same month.
+One row per month (YYYY-MM of txn_date), account scope, currency and status (settled or pending: pending rows are kept apart, so readers wanting settled figures filter on status = 'settled'), over agent.cash_flows. Amounts are pence. Class settings respect direction, so income, refund, borrowing, spending and debt_repayment each hold one sign and every column is a plain sum. income_minor is class income and salary_minor the part from payees with an employer setting; refund_minor is class refund; borrowing_minor is class borrowing (money lent to the owner, such as a loan drawdown), kept out of income; spending_minor is class spending and debt_repayment_minor class debt_repayment, both as positive numbers; the _out and _in columns split classes investment, own_external, scope_transfer and internal by sign (both positive). net_minor is the signed sum of every class except internal and scope_transfer. savings_rate is (income - (spending - refund) - debt_repayment) / income, rounded to four places, null when income is 0. Internal and scope_transfer legs between held accounts cancel when both legs are held and in the same month.
 
 <details>
 <summary><strong>Table Definition</strong></summary>
@@ -16,6 +16,7 @@ CREATE VIEW monthly_flows AS (
     (COALESCE(sum(amount_minor) FILTER (WHERE (flow_class = 'income'::text)), (0)::numeric))::bigint AS income_minor,
     (COALESCE(sum(amount_minor) FILTER (WHERE ((flow_class = 'income'::text) AND (employer IS TRUE))), (0)::numeric))::bigint AS salary_minor,
     (COALESCE(sum(amount_minor) FILTER (WHERE (flow_class = 'refund'::text)), (0)::numeric))::bigint AS refund_minor,
+    (COALESCE(sum(amount_minor) FILTER (WHERE (flow_class = 'borrowing'::text)), (0)::numeric))::bigint AS borrowing_minor,
     (COALESCE(sum((- amount_minor)) FILTER (WHERE (flow_class = 'spending'::text)), (0)::numeric))::bigint AS spending_minor,
     (COALESCE(sum((- amount_minor)) FILTER (WHERE (flow_class = 'debt_repayment'::text)), (0)::numeric))::bigint AS debt_repayment_minor,
     (COALESCE(sum((- amount_minor)) FILTER (WHERE ((flow_class = 'investment'::text) AND (amount_minor < 0))), (0)::numeric))::bigint AS investment_out_minor,
@@ -42,6 +43,7 @@ CREATE VIEW monthly_flows AS (
 
 | Name | Type | Default | Nullable | Children | Parents | Comment |
 | ---- | ---- | ------- | -------- | -------- | ------- | ------- |
+| borrowing_minor | bigint |  | true |  |  |  |
 | currency | text |  | true |  |  |  |
 | debt_repayment_minor | bigint |  | true |  |  |  |
 | income_minor | bigint |  | true |  |  |  |
@@ -74,6 +76,7 @@ erDiagram
 
 
 "agent.monthly_flows" {
+  bigint borrowing_minor
   text currency
   bigint debt_repayment_minor
   bigint income_minor

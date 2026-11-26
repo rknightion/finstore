@@ -61,7 +61,7 @@ CREATE VIEW payees AS (
                     count(*) AS n
                    FROM s
                   GROUP BY s.payee_id, s.flow_class) c
-          ORDER BY c.payee_id, c.n DESC, (array_position(ARRAY['internal'::text, 'investment'::text, 'scope_transfer'::text, 'own_external'::text, 'debt_repayment'::text, 'refund'::text, 'income'::text, 'spending'::text], c.flow_class))
+          ORDER BY c.payee_id, c.n DESC, (array_position(ARRAY['internal'::text, 'investment'::text, 'scope_transfer'::text, 'own_external'::text, 'debt_repayment'::text, 'borrowing'::text, 'refund'::text, 'income'::text, 'spending'::text], c.flow_class))
         ), modal_category AS (
          SELECT DISTINCT ON (c.payee_id) c.payee_id,
             c.category

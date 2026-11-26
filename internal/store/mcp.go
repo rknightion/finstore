@@ -1421,7 +1421,7 @@ func (r *Reader) DescribeSchema(ctx context.Context, schema string) ([]Relation,
 // the rules that give a row its class or an account its scope; the reader only checks the names a
 // caller passes.
 var (
-	FlowClasses   = []string{"internal", "scope_transfer", "own_external", "investment", "debt_repayment", "income", "refund", "spending"}
+	FlowClasses   = []string{"internal", "scope_transfer", "own_external", "investment", "debt_repayment", "borrowing", "income", "refund", "spending"}
 	AccountScopes = []string{"personal", "joint", "business"}
 	// SeriesStatuses are the statuses of agent.recurring_payments.
 	SeriesStatuses = []string{"active", "due", "overdue", "lapsed", "ended"}
@@ -1541,6 +1541,7 @@ type MonthFlow struct {
 	IncomeMinor           int64    `json:"income_minor"`
 	SalaryMinor           int64    `json:"salary_minor"`
 	RefundMinor           int64    `json:"refund_minor"`
+	BorrowingMinor        int64    `json:"borrowing_minor"`
 	SpendingMinor         int64    `json:"spending_minor"`
 	DebtRepaymentMinor    int64    `json:"debt_repayment_minor"`
 	InvestmentOutMinor    int64    `json:"investment_out_minor"`
@@ -1618,12 +1619,13 @@ type ProfileAccount struct {
 
 // ProfileMedian is the monthly medians of one scope and currency.
 type ProfileMedian struct {
-	Scope         string   `json:"scope"`
-	Currency      string   `json:"currency"`
-	IncomeMinor   int64    `json:"income_minor"`
-	SalaryMinor   int64    `json:"salary_minor"`
-	SpendingMinor int64    `json:"spending_minor"`
-	SavingsRate   *float64 `json:"savings_rate"`
+	Scope          string   `json:"scope"`
+	Currency       string   `json:"currency"`
+	IncomeMinor    int64    `json:"income_minor"`
+	SalaryMinor    int64    `json:"salary_minor"`
+	BorrowingMinor int64    `json:"borrowing_minor"`
+	SpendingMinor  int64    `json:"spending_minor"`
+	SavingsRate    *float64 `json:"savings_rate"`
 }
 
 // ProfileRecurring counts the live recurring series of one evidence and currency.
@@ -1936,7 +1938,8 @@ const cashFlowSQL = `
 	mf AS (
 	  SELECT m.month, m.scope, m.currency,
 	         sum(m.income_minor)::bigint AS income_minor, sum(m.salary_minor)::bigint AS salary_minor,
-	         sum(m.refund_minor)::bigint AS refund_minor, sum(m.spending_minor)::bigint AS spending_minor,
+	         sum(m.refund_minor)::bigint AS refund_minor, sum(m.borrowing_minor)::bigint AS borrowing_minor,
+	         sum(m.spending_minor)::bigint AS spending_minor,
 	         sum(m.debt_repayment_minor)::bigint AS debt_repayment_minor,
 	         sum(m.investment_out_minor)::bigint AS investment_out_minor,
 	         sum(m.investment_in_minor)::bigint AS investment_in_minor,
@@ -1983,7 +1986,7 @@ const cashFlowSQL = `
 	  SELECT 'month'::text AS kind, 0 AS part, r.rn, r.n > $6::int AS more,
 	         jsonb_build_object('month', r.month, 'scope', r.scope, 'currency', r.currency,
 	           'income_minor', r.income_minor, 'salary_minor', r.salary_minor, 'refund_minor', r.refund_minor,
-	           'spending_minor', r.spending_minor, 'debt_repayment_minor', r.debt_repayment_minor,
+	           'borrowing_minor', r.borrowing_minor, 'spending_minor', r.spending_minor, 'debt_repayment_minor', r.debt_repayment_minor,
 	           'investment_out_minor', r.investment_out_minor, 'investment_in_minor', r.investment_in_minor,
 	           'own_external_out_minor', r.own_external_out_minor, 'own_external_in_minor', r.own_external_in_minor,
 	           'scope_transfer_out_minor', r.scope_transfer_out_minor, 'scope_transfer_in_minor', r.scope_transfer_in_minor,
@@ -2114,6 +2117,7 @@ const profileSQL = `
 	  SELECT m.scope, m.currency,
 	         round(percentile_cont(0.5) WITHIN GROUP (ORDER BY m.income_minor))::bigint AS income_minor,
 	         round(percentile_cont(0.5) WITHIN GROUP (ORDER BY m.salary_minor))::bigint AS salary_minor,
+	         round(percentile_cont(0.5) WITHIN GROUP (ORDER BY m.borrowing_minor))::bigint AS borrowing_minor,
 	         round(percentile_cont(0.5) WITHIN GROUP (ORDER BY m.spending_minor))::bigint AS spending_minor,
 	         round((percentile_cont(0.5) WITHIN GROUP (ORDER BY m.savings_rate))::numeric, 4) AS savings_rate
 	  FROM agent.monthly_flows m, w
@@ -2185,7 +2189,8 @@ const profileSQL = `
 	  UNION ALL
 	  SELECT 'median', 3, m.rn, m.n > $1::int,
 	         jsonb_build_object('scope', m.scope, 'currency', m.currency, 'income_minor', m.income_minor,
-	           'salary_minor', m.salary_minor, 'spending_minor', m.spending_minor, 'savings_rate', m.savings_rate)
+	           'salary_minor', m.salary_minor, 'borrowing_minor', m.borrowing_minor,
+	           'spending_minor', m.spending_minor, 'savings_rate', m.savings_rate)
 	  FROM medr m WHERE m.rn <= $1::int
 	  UNION ALL
 	  SELECT 'salary_day', 4, 1, false, jsonb_build_object('day', s.day) FROM sal s

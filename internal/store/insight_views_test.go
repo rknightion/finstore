@@ -717,7 +717,15 @@ func (f *insightFixture) flowTxns() {
 	f.tx(itx{acct: "cur", key: "sp_refund", date: "2026-03-05", amt: 150, desc: "SPEND CO", scheme: "mastercard"})
 	f.setting("n:debt co", "", "debt_repayment", "", "", nil, 5)
 	f.tx(itx{acct: "cur", key: "debt_neg", date: "2026-03-05", amt: -900, desc: "DEBT CO"})
+	// A payee classed for debt: its money in is borrowing, never income (a drawdown, or a cashback
+	// the operator can put right row by row).
 	f.tx(itx{acct: "cur", key: "debt_cashback", date: "2026-03-05", amt: 50, desc: "DEBT CO"})
+	f.tx(itx{acct: "cur", key: "debt_drawdown", date: "2026-03-05", amt: 800000, desc: "DEBT CO"})
+	// Borrowing set explicitly: money in is borrowing, and money out is not a class this setting
+	// applies to, so it falls through like any other direction mismatch.
+	f.setting("n:lender co", "", "borrowing", "", "", nil, 11)
+	f.tx(itx{acct: "cur", key: "lend_in", date: "2026-03-05", amt: 90000, desc: "LENDER CO"})
+	f.tx(itx{acct: "cur", key: "lend_out", date: "2026-03-05", amt: -70, desc: "LENDER CO"})
 	f.setting("n:refund co", "", "refund", "", "", nil, 6)
 	f.tx(itx{acct: "cur", key: "ref_pos", date: "2026-03-05", amt: 80, desc: "REFUND CO"})
 	f.tx(itx{acct: "cur", key: "ref_neg", date: "2026-03-05", amt: -80, desc: "REFUND CO"})
@@ -806,7 +814,8 @@ func TestFlowClasses(t *testing.T) {
 		"inv_out": {"investment", "rule", ""}, "inv_in": {"investment", "rule", ""},
 		"inc_neg": {"spending", "direction", ""}, "inc_pos": {"income", "rule", ""},
 		"sp_neg": {"spending", "rule", ""}, "sp_refund": {"refund", "card_credit", ""},
-		"debt_neg": {"debt_repayment", "rule", ""}, "debt_cashback": {"income", "direction", ""},
+		"debt_neg": {"debt_repayment", "rule", ""}, "debt_cashback": {"borrowing", "rule", ""},
+		"debt_drawdown": {"borrowing", "rule", ""}, "lend_in": {"borrowing", "rule", ""}, "lend_out": {"spending", "direction", ""},
 		"ref_pos": {"refund", "rule", ""}, "ref_neg": {"spending", "direction", ""},
 		"scope_set": {"scope_transfer", "rule", ""}, "ext_out": {"own_external", "rule", ""},
 		"int_out": {"internal", "rule", ""}, "int_in": {"internal", "rule", ""},
@@ -902,6 +911,25 @@ func TestCashFlowsConservation(t *testing.T) {
 	}
 	if groups < 3 {
 		t.Errorf("only %d month and currency groups compared", groups)
+	}
+	// agent.monthly_flows loses nothing either: its class columns, signed, add up to the sum of the
+	// transactions of each month, scope, currency and status, so borrowing is a column of its own
+	// and not a hole.
+	var bad, months int
+	if err := f.q.QueryRow(context.Background(), `
+		WITH m AS (SELECT month, scope, currency, status,
+		             income_minor + refund_minor + borrowing_minor - spending_minor - debt_repayment_minor
+		             + investment_in_minor - investment_out_minor + own_external_in_minor - own_external_out_minor
+		             + scope_transfer_in_minor - scope_transfer_out_minor + internal_in_minor - internal_out_minor AS s
+		           FROM agent.monthly_flows),
+		     c AS (SELECT to_char(txn_date, 'YYYY-MM') AS month, account_scope AS scope, currency, status, sum(amount_minor) AS s
+		           FROM agent.cash_flows GROUP BY 1, 2, 3, 4)
+		SELECT count(*) FILTER (WHERE m.s IS DISTINCT FROM c.s), count(*)
+		FROM m FULL JOIN c USING (month, scope, currency, status)`).Scan(&bad, &months); err != nil {
+		t.Fatal(err)
+	}
+	if bad != 0 || months < 3 {
+		t.Errorf("%d of %d monthly_flows rows do not add up to their transactions", bad, months)
 	}
 	// Every transaction's key is a payee the resolution lists.
 	var orphan int
