@@ -40,10 +40,8 @@ func writeTxnClass(ctx context.Context, e Env, command string, p ledger.TxnClass
 		}
 		var out string
 		err = withWriter(ctx, e, t, "txn", func(ctx context.Context, tx pgx.Tx, l *ledger.Ledger) error {
-			var status string
-			err := tx.QueryRow(ctx, `SELECT status FROM agent.transactions WHERE id = $1`, id).Scan(&status)
-			held := err == nil
-			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			status, held, err := store.TxnStatus(ctx, tx, id)
+			if err != nil {
 				return err
 			}
 			if p.FlowClass == nil && !held {
@@ -73,9 +71,8 @@ func writeTxnClass(ctx context.Context, e Env, command string, p ledger.TxnClass
 				out = "transaction: class override cleared"
 				return nil
 			}
-			var class, reason string
-			err = tx.QueryRow(ctx, `SELECT flow_class, flow_reason FROM agent.cash_flows WHERE id = $1`, id).Scan(&class, &reason)
-			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			class, reason, _, err := store.TxnFlowClass(ctx, tx, id)
+			if err != nil {
 				return err
 			}
 			out = fmt.Sprintf("transaction: class override set to %s", *p.FlowClass)
