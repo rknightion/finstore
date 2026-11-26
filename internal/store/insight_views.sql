@@ -880,10 +880,11 @@ WITH s AS MATERIALIZED (
           AND (jsonb_path_exists(t.detail, 'lax $.fees ? (@.type() == "number" && @ != 0)')
                OR jsonb_path_exists(t.detail, 'lax $.fees.* ? (@.type() == "number" && @ != 0)'))) AS foreign_fee,
          row_number() OVER (PARTITION BY c.payee_id ORDER BY c.txn_date, c.id) AS payee_rn,
-         -- The place of a spending transaction among those of its payee, account, currency and amount.
+         -- The place of a spending transaction among those of its payee, account, currency and amount, by creation
+         -- time (a statement row counts from midnight), then id.
          CASE WHEN c.flow_class = 'spending'
               THEN row_number() OVER (PARTITION BY c.payee_id, c.account_slug, c.currency, c.amount_minor, c.flow_class
-                                      ORDER BY c.txn_date, c.id) END AS same_rn,
+                                      ORDER BY coalesce(t.created_at, c.txn_date::timestamptz), c.id) END AS same_rn,
          (c.flow_class = 'spending') AS is_spend
   FROM agent.cash_flows c
   JOIN agent.transactions t ON t.id = c.id

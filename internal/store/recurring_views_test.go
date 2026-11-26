@@ -1067,6 +1067,16 @@ func TestAnomalies(t *testing.T) {
 	setHour("Dup Late Co", 1, -26, 11, 1)
 	setHour("Dup Midnight Co", 0, -25, 23, 30)
 	setHour("Dup Midnight Co", 1, -24, 0, 30)
+	// The habit count follows creation time, not transaction id: two earlier charges, a third at 09:00,
+	// then two at 16:00 and 16:01 that each already have three before them, so nothing is flagged.
+	// Ids are hashes, so several payees make an id-ordered count fail whatever the hashes are.
+	for n := 0; n < 8; n++ {
+		name := fmt.Sprintf("Habit Day Co %c", 'A'+n)
+		spend(name, flat(1800, 5), []int{-60, -40, -9, -9, -9})
+		setHour(name, 2, -9, 9, 0)
+		setHour(name, 3, -9, 16, 0)
+		setHour(name, 4, -9, 16, 1)
+	}
 	// An ordinary repeat purchase: a payee the account has paid the same amount three times before
 	// is not flagged for two more on one day; with two earlier it is, and only the pair.
 	spend("Takeaway Co", flat(1800, 6), []int{-80, -60, -40, -21, -9, -9})
