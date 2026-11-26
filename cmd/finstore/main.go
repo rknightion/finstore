@@ -184,7 +184,7 @@ func runAccount(ctx context.Context, env app.Env, args []string,
 		var spec app.AccountSpec
 		fs.StringVar(&spec.Slug, "slug", "", "short name used in commands and views, such as bank-joint")
 		fs.StringVar(&spec.Type, "type", "", "current, joint, savings, mortgage or platform")
-		fs.StringVar(&spec.Provider, "provider", "", "for --type platform only: fidelity or aviva")
+		fs.StringVar(&spec.Provider, "provider", "", "for --type platform only: fidelity, aviva or freetrade")
 		fs.StringVar(&spec.Currency, "currency", "GBP", "three-letter currency code")
 		fs.StringVar(&spec.Name, "name", "", "display name")
 		fs.BoolVar(&spec.ExpectsImports, "expects-imports", false, "report an import as due when the newest statement is over 35 days old (70 days for an investment account's newest valuation)")

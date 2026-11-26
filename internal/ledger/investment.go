@@ -22,11 +22,15 @@ type investmentProvider struct {
 	method   string
 	// tickerKeys says an instrument's provider key is its ticker.
 	tickerKeys bool
+	// productKeys says the provider's files name no account number: an account is keyed by its
+	// product, so the provider holds at most one account of each, and its slug has no last four.
+	productKeys bool
 }
 
 var investmentProviders = map[string]investmentProvider{
-	ProviderFidelity: {products: []string{ProductSIPP, ProductISA, ProductCashManagement}, method: methodHoldingsReplay, tickerKeys: true},
-	ProviderAviva:    {products: []string{ProductPensionPlan}, method: methodStatementFlows},
+	ProviderFidelity:  {products: []string{ProductSIPP, ProductISA, ProductCashManagement}, method: methodHoldingsReplay, tickerKeys: true},
+	ProviderAviva:     {products: []string{ProductPensionPlan}, method: methodStatementFlows},
+	ProviderFreetrade: {products: []string{ProductSIPP}, method: methodClosingCash, productKeys: true},
 }
 
 // productAccount maps a product to its child account's type and the middle word of its slug.
@@ -95,12 +99,15 @@ func (a *applier) ensureChildren(ctx context.Context, platform store.Account, re
 	provider := strings.TrimPrefix(platform.Source, investmentSourcePrefix)
 	out := make(map[string]store.Account, len(recs))
 	for _, rec := range recs {
-		four, ok := lastFour(rec.AccountKey)
-		if !ok {
-			return nil, rejected("bad_result")
-		}
 		product := productAccount[rec.Product]
-		slug := platform.Slug + "-" + product.slugWord + "-" + four
+		slug := platform.Slug + "-" + product.slugWord
+		if !investmentProviders[provider].productKeys {
+			four, ok := lastFour(rec.AccountKey)
+			if !ok {
+				return nil, rejected("bad_result")
+			}
+			slug += "-" + four
+		}
 		id := AccountID(platform.Source, rec.AccountKey)
 		acc, err := a.core.GetAccount(ctx, id)
 		switch {
@@ -390,6 +397,8 @@ func (a *applier) runInvestmentMethod(ctx context.Context, acc store.Account, at
 		outcome, err = a.holdingsReplay(ctx, acc)
 	case methodStatementFlows:
 		outcome, err = a.statementFlows(ctx, acc)
+	case methodClosingCash:
+		outcome, err = a.closingCash(ctx, acc)
 	default:
 		return nil
 	}
@@ -621,4 +630,28 @@ func (a *applier) statementFlows(ctx context.Context, acc store.Account) (invest
 		}
 	}
 	return out, nil
+}
+
+// closingCash checks an account whose provider's files record its cash and not all its units, and
+// state no balance to check the cash against. Units are never compared. The only balance known is
+// that of a closed account, which holds no cash, so the check runs once the account is ended: the
+// cash_minor of its current events with an effective date on or before ended_on must sum to zero,
+// and the difference is 0 minus that sum. A pass reconciles the account through ended_on. An
+// account that has not ended has nothing checkable. End such an account only when it has closed:
+// ending one that still holds cash makes it a mismatch by that cash.
+func (a *applier) closingCash(ctx context.Context, acc store.Account) (investmentOutcome, error) {
+	if acc.EndedOn == nil {
+		return investmentOutcome{}, nil
+	}
+	events, err := a.core.ListInvestmentEvents(ctx, acc.ID)
+	if err != nil {
+		return investmentOutcome{}, err
+	}
+	var cash int64
+	for _, e := range events {
+		if e.DisappearedAt == nil && !e.EffectiveDate().After(*acc.EndedOn) {
+			cash += e.CashMinor
+		}
+	}
+	return investmentOutcome{checked: true, pass: cash == 0, diff: -cash, through: *acc.EndedOn}, nil
 }

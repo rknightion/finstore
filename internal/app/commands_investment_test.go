@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/rknightion/finstore/internal/config"
+	"github.com/rknightion/finstore/internal/importer"
 	"github.com/rknightion/finstore/internal/ledger"
 	"github.com/rknightion/finstore/internal/semconv"
 	"github.com/rknightion/finstore/internal/store"
@@ -111,7 +112,7 @@ func valuationFile(key, product string, asOf time.Time) ledger.InvestmentResult 
 
 func TestAccountAddPlatform(t *testing.T) {
 	r := newInvestmentRig(t)
-	for _, provider := range []string{"fidelity", "aviva"} {
+	for _, provider := range []string{"fidelity", "aviva", "freetrade"} {
 		if code, out := r.add(AccountSpec{Slug: "pf-" + provider, Type: "platform", Provider: provider, Currency: "GBP", Name: "Made-up", ExpectsImports: true}); code != ExitOK {
 			t.Fatalf("add %s: exit %d: %s", provider, code, out)
 		}
@@ -368,5 +369,61 @@ func TestCoverageAndImportDueForInvestmentAccounts(t *testing.T) {
 		if got[slug] != v {
 			t.Errorf("import.due %s = %d, want %d", slug, got[slug], v)
 		}
+	}
+}
+
+// AC1: finstore import --format freetrade-activity-csv against a freetrade platform stores one
+// event per row and creates <platform>-sipp from Account Type; the same file again stores nothing,
+// and the child is checked on cash once it is ended. Every value is made up.
+func TestImportFreetradeActivityStatement(t *testing.T) {
+	r := newInvestmentRig(t)
+	investmentFormats[string(importer.FormatFreetradeActivityCSV)] = importer.FreetradeActivityNormaliser{}
+	if code, out := r.add(AccountSpec{Slug: "ft", Type: "platform", Provider: "freetrade", Currency: "GBP", Name: "Made-up", ExpectsImports: true}); code != ExitOK {
+		t.Fatalf("add: exit %d: %s", code, out)
+	}
+	const sipp = "Self-Invested Personal Pension (SIPP)"
+	file := strings.Join([]string{
+		"Value Date,Type,Details,Currency,Direction,Value,Account Type",
+		"09/01/2030,CASH_TRANSFER,\"100.37 GBP cash transfer\",GBP,CASH_OUT,-100.37," + sipp,
+		"08/01/2030,INTEREST,\"Interest income of 0.37 GBP\",GBP,CASH_IN,0.37," + sipp,
+		"07/01/2030,SELL,\"10 Example Trust plc (GB0000000005) @ GBP 10.00000 on 03-Jan-2030 09:00:00\",GBP,CASH_IN,100," + sipp,
+		"06/01/2030,BUY,\"10 Example Trust plc (GB0000000005) @ GBP 10.00000 on 02-Jan-2030 09:00:00 (Requested 100 GBP)\",GBP,CASH_OUT,-100.00," + sipp,
+		"02/01/2030,CASH_TRANSFER,\"100.00 GBP cash transfer\",GBP,CASH_IN,100.00," + sipp,
+	}, "\n")
+	run := func() (int, string) {
+		return r.run(file, func(ctx context.Context, e Env) int {
+			return Import(ctx, e, "ft", string(importer.FormatFreetradeActivityCSV), "made-up.csv")
+		})
+	}
+	if code, out := run(); code != ExitOK || !strings.Contains(out, "imported: 5 rows") {
+		t.Fatalf("import: exit %d: %s", code, out)
+	}
+	if code, out := run(); code != ExitOK || !strings.Contains(out, "already imported") {
+		t.Fatalf("repeat: exit %d: %s", code, out)
+	}
+	ctx := context.Background()
+	var slug, typ string
+	var events int
+	if err := r.st.DB().QueryRow(ctx, "SELECT a.slug, a.type, count(e.*) FROM core.account a JOIN core.investment_event e ON e.account_id = a.id GROUP BY a.slug, a.type").Scan(&slug, &typ, &events); err != nil || slug != "ft-sipp" || typ != "pension" || events != 5 {
+		t.Fatalf("child %q %q with %d events, %v", slug, typ, events, err)
+	}
+	state := func() string {
+		var s string
+		if err := r.st.DB().QueryRow(ctx, "SELECT reconciliation_state FROM agent.coverage WHERE account_slug = 'ft-sipp'").Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	if s := state(); s != "not_checked" {
+		t.Fatalf("before the end: %s", s)
+	}
+	if code, out := r.run("", func(ctx context.Context, e Env) int {
+		d := time.Date(2030, 1, 9, 0, 0, 0, 0, time.UTC)
+		return AccountEnd(ctx, e, "ft-sipp", &d)
+	}); code != ExitOK {
+		t.Fatalf("end: exit %d: %s", code, out)
+	}
+	if s := state(); s != "reconciled" {
+		t.Fatalf("after the end: %s", s)
 	}
 }

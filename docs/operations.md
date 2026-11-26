@@ -268,10 +268,10 @@ skipped stretch in which money in equalled money out goes unnoticed.
 ### Investment accounts
 
 A pension or investment provider is one **platform** account, created once. `--provider` is
-required for this type, is `fidelity` or `aviva`, and is refused for every other type:
+required for this type, is `fidelity`, `aviva` or `freetrade`, and is refused for every other type:
 
 ```sh
-docker exec finstore finstore account add --slug <slug> --type platform --provider <fidelity|aviva> \
+docker exec finstore finstore account add --slug <slug> --type platform --provider <fidelity|aviva|freetrade> \
   --currency GBP --name "<name>" --expects-imports
 ```
 
@@ -280,7 +280,8 @@ provider accounts. The first file naming a provider account creates a **child** 
 platform. Its `source_key` is the provider's account number and its slug ends in that number's last
 four alphanumeric characters. A trade confirmation is matched by its account number alone, so it
 never creates a child: it is stored against the platform and that number, and joins the child once one
-exists.
+exists. A Freetrade file names no account number, so its child is keyed by the product and its slug
+has no last four (see [Freetrade activity statements](#freetrade-activity-statements)).
 
 | Product | `type` | Slug |
 |---|---|---|
@@ -288,6 +289,7 @@ exists.
 | Fidelity Investment ISA | `isa` | `<platform>-isa-<last four>` |
 | Fidelity Cash Management Account | `investment_cash` | `<platform>-cash-<last four>` |
 | Aviva pension plan | `pension` | `<platform>-pension-<last four>` |
+| Freetrade SIPP | `pension` | `<platform>-sipp` |
 
 `--format` also accepts each provider's formats, described after this section's tables.
 
@@ -505,6 +507,109 @@ unsettled on `D`. Otherwise it is `not_checked`. A transaction export states no 
 stale export imported late can omit newer rows and raise a `mismatch`; importing a fresh export
 clears it. Import a history that was exported after the summary was, in either order, and the account reaches
 `reconciled` with the replayed units and cash equal to the summary's.
+
+#### Freetrade activity statements
+
+Freetrade's activity statement is one CSV file for one account, exported from the app. It imports
+against a Freetrade platform, created with `--currency GBP` because the file's cash is in pounds:
+
+```sh
+docker exec finstore finstore account add --slug <platform> --type platform --provider freetrade   --currency GBP --name "<name>" --expects-imports
+docker exec -i finstore finstore import --account <platform> --format freetrade-activity-csv < activity.csv
+```
+
+The file names no account number. Its `Account Type` column names the product, and the product is the
+child account's key: `Self-Invested Personal Pension (SIPP)` becomes the child `<platform>-sipp`, of
+type `pension`, with `source_key` `sipp`. Freetrade gives a person one SIPP, so it stays under the first
+platform that imports it: the same file against a second Freetrade platform is refused as
+`account_mismatch`. Any other account type (an ISA or a general account) rejects the file until a real
+export of one has been seen and its mapping written.
+
+The header must match exactly:
+
+```text
+Value Date,Type,Details,Currency,Direction,Value,Account Type
+```
+
+- The file is UTF-8, with or without a byte order mark, with LF or CRLF line ends, with or without a
+  line end after the last row. Rows are newest first, and a row dated after the row above it rejects
+  the file. A file with the header and no rows is valid and stores nothing.
+- `Value Date` is `DD/MM/YYYY`. `Value` is a signed decimal in `Currency` with at most two decimal
+  places; Freetrade drops trailing zeros, so `0.8` and `5` are read. `Direction` is `CASH_IN` for a positive
+  value and `CASH_OUT` for a negative one. A zero value, or a direction that contradicts the sign or the
+  type, rejects the file.
+- `Details` is read by type, in exactly these shapes (made-up values). Where it repeats the amount,
+  the amount and its currency must equal `Value` and `Currency`.
+
+| Type | Details |
+|---|---|
+| `BUY`, `SELL` | `12.5 Example Corp (US0000000001) @ USD 10.00000 (@ 1 GBP = 1.25000 USD) on 01-Jan-2030 14:30:00 (Requested 100 GBP)`: units (at most eight decimals), the instrument, the price and its currency, a rate when the price is not in pounds (`(@ 1 GBP = r CCY)` or `(@ 1 CCY = r GBP)`), the execution time and an optional requested amount. A name can hold parentheses of its own, as in `Example Holding AG (ADR) (US0000000002)`, so the ISIN is the last parenthesised 12-character token before `@` |
+| `FX_FEE` | `0.70 GBP fx fee taken for 12.5 Example Corp (US0000000001) on 01-Jan-2030 14:30:00` |
+| `STAMP_DUTY` | `0.35 GBP stamp duty paid` |
+| `INTEREST` | `Interest income of 0.37 GBP` |
+| `INVESTMENT_INCOME` | `Investment income of 3.14 GBP` |
+| `SECURITIES_LENDING_INCOME` | `Securities lending income of 0.17 GBP for 2030-01` |
+| `CORPORATE_ACTION` | `Corporate action of 12.34 GBP from Example plc (GB0000000004)`, or the same without `from ...` |
+| `CASH_TRANSFER` | `250.00 GBP cash transfer`, in either direction |
+
+How each type is stored. `cash` is the row's effect on cash and `flow` its value as an external flow
+for return; `gross_minor` is Value as printed, so a buy's is negative. Only a cash transfer is an
+external flow: income, interest, fees and corporate action cash are not.
+
+| Type | Event type | Units | Order date, settle date | `cash` | `flow` |
+|---|---|---|---|---|---|
+| BUY | `buy` | plus | execution date, Value Date | Value, or for a row in euros its sterling cost (below) | 0 |
+| SELL | `sell` | minus | execution date, Value Date | Value | 0 |
+| FX_FEE, STAMP_DUTY | `fee` | none | Value Date, none | Value | 0 |
+| INTEREST | `interest` | none | Value Date, none | Value | 0 |
+| INVESTMENT_INCOME, SECURITIES_LENDING_INCOME | `income` | none | Value Date, none | Value | 0 |
+| CORPORATE_ACTION | `corporate_action` | none | Value Date, none | Value | 0 |
+| CASH_TRANSFER, CASH_IN | `transfer_in` | none | Value Date, none | Value | Value |
+| CASH_TRANSFER, CASH_OUT | `transfer_out` | none | Value Date, none | Value | Value |
+
+- **Trades.** A buy or sale is keyed to its instrument by ISIN, and its `instrument_name` is the name
+  and ISIN as printed. The date of its execution time is its order date, and must not be after the Value
+  Date, which is its settle date. A fee or corporate action that names an instrument keeps it in
+  `instrument_name` and has no units.
+- **Prices.** A price is stored, in pounds, only when it is printed in pounds and units times price
+  agrees with Value to within half the price's last printed place for each unit, plus half a penny.
+  Otherwise `price` is empty and the printed price stays in the row's stored content: the export
+  prints some prices in pence under `GBP`, and prints some rates the wrong way round, so neither can
+  be stored as a price unchecked. The rate on a sterling row is kept in the content only.
+- **Rows in euros.** Only a BUY may be printed in another currency, and only in `EUR`, with its price in
+  euros and the rate printed as `(@ 1 GBP = r EUR)`. The event keeps the printed amount and currency
+  (`gross_minor` and `currency` are euros), and its `cash_minor` is the sterling cost: the amount divided
+  by r, rounded to the penny, half away from zero (made up: 100.00 EUR at 1.17 is 85.47; 0.25 EUR at
+  2 is 0.13). `cash_minor` and `flow_minor` are always in the account's currency. Freetrade states no
+  sterling figure for these rows, so their cash is derived, not reported. Any other type in another
+  currency, a missing rate, or the rate printed the other way round rejects the file.
+- **Keys.** A row has no reference, so its key is the SHA-256 of its seven fields as printed, followed by
+  `#` and its position among the identical rows of the file. Byte-identical rows (two income payments
+  of one amount on one day) are separate events, and the same row has the same key in every export,
+  so a repeated or overlapping export stores nothing new. A key holds no plaintext, but the hash is
+  unkeyed, so anyone holding a key can test a guessed row against it.
+
+A file that breaks any rule is rejected whole as `check_failed`, with exit 2 and nothing stored but its
+bytes in `raw`. The reader's reason is one of a fixed list (`header`, `row shape`,
+`unknown account type`, `unknown type`, `date`, `order`, `direction`, `amount`,
+`contradictory sign`, `currency`, `details`, `details amount`, `fx rate`, `not UTF-8`) and never
+repeats anything from the file.
+
+**What the export cannot show.** It records cash only. Unit-only events (splits, ISIN changes,
+corporate actions that change units, and an in-specie transfer of holdings out) are not in it, so the
+units replayed from it do not reach zero for a closed account. Units are therefore never checked for a
+Freetrade child, `core.holding_check` and `agent.holdings` hold nothing for it, and it has no valuation, so
+`agent.investment_returns` reports `statement_missing`.
+
+**Checking the cash** (`closing_cash`). The export states no balance, so a Freetrade child is
+`not_checked` until it is ended. Ending it with `account end --last-date <day it closed>` states that the
+closed account holds no cash: the `cash_minor` of its events with an effective date on or before that day
+must sum to zero. Then it is `reconciled` through that day; otherwise it is a `mismatch`, and
+`last_diff_minor` is 0 minus the replayed cash. End a Freetrade child only once the account has closed:
+ending one that still holds cash makes it a mismatch by that cash. `account accept-difference` refuses it,
+so a difference stays an honest `mismatch`. An export whose sterling rows come to nothing on their own
+ends below zero by the derived sterling cost of its euro buys, and is a `mismatch` by that amount: the
+export lacks the sterling rows that paid for them.
 
 #### Pension statements and trade confirmations
 
@@ -1017,7 +1122,7 @@ carries a comment with its rules.
 | View | One row per | Rules |
 |---|---|---|
 | `agent.holdings` | Instrument per account, at the newest capture | Units, price and value are as reported on `as_of`. `expected_units` and `unit_difference` (reported minus expected) come from the last checked snapshot, dated `checked_as_of`, which can be older than `as_of`. A position missing from either side appears, with the other side null |
-| `agent.investment_events` | Current provider ledger row | Only `cash_minor` sums to cash and only `flow_minor` sums to external flows. `gross_minor` is the printed amount and includes a dealing fee on a buy. `effective_date` is `settle_date`, else `order_date`. Trade note columns are null when no note matches |
+| `agent.investment_events` | Current provider ledger row | Only `cash_minor` sums to cash and only `flow_minor` sums to external flows, both always in the account's currency. `gross_minor` is the printed amount, in `currency`, and includes a dealing fee on a buy. `effective_date` is `settle_date`, else `order_date`. Trade note columns are null when no note matches |
 | `agent.valuations` | Account and date, from that date's latest capture | Values are not cash balances. A value of 0 is real |
 | `agent.pension_statements` | Winning statement | Figures are as printed, and a statement that lost to an overlapping reissue is left out. A null `charges_minor` is unknown, never zero |
 | `agent.investment_returns` | Account and measured interval | See below |
@@ -1244,6 +1349,11 @@ Two views follow the money into and out of pots:
   either side, and cash with the events effective on or before `D`. Any difference is an immediate
   `mismatch`, and `core.holding_check` holds the per-instrument result. A transactions export taken
   before the capture can raise a false mismatch, and a fresh export clears it.
+- **Investment accounts with a cash-only ledger** (`closing_cash`, Freetrade): units are never
+  compared, because the export lacks unit-only events. The export states no balance, so the account is
+  `not_checked` until it is ended; once ended, the cash of its events up to the end date must sum to
+  zero, as a closed account holds none. Any difference is a `mismatch`. See
+  [Freetrade activity statements](#freetrade-activity-statements).
 - **Investment accounts with no ledger** (`statement_flows`): each winning annual statement's paid-in
   figure must equal the stored contributions dated in its period, and its opening must equal the
   previous statement's closing when the two periods abut. The account is `not_checked` until it has a
@@ -1513,6 +1623,12 @@ revision from 7 to 8, because `core.payee_setting` now accepts the class. Run `m
 a `renormalise` is required), stop the service, run `renormalise`, and start the new image. The
 old image refuses a revision 8 record, as above; a payee already classed `debt_repayment` gets
 `borrowing` on its money in as soon as the new views are in place.
+
+**The Freetrade release.** The release that added the Freetrade activity statement raises the
+normaliser revision from 9 to 10, because `core.investment_event` accepts two new event types,
+`income` and `corporate_action`. Run `migrate` (which says a `renormalise` is required), stop the
+service, run `renormalise`, and start the new image. The old image refuses a revision 10 record, as
+above. Nothing already stored is read differently.
 
 ## Telemetry
 

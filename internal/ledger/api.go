@@ -31,6 +31,9 @@ const (
 	methodHoldingsReplay = "holdings_replay"
 	// methodStatementFlows checks an investment account with no ledger: see statementFlows.
 	methodStatementFlows = "statement_flows"
+	// methodClosingCash checks an investment account whose ledger records cash and not units, and
+	// whose provider reports no balance: see closingCash.
+	methodClosingCash = "closing_cash"
 )
 
 // SourceTrueLayerLloyds is the source of the TrueLayer connection to Lloyds. Its accounts are

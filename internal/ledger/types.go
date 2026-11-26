@@ -265,14 +265,17 @@ type FileNormaliser interface {
 
 // Investment providers: the value of `account add --provider` and of InvestmentNormaliser.Provider.
 const (
-	ProviderFidelity = "fidelity"
-	ProviderAviva    = "aviva"
+	ProviderFidelity  = "fidelity"
+	ProviderAviva     = "aviva"
+	ProviderFreetrade = "freetrade"
 )
 
 // Products an InvestmentAccountRec names. A parser maps the provider's printed product to one of
-// these. Each fixes the child account's type and the middle word of its slug.
+// these. Each fixes the child account's type and the middle word of its slug. A provider whose
+// files name no account number (Freetrade) keys its one account of a product by the product
+// itself, and its slug has no last four: <platform>-sipp.
 const (
-	ProductSIPP           = "sipp"    // Fidelity SIPP: type pension, slug <platform>-sipp-<last four>
+	ProductSIPP           = "sipp"    // Fidelity or Freetrade SIPP: type pension, slug <platform>-sipp-<last four> (Fidelity) or <platform>-sipp (Freetrade)
 	ProductISA            = "isa"     // Fidelity Investment ISA: type isa, slug <platform>-isa-<last four>
 	ProductCashManagement = "cash"    // Fidelity Cash Management Account: type investment_cash, slug <platform>-cash-<last four>
 	ProductPensionPlan    = "pension" // Aviva pension plan: type pension, slug <platform>-pension-<last four>
@@ -302,6 +305,12 @@ const (
 	EventAdjustment      = "adjustment"
 	EventSiblingTransfer = "sibling_transfer"
 	EventInternal        = "internal"
+	// EventIncome is income a holding pays into cash: a dividend, a fund distribution or securities
+	// lending income. It is not an external flow.
+	EventIncome = "income"
+	// EventCorporateAction is cash paid by a corporate action on a holding. It is not an external
+	// flow, and it carries no units: a unit change the provider does not print is not recorded.
+	EventCorporateAction = "corporate_action"
 )
 
 // Price units: GBP is pounds, GBX is pence.
@@ -315,7 +324,9 @@ const (
 type InvestmentAccountRec struct {
 	// AccountKey is the provider's account number, exactly as every other record of the result
 	// names it. It becomes the child's source_key; its last four alphanumeric characters,
-	// lower-cased, end the child's slug, and a number with fewer than four rejects the file.
+	// lower-cased, end the child's slug, and a number with fewer than four rejects the file. A
+	// provider whose files name no account number (Freetrade) gives the Product constant here
+	// instead, and the slug is <platform>-<product word>.
 	AccountKey string
 	// Product is one of the Product constants, and must belong to the normaliser's provider.
 	Product string
@@ -343,12 +354,14 @@ type InvestmentEventRec struct {
 	// Price and PriceUnit are set together or not at all, and only with Units.
 	Price     string
 	PriceUnit string
-	// GrossMinor is the row's amount as printed; CashMinor its effect on cash; FlowMinor its value
-	// as an external flow for return.
+	// GrossMinor is the row's amount as printed, in Currency; CashMinor its effect on cash and
+	// FlowMinor its value as an external flow for return, both always in the account's currency,
+	// which is the platform's. A row printed in another currency converts its cash effect with its
+	// own printed rate.
 	GrossMinor int64
 	CashMinor  int64
 	FlowMinor  int64
-	// Currency is empty for the platform's currency.
+	// Currency is the currency of GrossMinor and Price, empty for the platform's currency.
 	Currency string
 	// Content is the whole row as JSON, stored with each version. HashInput is the canonical
 	// encoding the version hash is computed over: two records of one event with equal HashInput are
@@ -456,7 +469,8 @@ type InvestmentResult struct {
 // file while applying a later one. It returns an error, with no file content in it, when the file
 // fails its own checks; the ledger then rejects the file as check_failed and stores no rows.
 type InvestmentNormaliser interface {
-	// Provider is ProviderFidelity or ProviderAviva. A file imports only against a platform of it.
+	// Provider is ProviderFidelity, ProviderAviva or ProviderFreetrade. A file imports only against a
+	// platform of it.
 	Provider() string
 	NormaliseInvestmentFile(f File, loc *time.Location) (InvestmentResult, error)
 }
@@ -464,7 +478,7 @@ type InvestmentNormaliser interface {
 // NormaliserRev is the revision of the normalising code. Bump it whenever a change to a
 // normaliser or to the core schema would give different core rows for the same raw rows; a
 // deployment must then run `finstore renormalise`.
-const NormaliserRev = 9
+const NormaliserRev = 10
 
 // Stats counts what one CatchUp did.
 type Stats struct {

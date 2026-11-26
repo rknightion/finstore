@@ -119,9 +119,10 @@ func TestUpgradeFromRevisionFiveAndBack(t *testing.T) {
 // it (a late-loaded sighting of an older state), and records accepted statement gaps. Revision 6
 // adds the investment tables. Revision 7 adds the payee rule tables and core.account.scope.
 // Revision 8 lets a payee setting hold the borrowing flow class. Revision 9 adds core.txn_class.
-func TestNormaliserRevisionIsNine(t *testing.T) {
-	if ledger.NormaliserRev != 9 {
-		t.Fatalf("NormaliserRev = %d, want 9", ledger.NormaliserRev)
+// Revision 10 lets an investment event be income or a corporate action (Freetrade).
+func TestNormaliserRevisionIsTen(t *testing.T) {
+	if ledger.NormaliserRev != 10 {
+		t.Fatalf("NormaliserRev = %d, want 10", ledger.NormaliserRev)
 	}
 }
 
