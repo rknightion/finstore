@@ -1055,7 +1055,7 @@ pence, and every view carries a comment with its exact rules. The MCP tools `spe
 | View | One row per | Rules |
 |---|---|---|
 | `agent.account_scopes` | Account | The scope is the operator's setting, else a pot's parent scope, else `joint` or `business` from the account type, else `personal`. `scope_source` says which (`setting`, `parent`, `type`, `default`) |
-| `agent.payee_keys` | Payee key | How keys (`mg:` merchant group, `mu:` Monzo user, `n:` normalised name, `x:` scheme) resolve to a payee. Two `mg:` keys that share a most frequent merchant name merge by themselves; the other kinds never do. An operator merge or separation overrides. `merge_loop` flags a merge that cannot apply |
+| `agent.payee_keys` | Payee key | How keys (`mg:` merchant group, `mu:` Monzo user; an id starting `anonuser_` is not one, so that row takes its `n:` key from the counterparty name, `n:` normalised name, `x:` scheme) resolve to a payee. Two `mg:` keys that share a most frequent merchant name merge by themselves; the other kinds never do. An operator merge or separation overrides. `merge_loop` flags a merge that cannot apply |
 | `agent.cash_flows` | Transaction that is not declined | The ledger row with its payee, its account scope and one flow class (below). Pending rows are included, so a reader decides about them. Everything else reads this view |
 | `agent.payees` | Payee and currency | Settled totals (lifetime and last 12 months), the key list, name variants, effective class and category, and the count of recurring series |
 | `agent.payee_years` | Payee, currency and calendar year | Money out and in, and the count, over every class |
@@ -1387,12 +1387,49 @@ live one is a hazard: used anywhere, it invalidates the one in service.
 ### Restore
 
 ```sh
+set -e                                                 # stop at the first failing step
 docker compose up -d finstore-db                       # an empty data directory
 docker compose run --rm finstore-admin bootstrap       # roles must exist before the restore
-docker exec -i finstore-db pg_restore -U postgres -d finstore --clean --if-exists --exit-on-error < finstore.dump
-docker compose run --rm finstore-admin migrate
+docker exec -i finstore-db pg_restore -U postgres -d finstore --clean --if-exists --exit-on-error --no-privileges < finstore.dump
+docker compose run --rm finstore-admin migrate         # re-applies finstore's own grants
 docker compose up -d finstore
 ```
+
+`--no-privileges` leaves every `GRANT` out of the restore, so a dump that grants to a role this
+database does not have (a monitoring login, a reporting login) no longer stops it with `role "..."
+does not exist`. `migrate` then applies finstore's own grants again to `finstore_app`,
+`finstore_agent` and `finstore_mcp`. Do not add `--no-owner`: the restored objects must stay owned by
+`finstore_owner`, which `bootstrap` created, or `migrate` cannot alter them.
+
+Role memberships and the grants you made to roles of your own are not finstore's, so `migrate` does
+not bring them back. Create those roles, then grant again as you did originally. The shape:
+
+```sh
+docker exec -i finstore-db psql -U postgres -d finstore <<'SQL'
+CREATE ROLE <monitoring_login> LOGIN PASSWORD '<from your secret store>';
+GRANT USAGE ON SCHEMA <schema> TO <monitoring_login>;
+GRANT SELECT ON ALL TABLES IN SCHEMA <schema> TO <monitoring_login>;
+CREATE ROLE <reporting_login> LOGIN PASSWORD '<from your secret store>';
+GRANT finstore_agent TO <reporting_login>;
+SQL
+```
+
+**Telling a complete restore from a partial one.** The exit status of `pg_restore` is the check: with
+`--exit-on-error` any failure ends the restore with a non-zero status, and `set -e` stops the steps
+after it. Never run `migrate` or `renormalise` after a failed restore; they run over what was
+restored without complaint. Row counts in `raw` back this up. Run the query on the source before the
+dump and on the restored database, and compare the two lines:
+
+```sh
+docker exec finstore-db psql -U postgres -d finstore -At -c "
+  SELECT (SELECT count(*) FROM raw.fetch),        (SELECT count(*) FROM raw.api_response),
+         (SELECT count(*) FROM raw.fetch_complete), (SELECT count(*) FROM raw.import_file),
+         (SELECT count(*) FROM raw.operator_entry)"
+```
+
+Equal counts do not prove a complete restore on their own: `pg_restore` loads the data before the
+grants and the constraints, so a restore that failed late can have every row. Equal counts with a
+zero exit status do.
 
 Then reconnect Monzo from the status page. The restored database has no tokens, so the service
 marks the connection as lost as soon as it starts; reconnecting brings it back. Nothing else is

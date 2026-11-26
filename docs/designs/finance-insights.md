@@ -265,7 +265,7 @@ Each transaction gets a **payee key** from the first rule that applies. The gram
 | Key order | Source | Key |
 |---|---|---|
 | 1 | Monzo merchant object with a `group_id` | `mg:<group_id>` |
-| 2 | Monzo counterparty with a Monzo `user_id` (person to person) | `mu:<user_id>` |
+| 2 | Monzo counterparty with a Monzo `user_id` (person to person); an id that starts with `anonuser_` is treated as absent, because Monzo makes a new one for each payment from a counterparty outside Monzo | `mu:<user_id>` |
 | 3 | Any other transaction with a counterparty or description name | `n:<normalised name>` |
 | 4 | None of the above | `x:<scheme>` |
 
@@ -633,7 +633,7 @@ asked. `not_recurring` removes it.
 | `annual_cost_minor` | `typical_amount_minor` times the cadence's payments per year, null for `irregular` |
 | `next_expected_date` | `last_date` plus the median gap, null for `irregular` |
 | `status` | below |
-| `price_changes` | JSON array of `{date, from_minor, to_minor}`, oldest first: every change between consecutive amounts of a `fixed`-kind series, and every hand-over |
+| `price_changes` | JSON array of `{date, from_minor, to_minor}`, oldest first: every hand-over, every change between consecutive amounts of a `fixed`-kind series, and every change between consecutive amounts of a series whose amounts form steps (each run of equal consecutive amounts holds for at least two charges), whatever its `amount_kind` and however old the step; a bill that varies every charge lists none |
 | `change_12m_minor` | typical amount now minus the median of the six amounts up to the transaction closest to twelve months earlier; null when the series is under a year old |
 | `flow_class`, `category`, `category_name` | of the latest transaction |
 | `account_slugs` | accounts the series was paid from |
