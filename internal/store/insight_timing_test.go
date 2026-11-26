@@ -82,6 +82,19 @@ SELECT 1 + (g % 60), (current_date - 2900 + g * 13)::date, -(1000 + g * 7)::bigi
        'mastercard', 'EUR', jsonb_build_object('fees', jsonb_build_object('currency_conversion', 20))
 FROM generate_series(1, 200) g;
 
+-- Habitual shops of a busy account: three takeaways charging a few fixed amounts (often twice in a
+-- day) and two supermarkets with varied baskets, 6,000 charges over the last three years.
+INSERT INTO gen (acct, d, amt, descr, scheme)
+SELECT 1 + (g % 3), (current_date - 1100 + floor(random() * 1100)::int)::date,
+       -(CASE floor(random() * 3)::int WHEN 0 THEN 1850 WHEN 1 THEN 2350 ELSE 2999 END)::bigint,
+       'Takeaway ' || translate((g % 3)::text, '0123456789', 'abcdefghij'), 'mastercard'
+FROM generate_series(1, 3000) g;
+INSERT INTO gen (acct, d, amt, descr, scheme)
+SELECT 1 + (g % 3), (current_date - 1100 + floor(random() * 1100)::int)::date,
+       -(400 + floor(random() * random() * 14000) * CASE WHEN random() < 0.03 THEN 4 ELSE 1 END)::bigint,
+       'Supermarket ' || translate((g % 2)::text, '0123456789', 'abcdefghij'), 'mastercard'
+FROM generate_series(1, 3000) g;
+
 -- The remainder: variable spending at 120 shops, skewed to a few, with the odd large purchase.
 INSERT INTO gen (acct, d, amt, descr, scheme)
 SELECT 1 + floor(random() * 60)::int, (current_date - 3280 + floor(random() * 3280)::int)::date,
@@ -128,6 +141,26 @@ func TestInsightViewTiming(t *testing.T) {
 	}
 
 	agent := connAs(t, c.super, "finstore_agent")
+	// A busy account should see a handful of flags in 90 days, not dozens (issue 177). The generated
+	// spending is more regular than a person's, so the ceiling is generous.
+	var flags90 int
+	rows90, err := agent.Query(ctx, `SELECT kind, count(*) FROM agent.anomalies WHERE txn_date >= current_date - 90 GROUP BY kind ORDER BY kind`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows90.Next() {
+		var kind string
+		var k int
+		if err := rows90.Scan(&kind, &k); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("anomalies in the last 90 days: %-16s %d", kind, k)
+		flags90 += k
+	}
+	rows90.Close()
+	if flags90 > 20 {
+		t.Errorf("%d anomalies in the last 90 days over 30000 transactions, want at most 20", flags90)
+	}
 	// Each timed read fetches every row of the view, as a reader would. A view is read three times
 	// and judged on its fastest read. Where /proc is readable the read is measured by the CPU time of
 	// its backend, which a busy machine does not stretch, and the wall time is logged beside it.

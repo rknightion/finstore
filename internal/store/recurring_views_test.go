@@ -1030,23 +1030,50 @@ func TestAnomalies(t *testing.T) {
 	r := newRecFix(t)
 	spend := func(name string, amts []int64, offs []int) { r.put(rs{name: name, amts: amts, offs: offs}) }
 
-	// unusual_amount: at least six earlier spending rows, then more than three times their median
-	// and at least 2,000 pence above it. 3000 is exactly three times 1000 (not flagged); 3001 is.
-	spend("Edge Cafe", append(flat(1000, 6), 3000, 3001), steps(8, 10, -30))
-	spend("Few Cafe", append(flat(1000, 5), 9000), steps(6, 10, -30))
-	spend("Small Cafe", append(flat(500, 6), 1600, 2600), steps(8, 10, -30))
+	// unusual_amount: at least twelve earlier spending rows, then at least 5,000 pence, more than five
+	// times their median, at least 5,000 pence above it and well clear of their spread.
+	// 10000 is exactly five times 2000 (not flagged); 10001 is.
+	spend("Edge Cafe", append(flat(2000, 12), 10000, 10001), steps(14, 10, -30))
+	spend("Few Cafe", append(flat(2000, 11), 90000), steps(12, 10, -30))
+	// Under the 5,000 pence excess: 5499 is 4,999 above the median of 500, 5500 is 5,000 above.
+	spend("Small Cafe", append(flat(500, 12), 5499, 5500), steps(14, 10, -30))
+	// Half the history at 200 and half at 2000: the median is 1100 and the scaled MAD 1334, so the
+	// threshold is 9106. 9000 is within the payee's own spread, 9200 is not.
+	mixed := []int64{200, 2000, 200, 2000, 200, 2000, 200, 2000, 200, 2000, 200, 2000}
+	spend("Spread Cafe", append(append([]int64{}, mixed...), 9000), steps(13, 10, -30))
+	spend("Spread Two Cafe", append(append([]int64{}, mixed...), 9200), steps(13, 10, -30))
 
-	// possible_duplicate: same payee, account and amount within two days.
+	// possible_duplicate: same payee, account and amount created within two hours, and not a habit.
 	spend("Dup Co", flat(2500, 2), []int{-20, -20})
-	spend("Dup Edge Co", flat(2500, 2), []int{-30, -28})
-	spend("Dup Far Co", flat(2500, 2), []int{-30, -27})
 	r.tx(itx{acct: "cur", key: "Dup Acct Co/0", date: r.at(-20), amt: -2500, desc: "Dup Acct Co"})
 	r.tx(itx{acct: "sav", key: "Dup Acct Co/1", date: r.at(-20), amt: -2500, desc: "Dup Acct Co"})
 	r.tx(itx{acct: "cur", key: "Dup Pend Co/0", date: r.at(-20), amt: -2500, desc: "Dup Pend Co"})
 	r.tx(itx{acct: "cur", key: "Dup Pend Co/1", date: r.at(-20), amt: -2500, desc: "Dup Pend Co", status: "pending"})
-	// A weekly series is not a duplicate when the repeat falls inside it.
-	spend("Weekly Co", flat(500, 6), steps(6, 7, -1))
-	r.tx(itx{acct: "cur", key: "Weekly Co/extra", date: r.at(-22), amt: -500, desc: "Weekly Co"})
+	// The same amount on two days is a repeat purchase, whatever the gap.
+	spend("Dup Next Day Co", flat(2500, 2), []int{-30, -29})
+	spend("Dup Far Co", flat(2500, 2), []int{-30, -27})
+	// The two-hour edge, and a pair that straddles midnight.
+	spend("Dup Hours Co", flat(2500, 2), []int{-26, -26})
+	spend("Dup Late Co", flat(2500, 2), []int{-26, -26})
+	spend("Dup Midnight Co", flat(2500, 2), []int{-25, -24})
+	setHour := func(name string, i int, day int, h, m int) {
+		t.Helper()
+		r.exec(`UPDATE core.transaction SET created_at = $2::date + make_interval(hours => $3::int, mins => $4::int) WHERE source_key = $1`,
+			r.key(name, i), r.at(day), h, m)
+	}
+	setHour("Dup Hours Co", 0, -26, 9, 0)
+	setHour("Dup Hours Co", 1, -26, 10, 59)
+	setHour("Dup Late Co", 0, -26, 9, 0)
+	setHour("Dup Late Co", 1, -26, 11, 1)
+	setHour("Dup Midnight Co", 0, -25, 23, 30)
+	setHour("Dup Midnight Co", 1, -24, 0, 30)
+	// An ordinary repeat purchase: a payee the account has paid the same amount three times before
+	// is not flagged for two more on one day; with two earlier it is, and only the pair.
+	spend("Takeaway Co", flat(1800, 6), []int{-80, -60, -40, -21, -9, -9})
+	spend("Takeaway Few Co", flat(1800, 4), []int{-60, -40, -9, -9})
+	// A weekly shop is a habit, so a second charge in one day is not flagged.
+	spend("Weekly Co", flat(500, 8), steps(8, 7, -1))
+	r.tx(itx{acct: "cur", key: "Weekly Co/extra", date: r.at(-1), amt: -500, desc: "Weekly Co"})
 
 	// new_large_payee: the payee's first settled transaction, spending, at least 25,000 pence.
 	spend("Big Co", flat(25000, 1), []int{-15})
@@ -1092,14 +1119,19 @@ func TestAnomalies(t *testing.T) {
 		}
 		delete(got, key)
 	}
-	check("Edge Cafe|unusual_amount", anomRow{-3001, ptr(int64(-1000))})
-	check("Small Cafe|unusual_amount", anomRow{-2600, ptr(int64(-500))})
-	check("Dup Co|possible_duplicate", anomRow{-2500, ptr(int64(-2500))}, anomRow{-2500, ptr(int64(-2500))})
-	check("Dup Edge Co|possible_duplicate", anomRow{-2500, ptr(int64(-2500))}, anomRow{-2500, ptr(int64(-2500))})
+	check("Edge Cafe|unusual_amount", anomRow{-10001, ptr(int64(-2000))})
+	check("Small Cafe|unusual_amount", anomRow{-5500, ptr(int64(-500))})
+	check("Spread Two Cafe|unusual_amount", anomRow{-9200, ptr(int64(-1100))})
+	dup := anomRow{-2500, ptr(int64(-2500))}
+	check("Dup Co|possible_duplicate", dup, dup)
+	check("Dup Hours Co|possible_duplicate", dup, dup)
+	check("Dup Midnight Co|possible_duplicate", dup, dup)
+	pair := anomRow{-1800, ptr(int64(-1800))}
+	check("Takeaway Few Co|possible_duplicate", pair, pair)
 	check("Big Co|new_large_payee", anomRow{-25000, nil})
 	check("Fee A Co|foreign_fee", anomRow{-1000, nil})
 	check("Fee F Co|foreign_fee", anomRow{-1000, nil})
-	// Second Co's large second transaction is also unusual only with six earlier rows: it has one.
+	// Second Co's large second transaction is also unusual only with twelve earlier rows: it has one.
 	for k, v := range got {
 		t.Errorf("unexpected anomaly %s: %+v", k, v)
 	}
@@ -1114,7 +1146,7 @@ func TestInsightViewCommentsRecordTheParameters(t *testing.T) {
 		"upcoming_payments": {"45 days"},
 		"monthly_flows":     {"savings_rate", "four places", "pending"},
 		"category_months":   {"settled"},
-		"anomalies":         {"six earlier", "three times", "2,000 pence", "2 days", "25,000 pence", "x: payees are never flagged"},
+		"anomalies":         {"twelve earlier", "five times", "5,000 pence", "median absolute deviation", "2 hours", "three or more", "25,000 pence", "x: payees are never flagged"},
 	}
 	for view, subs := range want {
 		var c string
