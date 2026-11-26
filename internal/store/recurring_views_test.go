@@ -433,8 +433,8 @@ func TestRecurringHandOver(t *testing.T) {
 	r.tx(itx{acct: "cur", key: "Tie Co/b1", date: r.at(-60), amt: -1500, desc: "Tie Co"})
 	r.tx(itx{acct: "cur", key: "Tie Co/b2", date: r.at(-60), amt: -2300, desc: "Tie Co"})
 
-	// A price step inside the tolerance, within the last twelve months: no hand-over, and the amount
-	// kind is variable, so no price changes are listed, but change_12m_minor shows it.
+	// A price step inside the tolerance, within the last twelve months: no hand-over, the amount kind
+	// is variable, and the amounts form steps, so the step is listed and change_12m_minor shows it.
 	r.put(rs{name: "Rise Co", amts: repeat(flat(1000, 7), flat(1200, 7)), offs: steps(14, 30, -5)})
 
 	// A year-old series that never changed, and a series under a year old.
@@ -473,8 +473,10 @@ func TestRecurringHandOver(t *testing.T) {
 	}
 
 	rise := one(t, all, "Rise Co")
-	if rise.kind != "variable" || len(rise.changes) != 0 || rise.change12 == nil || *rise.change12 != 200 || rise.typical != 1200 {
-		t.Errorf("Rise Co = %+v, want variable, no price changes, change_12m_minor 200", rise)
+	riseDate := r.at(steps(14, 30, -5)[7])
+	if rise.kind != "variable" || len(rise.changes) != 1 || rise.changes[0] != (priceChange{Date: riseDate, From: 1000, To: 1200}) ||
+		rise.change12 == nil || *rise.change12 != 200 || rise.typical != 1200 {
+		t.Errorf("Rise Co = %+v, want variable, one price change 1000 to 1200 on %s, change_12m_minor 200", rise, riseDate)
 	}
 	flatCo := one(t, all, "Flat Co")
 	if flatCo.change12 == nil || *flatCo.change12 != 0 || len(flatCo.changes) != 0 {
