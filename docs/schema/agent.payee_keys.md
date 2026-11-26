@@ -2,7 +2,7 @@
 
 ## Description
 
-How payee keys resolve to payees: one row per payee key that has a transaction that is not declined, or that an operator payee rule names (txn_count 0 then). payee_id is the canonical key. Rules: keys are mg:<merchant group id>, mu:<Monzo user id>, n:<normalised name> or x:<scheme>. Two mg: keys are one automatic group when the most frequent normalised merchant name of each (ties by the lowest name) is the same; mu:, n: and x: keys never merge automatically. A key with an operator separate setting leaves its group. A group is identified by its member with the earliest first transaction, ties by the lowest key. An operator merge on any member moves the whole group into the payee its target key belongs to; when members carry different merges the highest entry_seq wins. Merge targets are followed at most ten steps; a loop or a longer chain leaves the group unmerged and sets merge_loop. setting_name, setting_flow_class, setting_employer and setting_category are the payee's operator settings, collected from every key of the payee, per setting the non-null value with the highest entry_seq. A rule stored against an n: key resolves through normalise_payee_name(name_sample), so it follows the normaliser. group_id is the identity of the key's own group.
+How payee keys resolve to payees: one row per payee key that has a transaction that is not declined, or that an operator payee rule names (txn_count 0 then). payee_id is the canonical key. Rules: keys are mg:<merchant group id>, mu:<Monzo user id>, n:<normalised name> or x:<scheme>. A Monzo user id that starts with anonuser_ is not an identity (Monzo makes a new one for each payment from a counterparty outside Monzo), so such a transaction is keyed by its counterparty name (n:) like one without a user id. Two mg: keys are one automatic group when the most frequent normalised merchant name of each (ties by the lowest name) is the same; mu:, n: and x: keys never merge automatically. A key with an operator separate setting leaves its group. A group is identified by its member with the earliest first transaction, ties by the lowest key. An operator merge on any member moves the whole group into the payee its target key belongs to; when members carry different merges the highest entry_seq wins. Merge targets are followed at most ten steps; a loop or a longer chain leaves the group unmerged and sets merge_loop. setting_name, setting_flow_class, setting_employer and setting_category are the payee's operator settings, collected from every key of the payee, per setting the non-null value with the highest entry_seq. A rule stored against an n: key resolves through normalise_payee_name(name_sample), so it follows the normaliser. group_id is the identity of the key's own group.
 
 <details>
 <summary><strong>Table Definition</strong></summary>
@@ -12,7 +12,10 @@ CREATE VIEW payee_keys AS (
  WITH RECURSIVE txn AS MATERIALIZED (
          SELECT t.txn_date,
             NULLIF(((t.detail -> 'merchant'::text) ->> 'group_id'::text), ''::text) AS mgid,
-            NULLIF(((t.detail -> 'counterparty'::text) ->> 'user_id'::text), ''::text) AS muid,
+                CASE
+                    WHEN (((t.detail -> 'counterparty'::text) ->> 'user_id'::text) ~~ 'anonuser\_%'::text) THEN NULL::text
+                    ELSE NULLIF(((t.detail -> 'counterparty'::text) ->> 'user_id'::text), ''::text)
+                END AS muid,
             COALESCE(NULLIF(t.counterparty, ''::text), NULLIF(t.description, ''::text)) AS key_name,
             COALESCE(NULLIF(t.merchant_name, ''::text), NULLIF(((t.detail -> 'merchant'::text) ->> 'name'::text), ''::text)) AS mname,
             COALESCE(NULLIF(t.scheme, ''::text), 'unknown'::text) AS scheme

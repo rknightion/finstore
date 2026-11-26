@@ -265,7 +265,7 @@ Each transaction gets a **payee key** from the first rule that applies. The gram
 | Key order | Source | Key |
 |---|---|---|
 | 1 | Monzo merchant object with a `group_id` | `mg:<group_id>` |
-| 2 | Monzo counterparty with a Monzo `user_id` (person to person) | `mu:<user_id>` |
+| 2 | Monzo counterparty with a Monzo `user_id` (person to person); an id that starts with `anonuser_` is treated as absent, because Monzo makes a new one for each payment from a counterparty outside Monzo | `mu:<user_id>` |
 | 3 | Any other transaction with a counterparty or description name | `n:<normalised name>` |
 | 4 | None of the above | `x:<scheme>` |
 

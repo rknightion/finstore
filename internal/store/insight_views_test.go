@@ -1053,3 +1053,43 @@ func TestPayeesAndYears(t *testing.T) {
 		t.Errorf("payee_years = %v, want %v", years, wantYears)
 	}
 }
+
+// Monzo gives counterparties outside Monzo a user_id of the form anonuser_<hex>, new for every
+// payment. Such an id is not an identity: the row is keyed by name. A real user_ id keeps mu:.
+func TestPayeeKeysAnonymousCounterparty(t *testing.T) {
+	f := newInsightFixture(t)
+	f.tx(itx{acct: "cur", key: "an1", date: "2026-03-01", amt: 150000, cp: "Example Payroll Ltd", desc: "salary",
+		detail: cpDetail("user_id", "anonuser_aaa111", "name", "Example Payroll Ltd")})
+	f.tx(itx{acct: "cur", key: "an2", date: "2026-04-01", amt: 150000, cp: "Example Payroll Ltd", desc: "salary",
+		detail: cpDetail("user_id", "anonuser_bbb222", "name", "Example Payroll Ltd")})
+	f.tx(itx{acct: "cur", key: "real", date: "2026-03-09", amt: -2500, cp: "A Friend", desc: "pizza",
+		detail: cpDetail("user_id", "user_1", "name", "A Friend")})
+	f.setting("n:example payroll", "", "income", "", "", ptr(true), 1)
+
+	got := f.flows()
+	for _, k := range []string{"an1", "an2"} {
+		if got[k].payeeKey != "n:example payroll" || got[k].payeeID != "n:example payroll" {
+			t.Errorf("%s payee_key/payee_id = %q/%q, want n:example payroll", k, got[k].payeeKey, got[k].payeeID)
+		}
+		if got[k].class != "income" || got[k].reason != "rule" {
+			t.Errorf("%s class/reason = %q/%q, want income/rule (the n: setting applies)", k, got[k].class, got[k].reason)
+		}
+	}
+	if got["real"].payeeKey != "mu:user_1" {
+		t.Errorf("real user payee_key = %q, want mu:user_1", got["real"].payeeKey)
+	}
+	var n, cnt int
+	if err := f.q.QueryRow(context.Background(), `SELECT count(*), coalesce(max(txn_count), 0) FROM agent.payees WHERE payee_id = 'n:example payroll'`).Scan(&n, &cnt); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || cnt != 2 {
+		t.Errorf("agent.payees rows / txn_count for the company = %d / %d, want 1 / 2", n, cnt)
+	}
+	var anon int
+	if err := f.q.QueryRow(context.Background(), `SELECT count(*) FROM agent.payee_keys WHERE payee_key LIKE 'mu:anonuser%'`).Scan(&anon); err != nil {
+		t.Fatal(err)
+	}
+	if anon != 0 {
+		t.Errorf("agent.payee_keys has %d mu:anonuser_ keys, want 0", anon)
+	}
+}
