@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -43,6 +44,15 @@ type SeriesSetting struct {
 type CategoryName struct {
 	Category  string
 	Name      string
+	EntrySeq  int64
+	EnteredAt time.Time
+}
+
+// TxnClass is a core.txn_class row: the operator's flow class for one transaction.
+type TxnClass struct {
+	TxnID     uuid.UUID
+	FlowClass string
+	Employer  bool
 	EntrySeq  int64
 	EnteredAt time.Time
 }
@@ -128,6 +138,36 @@ func (c Core) DeleteSeriesSetting(ctx context.Context, key string) error {
 	_, err := c.q.Exec(ctx, c.sql(`DELETE FROM core.series_setting WHERE series_key = $1`), key)
 	if err != nil {
 		return fmt.Errorf("store: delete series setting: %w", err)
+	}
+	return nil
+}
+
+// PutTxnClass inserts the row, or replaces the row of the same transaction.
+func (c Core) PutTxnClass(ctx context.Context, t TxnClass) error {
+	_, err := c.q.Exec(ctx, c.sql(`INSERT INTO core.txn_class (txn_id, flow_class, employer, entry_seq, entered_at)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (txn_id) DO UPDATE SET flow_class = EXCLUDED.flow_class, employer = EXCLUDED.employer,
+		  entry_seq = EXCLUDED.entry_seq, entered_at = EXCLUDED.entered_at`),
+		t.TxnID, t.FlowClass, t.Employer, t.EntrySeq, t.EnteredAt)
+	if err != nil {
+		return fmt.Errorf("store: put txn class: %w", err)
+	}
+	return nil
+}
+
+// GetTxnClass returns the row of the transaction, or ErrNotFound.
+func (c Core) GetTxnClass(ctx context.Context, id uuid.UUID) (TxnClass, error) {
+	var t TxnClass
+	err := c.q.QueryRow(ctx, c.sql(`SELECT txn_id, flow_class, employer, entry_seq, entered_at FROM core.txn_class WHERE txn_id = $1`), id).
+		Scan(&t.TxnID, &t.FlowClass, &t.Employer, &t.EntrySeq, &t.EnteredAt)
+	return t, oneRow(err, "txn class")
+}
+
+// DeleteTxnClass deletes the row of the transaction, if any.
+func (c Core) DeleteTxnClass(ctx context.Context, id uuid.UUID) error {
+	_, err := c.q.Exec(ctx, c.sql(`DELETE FROM core.txn_class WHERE txn_id = $1`), id)
+	if err != nil {
+		return fmt.Errorf("store: delete txn class: %w", err)
 	}
 	return nil
 }

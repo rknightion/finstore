@@ -176,6 +176,11 @@ func TestPayeeCategoryAndScopeCommandsTakeFlagsOnly(t *testing.T) {
 		{"payee", "clear", "--series", "sub:n:a", "--what", "name"},
 		{"payee", "clear"},
 		{"category"},
+		{"txn"},
+		{"txn", "nonsense"},
+		{"txn", "class", "--id", "made-up"},
+		{"txn", "class", "--class", "income"},
+		{"txn", "clear"},
 		{"category", "name", "--category", "made-up"},
 		{"category", "clear"},
 		{"account", "scope", "--slug", "bank-joint"},
@@ -197,6 +202,8 @@ func TestPayeeCategoryAndScopeCommandsTakeFlagsOnly(t *testing.T) {
 		{"payee", "clear", "--key", "n:a", "--what", "class"},
 		{"payee", "clear", "--series", "sub:n:a"},
 		{"category", "name", "--category", "made-up", "--name", "Made up"},
+		{"txn", "class", "--id", "11111111-1111-4111-8111-111111111111", "--class", "income", "--employer"},
+		{"txn", "clear", "--id", "11111111-1111-4111-8111-111111111111"},
 		{"account", "scope", "--slug", "bank-joint", "--clear"},
 	} {
 		code, _, errOut := runWith(t, nil, args...)

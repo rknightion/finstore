@@ -27,7 +27,7 @@ This design adds a derived layer over the existing transactions:
 4.  **Cash flow and profile.** Monthly income, spending and savings by account scope, category
     trends, upcoming payments, unusual transactions and a short profile of the owner's finances.
 5.  **Corrections.** The operator corrects any of the above with `finstore payee`, `finstore
-    category` and `finstore account scope` commands. Each correction is an append-only operator
+    category`, `finstore account scope` and `finstore txn` commands. Each correction is an append-only operator
     entry, applies to all past and future transactions, and survives `renormalise`.
 6.  **MCP tools.** Four new read-only tools return these results in one call each.
 7.  **A changed default.** `spending_summary` stops counting the owner's own money: its default
@@ -212,11 +212,11 @@ partner". The operator applies what they agree with by CLI.
 ## Proposed Architecture
 
 ```text
-raw.operator_entry (payee_rule, category_name, account_scope)
+raw.operator_entry (payee_rule, category_name, account_scope, txn_class)
         │  ledger normalises, in sequence order
         ▼
 core.payee_alias, core.payee_setting, core.series_setting,
-core.category_name, core.account.scope
+core.category_name, core.txn_class, core.account.scope
         │
         ▼
 agent.transactions ──► agent.cash_flows ──► agent.payees, agent.payee_years
@@ -230,7 +230,7 @@ agent.standing_orders ───────────────────�
 MCP tools: payees, recurring_payments, cash_flow, finance_profile
 ```
 
-The only stored state is the operator's corrections: four `core` tables and one `core.account`
+The only stored state is the operator's corrections: five `core` tables and one `core.account`
 column, built from operator entries. Everything else is a view, so a correction applies retroactively by construction and no
 derived row can go stale.
 
@@ -376,6 +376,18 @@ CREATE TABLE core.category_name (
   entry_seq   bigint NOT NULL,
   entered_at  timestamptz NOT NULL);
 
+-- The operator's flow class for one transaction (the txn_class entry kind): last entry wins, a
+-- clear deletes the row. txn_id is not a foreign key: a rebuild may apply the entry before the
+-- transaction is loaded, and the row is applied wherever the transaction exists.
+CREATE TABLE core.txn_class (
+  txn_id      uuid PRIMARY KEY,
+  flow_class  text NOT NULL CHECK (flow_class IN ('internal', 'scope_transfer', 'own_external',
+                                                  'investment', 'debt_repayment', 'borrowing', 'income',
+                                                  'refund', 'spending')),
+  employer    boolean NOT NULL DEFAULT false CHECK (NOT employer OR flow_class = 'income'),
+  entry_seq   bigint NOT NULL,
+  entered_at  timestamptz NOT NULL);
+
 -- An account's operator-set scope, written by the existing account upsert path the way
 -- account_end writes ended_on. Null means no setting. (In core_schema.sql every table name is
 -- written {{schema}}.name, because the same DDL builds core_next.)
@@ -393,6 +405,7 @@ Entry payloads (`raw.operator_entry.payload`), with only the fields the action u
 | `payee_rule` | `action`: one of `merge`, `separate`, `rename`, `class`, `category`, `recurring`, `clear`; `payee_key`; `name_sample`; and per action: `into_key` (merge), `name` (rename), `flow_class` and `employer` (class), `category` (category), `series_key` and `recurring` (recurring), `clears` (clear) |
 | `category_name` | `category`; `name`, where null clears it |
 | `account_scope` | `slug`; `scope`, where null clears it |
+| `txn_class` | `txn_id` (a transaction id, a UUID); `flow_class`, where null clears the override; `employer` (only with `income`) |
 
 **Clearing.** A `clear` names what it removes in `clears`:
 
@@ -408,6 +421,9 @@ Entry payloads (`raw.operator_entry.payload`), with only the fields the action u
     grammar (`^(dd|so|sub|inf):.+$`). Neither needs to exist yet: a rule may name a payee before
     its first transaction.
 *   `flow_class` is one of the classes, and `employer` is accepted only with `income`.
+*   `txn_id` is a UUID, `flow_class` is one of the classes and `employer` only goes with `income`.
+    Whether the transaction exists is the CLI's check, not the ledger's: a rebuild applies entries
+    in sequence order and may meet the entry before the transaction.
 *   `account_scope` names an existing account that is not a pot (a pot takes its parent's scope).
 
 The CLI validates an entry with the same exported validation functions the ledger uses, before it
@@ -463,7 +479,7 @@ not exactly "joint", and any statement-fed joint or business account, needs an o
 ### Flow classes
 
 `agent.cash_flows` gives each transaction that was not declined one class. The first rule that
-applies wins:
+applies wins (rule 4a sits between 4 and 5; it is not numbered 5 so that the others keep their numbers):
 
 | Rule | Condition | Class | `flow_reason` |
 |---|---|---|---|
@@ -471,6 +487,7 @@ applies wins:
 | 2 | `metadata.flex_transaction_type` is `repayment`, `transaction_moved_to_flex_current_account_side`, `transaction_moved_to_flex_flex_side`, `flex_move_money_transfer_current_account_side` or `flex_move_money_transfer_flex_side` | `internal` | `flex` |
 | 3 | The counterparty is a held account (below) in the same scope | `internal` | `own_account` |
 | 4 | The transaction pairs with a leg on a held account in the same scope (below) | `internal` | `paired` |
+| 4a | The operator set a class on this transaction (`txn_class`, below) | the entry's class, in either direction | `txn_rule` |
 | 5 | An effective `class` setting on the canonical payee that applies in this direction (below) | the setting's class, or `borrowing` for a positive row of a payee classed `debt_repayment` | `rule` |
 | 6 | The counterparty is a held account in a different scope, or the transaction pairs across scopes | `scope_transfer` | `own_account` or `paired` |
 | 7 | `metadata.p2p_is_to_self` is true | `own_external` | `self_flag` |
@@ -478,6 +495,19 @@ applies wins:
 | 9 | The amount is positive and the transaction is a card credit: a card scheme (`mastercard`, `gps_mastercard`), or any positive row on a `credit_card` account | `refund` | `card_credit` |
 | 10 | The amount is positive | `income` | `direction` |
 | 11 | Otherwise | `spending` | `direction` |
+
+**Per-transaction override (rule 4a).** A payee setting covers every row of a payee, but some payees
+mix kinds of money under one name: a small company the operator owns can pay salary and take
+director's loan repayments, which are `income` (with `employer`) and `own_external`. `finstore txn
+class` writes a `txn_class` entry that names one transaction and its class. The override applies
+after rules 1 to 4 and before the payee's class setting: it never changes a row a pot, Flex, held
+account or same-scope pairing rule classified, so pair conservation holds, and it applies in either
+direction, because the operator chose that row. It changes no other row, not even another row of the
+same payee. `employer` on the entry (income only) sets `agent.cash_flows.employer` for that row, and
+`agent.payees.employer` is true for a payee with such a settled income row; the payee's own class
+setting is never replaced, but the row's class enters the payee's most-frequent-class fallback and
+`agent.monthly_flows`. An override on one half of a pair across scopes (rule 6 or 7) reclassifies
+that half alone, so the pair no longer cancels in `scope_transfer`.
 
 **Held accounts.** The counterparty is a held account when, for any account in `core.account`,
 ended or not (an old transfer stays internal after an account ends):
@@ -824,6 +854,7 @@ arguments:
 | `finstore payee clear --series <series-key>` | `clear` of a series decision |
 | `finstore category name --category <category> --name <name>`, `finstore category clear --category <category>` | `category_name` |
 | `finstore account scope --slug <slug> --scope <scope>`, `finstore account scope --slug <slug> --clear` | `account_scope` |
+| `finstore txn class --id <transaction id> --class <class> [--employer]`, `finstore txn clear --id <transaction id>` | `txn_class` |
 
 The settings commands (`rename`, `class`, `category`) write against the payee's current canonical
 key: given any key, the CLI resolves it through `agent.cash_flows` first. A writing command fills
